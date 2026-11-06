@@ -1240,12 +1240,22 @@ def _register_services(
 ) -> None:
     """Register all JARVIS services. Called once per entry setup."""
 
+    # Jarvis Home patch (2026-11-06): the services any household login may call, the ones the panel and daily
+    # use need. An allowlist, so a new service starts as admin only. Automations carry no user and are not limited.
+    _JH_OPEN_SERVICES = frozenset({"analyze_camera", "briefing", "scene_by_intent", "routine", "add_reminder",
+                                   "check_packages", "nap", "shush", "unshush", "observer_status"})
+
     def _register_service(name: str, handler, schema=None) -> None:
         """Guard registration so reloads are idempotent and unload stays symmetric."""
         if name not in JARVIS_SERVICE_NAMES:
             raise ValueError(f"Unlisted JARVIS service: {name}")
         if hass.services.has_service(DOMAIN, name):
             _LOGGER.debug("JARVIS service already registered: %s.%s", DOMAIN, name)
+            return
+        if name not in _JH_OPEN_SERVICES:
+            from homeassistant.helpers.service import async_register_admin_service
+            async_register_admin_service(hass, DOMAIN, name, handler,
+                                         schema=vol.Schema({}, extra=vol.ALLOW_EXTRA) if schema is None else schema)
             return
         if schema is None:
             hass.services.async_register(DOMAIN, name, handler)

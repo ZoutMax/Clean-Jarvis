@@ -14,6 +14,7 @@
     "logbook"
   ],
   "codeowners": [
+    "@ZoutMax",
     "@sam3gp8"
   ],
   "config_flow": true,
@@ -22,10 +23,10 @@
     "frontend",
     "panel_custom"
   ],
-  "documentation": "https://github.com/sam3gp8/jarvis-aio",
+  "documentation": "https://github.com/ZoutMax/Clean-Jarvis",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/sam3gp8/jarvis-aio/issues",
+  "issue_tracker": "https://github.com/ZoutMax/Clean-Jarvis/issues",
   "requirements": [
     "groq>=0.9.0",
     "openai>=1.0.0",
@@ -33,5 +34,5 @@
     "anthropic>=0.39.0",
     "pypdf>=4.0.0"
   ],
-  "version": "9.86.0"
+  "version": "1.0.0"
 }

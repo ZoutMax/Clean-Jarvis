@@ -1,3 +1,5 @@
+> **This is Clean Jarvis**, a patch of the original JARVIS. See [what is different and how to install it](CLEAN_JARVIS.md).
+
 <div align="center">
 
 # JARVIS AI Assistant

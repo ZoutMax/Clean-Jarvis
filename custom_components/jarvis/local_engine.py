@@ -100,6 +100,10 @@ _INTENT_PATTERNS = [
     (r"turn\s+off\s+(?:the\s+)?(.+?)(?:\s+light(?:s)?)?$",      "turn_off", "light"),
     (r"switch\s+on\s+(?:the\s+)?(.+?)(?:\s+light(?:s)?)?$",     "turn_on",  "light"),
     (r"switch\s+off\s+(?:the\s+)?(.+?)(?:\s+light(?:s)?)?$",    "turn_off", "light"),
+    (r"(?:switch|turn)\s+(?:the\s+)?(.+?)\s+on$",  "turn_on",  "light"),
+    (r"(?:switch|turn)\s+(?:the\s+)?(.+?)\s+off$", "turn_off", "light"),
+    (r"(?:switch|turn)\s+(?:the\s+)?(.+?)\s+on\s+please$",  "turn_on",  "light"),
+    (r"(?:switch|turn)\s+(?:the\s+)?(.+?)\s+off\s+please$", "turn_off", "light"),
     (r"lights?\s+on\s+(?:in\s+)?(?:the\s+)?(.+)$",              "turn_on",  "light"),
     (r"lights?\s+off\s+(?:in\s+)?(?:the\s+)?(.+)$",             "turn_off", "light"),
     (r"dim\s+(?:the\s+)?(.+?)(?:\s+light(?:s)?)?\s+to\s+(\d+)", "dim",      "light"),
@@ -202,7 +206,7 @@ _QUERY_PATTERNS = [
     (r"(?:are\s+)?(?:any|which)\s+(?:lights?)\s+on",     "lights_on"),
     (r"(?:how\s+many)\s+lights?\s+(?:are\s+)?on",        "lights_on"),
     (r"(?:what(?:'s| is)\s+(?:the\s+)?)?(?:energy|power)\s+(?:usage|consumption)", "energy"),
-    (r"(?:what(?:'s| is)\s+(?:the\s+)?)weather",        "weather"),
+    (r"(?:what(?:'s| is)\s+(?:the\s+)?)weather(?!.*\b(?:tomorrow|tonight|week|weekend|forecast|later|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)", "weather"),
     (r"(?:what(?:'s| is)\s+(?:it\s+)?)(?:like\s+)?outside", "weather"),
     (r"(?:how\s+(?:warm|cold|hot))\s+is\s+it",           "weather"),
     (r"(?:what\s+)?(?:devices?|entities?)\s+(?:are\s+)?(?:in|at)\s+(?:the\s+)?(.+)", "area_devices"),
@@ -321,6 +325,59 @@ def _load_learned_aliases(hass) -> dict:
         return {}
 
 
+def _jh_is_setting(hass, eid: str) -> bool:
+    """Jarvis Home patch: config and diagnostic entities are never spoken command targets."""
+    try:
+        from homeassistant.helpers import entity_registry as _er
+        entry = _er.async_get(hass).async_get(eid)
+        if entry is not None and entry.entity_category is not None:
+            return True
+    except Exception:
+        pass
+    return "backlight" in eid or "child_lock" in eid
+
+
+def _jh_frag(name_fragment):
+    """Jarvis Home patch (2026-11-06): one name clean-up shared by the resolver and the vague check."""
+    fragment = name_fragment.lower().strip().replace("colour", "color")
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("light", "lights", "lamp", "lamps", "switch", "switches",
+                       "fan", "fans", "lock", "locks", "door", "doors",
+                       "cover", "covers", "thermostat", "sensor",
+                       "please", "now", "for me", "jarvis", "again"):
+            shorter = re.sub(rf"\s+{suffix}$", "", fragment)
+            if shorter != fragment:
+                fragment, changed = shorter, True
+    return re.sub(r"^(?:my|the|light|lamp|plug|switch)\s+(?=\S)", "", fragment.strip()).strip()  # Jarvis Home patch: filler words
+
+
+def _jh_heaters(hass):
+    """Jarvis Home patch (2026-11-06): heater switches and climate devices, read live. A switch counts when
+    it has the Home Assistant label Heater or Heating on the entity or its device, or heater or radiator in
+    its id or name. Setting entities such as a child lock or display never count."""
+    def labelled(eid):
+        try:
+            from homeassistant.helpers import device_registry as dr, entity_registry as er
+            entry = er.async_get(hass).async_get(eid)
+            if entry is None:
+                return False
+            found = set(entry.labels or ())
+            if entry.device_id:
+                device = dr.async_get(hass).async_get(entry.device_id)
+                found |= set(getattr(device, "labels", None) or ())
+            return bool({x.lower() for x in found} & {"heater", "heating"})
+        except Exception:
+            return False
+    switches = []
+    for s in hass.states.async_all("switch"):
+        words = f"{s.entity_id} {s.attributes.get('friendly_name') or ''}".lower()
+        if not _jh_is_setting(hass, s.entity_id) and ("heater" in words or "radiator" in words or labelled(s.entity_id)):
+            switches.append(s)
+    return switches, list(hass.states.async_all("climate"))
+
+
 def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
     """
     Fuzzy-match a name fragment against HA entities. v5.7.08.
@@ -337,15 +394,7 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
 
     Returns (entity_id, friendly_name) or None.
     """
-    fragment = name_fragment.lower().strip()
-
-    # Strip common suffixes
-    for suffix in ("light", "lights", "lamp", "lamps", "switch", "switches",
-                   "fan", "fans", "lock", "locks", "door", "doors",
-                   "cover", "covers", "thermostat", "sensor",
-                   "please", "now", "for me", "jarvis"):
-        fragment = re.sub(rf"\s+{suffix}$", "", fragment)
-    fragment = fragment.strip()
+    fragment = _jh_frag(name_fragment)
     if not fragment:
         return None
 
@@ -369,7 +418,9 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
     for domain in domains:
         for state in hass.states.async_all(domain):
             eid = state.entity_id
-            fname = (state.attributes.get("friendly_name") or "").lower()
+            if _jh_is_setting(hass, eid):
+                continue
+            fname = (state.attributes.get("friendly_name") or "").lower().replace("colour", "color")
             fname_words = set(fname.split())
 
             # Tier 1: exact
@@ -395,7 +446,7 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
 
             # Tier 4: fuzzy similarity
             fuzz = _fuzzy_score(fragment, fname)
-            if fuzz > 55 and fuzz > best_score:
+            if fuzz > 85 and fuzz > best_score:
                 best_score = fuzz
                 best_match = (eid, state.attributes.get("friendly_name", eid))
                 continue
@@ -419,6 +470,8 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
             # Retry with corrected form (non-recursive, just one pass)
             for domain in domains:
                 for state in hass.states.async_all(domain):
+                    if _jh_is_setting(hass, state.entity_id):
+                        continue
                     fname = (state.attributes.get("friendly_name") or "").lower()
                     if corrected in fname:
                         score = len(corrected) / max(len(fname), 1) * 90
@@ -427,7 +480,7 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
                             best_match = (state.entity_id,
                                           state.attributes.get("friendly_name", state.entity_id))
                     fuzz = _fuzzy_score(corrected, fname)
-                    if fuzz > 55 and fuzz > best_score:
+                    if fuzz > 85 and fuzz > best_score:
                         best_score = fuzz
                         best_match = (state.entity_id,
                                       state.attributes.get("friendly_name", state.entity_id))
@@ -443,7 +496,7 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
             for area in area_reg.async_list_areas():
                 if fragment in area.name.lower():
                     for entry in ent_reg.entities.values():
-                        if entry.domain != domain_hint:
+                        if entry.domain != domain_hint or _jh_is_setting(hass, entry.entity_id):
                             continue
                         in_area = entry.area_id == area.id
                         if not in_area and entry.device_id:
@@ -499,7 +552,7 @@ def _find_entities_in_area(hass, area_name, domain):
                 # Excluded entities don't take part in area/group commands
                 # ("turn on the living-room lights"); a by-name request still
                 # resolves them through a different path.
-                if is_excluded(hass, entry.entity_id):
+                if is_excluded(hass, entry.entity_id) or _jh_is_setting(hass, entry.entity_id):
                     continue
                 state = hass.states.get(entry.entity_id)
                 if state:
@@ -540,6 +593,196 @@ def _default_target(hass, domain):
     except Exception:   # pragma: no cover - defensive
         pass
     return None
+
+
+# Jarvis Home patch (2026-11-06): one open "which one" question per conversation, never shared between people.
+_JH_PENDING = {}
+# Words that point back at something said before. Only the AI has that context, so they are never device names.
+_JH_PRONOUNS = frozenset(("it", "that", "this", "them", "those", "these", "everything", "all"))
+
+
+_JH_YES = r"yes|yes sir|yes do|yeah|yep|sure|ok|okay|do it|go ahead|please do|that one|ja|ja hoor|jawel|doe maar"
+
+
+def _jh_vague(hass, name_fragment, spoken=""):
+    """Jarvis Home patch (2026-11-05): names of every device a vague word could mean, read live.
+    "the bathroom" and "the bathroom light" reach this as the same fragment, so the spoken words decide (2026-11-06):
+    only a name really said is exact, a bare room word is vague, and "light" or "lamp" leaves the other devices out."""
+    frag = _jh_frag(name_fragment)
+    if not frag:
+        return []
+    said = spoken.lower().replace("colour", "color")
+    light_word = bool(re.search(rf"\b{re.escape(frag)}\s+(?:lights?|lamps?)\b", said))
+    hits, exact = [], []
+    for dom in ("light", "switch", "climate"):
+        for st in hass.states.async_all(dom):
+            nm = st.attributes.get("friendly_name") or ""
+            low = nm.lower().replace("colour", "color")
+            if _jh_is_setting(hass, st.entity_id):
+                continue
+            if light_word and dom != "light" and not re.search(r"\b(?:lights?|lamps?)\b", low):
+                continue
+            if low == frag and st.state not in ("unavailable", "unknown"):
+                return []
+            if frag in low and nm not in [h[1] for h in hits]:
+                hits.append((st.entity_id, nm))
+                if low != frag and _jh_frag(nm) == frag and re.search(rf"\b{re.escape(low)}\b", said):
+                    exact.append(nm)
+    if len(exact) == 1:
+        return []
+    return hits if len(hits) > 1 else []
+
+
+# Jarvis Home patch (2026-11-06, round 3): a word like fan or door is cut from a name to find "the bedroom" in "the bedroom lamp",
+# but it can be the very word that tells two real devices apart.
+_JH_KIND_DOMAINS = {"fan": ("fan",), "fans": ("fan",), "lock": ("lock",), "locks": ("lock",), "door": ("lock", "cover"), "doors": ("lock", "cover"),
+                    "cover": ("cover",), "covers": ("cover",), "thermostat": ("climate",)}
+
+
+def _jh_said_name(spoken):
+    name = re.sub(r"\s+(?:on|off)$", "", re.sub(r"\s+(?:please|now|for me|jarvis|again)$", "", spoken.lower().strip()))
+    return re.sub(r"^(?:my|the)\s+", "", name).replace("colour", "color").strip()
+
+
+def _jh_whole(hass, spoken):
+    """The one device whose name holds the whole name as said, suffix word included, in any domain."""
+    name = _jh_said_name(spoken)
+    words = name.split()
+    if len(words) < 2 or words[-1] not in _JH_KIND_DOMAINS:
+        return None
+    bare, hits = " ".join(words[:-1]), []
+    for dom in ("light", "switch", "lock", "cover", "climate", "fan", "media_player"):
+        for st in hass.states.async_all(dom):
+            if _jh_is_setting(hass, st.entity_id):
+                continue
+            nm = (st.attributes.get("friendly_name") or "").lower().replace("colour", "color")
+            found = (st.entity_id, st.attributes.get("friendly_name", st.entity_id))
+            if nm == name:
+                return found
+            if set(words) <= set(nm.split()) or (nm == bare and dom in _JH_KIND_DOMAINS[words[-1]]):
+                hits.append(found)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _jh_wrong_kind(spoken, resolved):
+    """True when the words asked for a fan, a lock or the like and the match is neither that kind nor named so."""
+    words = _jh_said_name(spoken).split()
+    if len(words) < 2 or words[-1] not in _JH_KIND_DOMAINS:
+        return False
+    return resolved[0].split(".")[0] not in _JH_KIND_DOMAINS[words[-1]] and words[-1] not in str(resolved[1]).lower().split()
+
+
+# Is this turn a device command? The truth check in agent.py asks, so a wrong yes costs a good answer and a wrong no lets a claim
+# through. It leans hard to no: only the opening word makes an order, so "the heating went off" and a bare "door open" are
+# statements. A question is never a command, and chat that begins like one needs a device to be one.
+_JH_FILLER_RE = re.compile(r"^(?:(?:ok(?:ay)?|hey|hi|hello|yo|sir|jarvis|please|kindly|just|now|then|and|also|so|go ahead and|graag"
+                           r"|alsjeblieft|alstublieft|bitte|por favor)\b[\s,]*)+")
+_JH_POLITE_RE = re.compile(r"^(?:could you|can you|would you|will you|i want you to|i need you to|i'd like you to|kun je|kan je|kunt u|wil je|wilt u)\b[\s,]*")
+_JH_TAIL_RE = re.compile(r"[\s,]+(?:please|sir|jarvis|now|for me|thanks|thank you|alsjeblieft|alstublieft|graag|bitte|por favor)$")
+_JH_ASK_RE = re.compile(r"^(?:tell me|check if|check whether|what|what's|whats|which|who|who's|whose|where|where's|when|why|how|is|are|was|were|am|do|does|did|has|have|had|should"
+                        r"|would|could|can|will|shall|isn't|aren't|wat|welke|wie|waar|wanneer|waarom|hoe|staat|ben|zijn|heeft|hebben|kan|kun|moet"
+                        r"|ist|sind|warum|wann|wo|wer|comment|pourquoi|quand|quel|quelle|qué|que|cómo|como|cuándo|dónde|cosa|quando|perché)\b")
+# Words that make a sentence about something, not an order to it.
+_JH_NO_ORDER_RE = re.compile(r"\b(?:don't|do not|never|not|niet|geen|nicht|if|when|als|wanneer|about|over|story|poem|joke|song|essay|letter|talking|praten"
+                             r"|verhaal|gedicht|grap|tell|explain\w*|write|translate|remember|remind|what|how|why|wat|hoe|i|i'm|i've|we|ik|wij|you"
+                             r"|he|she|they|is|are|was|were|ben|zijn|staat|ist|sind)\b")
+_JH_ORDER_VERBS = frozenset(("turn switch set dim brighten open close shut lock unlock kill stop start pause resume play mute unmute activate deactivate "
+                             "enable disable raise lower toggle zet doe draai sluit schakel dimmen schalte schalt öffne schließe stell dimme "
+                             "allume éteins eteins ouvre ferme baisse monte enciende apaga abre cierra accendi spegni apri chiudi").split())
+# Too common to be an order alone: these only open one together with an end word, as in "put the lamp on".
+_JH_SOFT_VERBS = frozenset("put make maak mach".split())
+_JH_ORDER_ENDS = frozenset("on off up down open shut closed brighter dimmer darker warmer cooler colder hotter higher lower aan uit dicht omhoog omlaag hoger lager kouder an aus auf zu".split())
+# Dutch puts the verb last after a polite opening: "kun je de lamp aanzetten".
+_JH_ORDER_LAST = frozenset("zetten doen aanzetten uitzetten aandoen uitdoen openen sluiten dimmen".split())
+# Kinds of device, not devices: a claim about the blinds is false in a house without blinds too.
+_JH_KIND_RE = re.compile(r"\b(?:lights?|lamps?|heat|heating|heaters?|volume|brightness|radiators?|thermostats?|aircon|air conditioning|tv|television|blinds?|curtains?|shutters?|shades?"
+                         r"|doors?|gates?|garage|windows?|fans?|locks?|plugs?|sockets?|speakers?|music|vacuum|alarm"
+                         r"|licht|lichten|lampen|verwarming|kachels?|thermostaat|televisie|gordijnen|gordijn|rolluiken|rolluik|zonwering|deuren|deur|poort"
+                         r"|ventilator|stekker|muziek|stofzuiger|lampe|lampen|heizung|fernseher|tür|lumi[eè]res?|chauffage|télé|porte|volets?"
+                         r"|luz|luces|lámpara|calefacción|puerta|luce|luci|lampada|riscaldamento|porta)\b")
+_JH_WARMTH_RE = re.compile(r"(?:make|get) it (?:a (?:bit|little) |slightly )?(?:warmer|cooler|colder|hotter)|maak het (?:wat |een beetje )?(?:warmer|kouder)")
+_JH_ARTICLE = r"\s(?:the|my|a|an|de|het|een)\s"
+_JH_ACT_DOMAINS = ("light", "switch", "fan", "cover", "lock", "climate", "media_player", "vacuum", "humidifier", "water_heater", "siren", "scene",
+                   "script", "input_boolean", "button", "input_button", "valve", "remote", "lawn_mower", "group", "alarm_control_panel")
+
+
+def _jh_opening(text):
+    """(the words without greetings and politeness, was it a polite request, did it end in a question mark)."""
+    said = (text or "").strip().lower().replace("’", "'")
+    body = _JH_FILLER_RE.sub("", said)
+    polite = _JH_POLITE_RE.match(body)
+    if polite:
+        body = _JH_FILLER_RE.sub("", body[polite.end():])
+    return body, bool(polite), said.endswith("?")
+
+
+def is_question(text):
+    body, polite, mark = _jh_opening(text)
+    return mark or polite or bool(_JH_ASK_RE.match(body))
+
+
+def _jh_names_device(hass, body):
+    """A kind of device, or the name of a real device or room, read live."""
+    if _JH_KIND_RE.search(body):
+        return True
+    names = []
+    for dom in _JH_ACT_DOMAINS:
+        names += [str(s.attributes.get("friendly_name") or "") for s in hass.states.async_all(dom) if not _jh_is_setting(hass, s.entity_id)]
+    try:
+        from homeassistant.helpers import area_registry as areg
+        for area in areg.async_get(hass).async_list_areas():
+            names += [area.name, *(getattr(area, "aliases", None) or ())]
+    except Exception:
+        pass
+    # "set the mood in the bedroom" is about the room, not an order to it, and "sun's up" is no device called Sun
+    return any(len(n) >= 3 and re.search(rf"(?<!\bin )(?<!\bat )(?<!\bto )(?<!\bof )(?<!\bfor )(?<!\bwith )(?<!\bfrom )\b{re.escape(n.lower())}\b(?!['\u2019])", re.sub(_JH_ARTICLE, " ", body)) for n in names)
+
+
+def _jh_local_order(hass, body, aliases):
+    """The local command patterns, whole sentence only, with a real target where they name one."""
+    if _JH_WARMTH_RE.fullmatch(body) or any(re.fullmatch(p[0], body) for p in _BULK_PATTERNS):
+        return True
+    for pattern, action, hint in _INTENT_PATTERNS:
+        match = re.fullmatch(pattern, body)
+        if not match:
+            continue
+        if action in _MEDIA_ACTIONS or action == "set_temp":
+            return True
+        if action == "scene":
+            if match.group(1) and _find_scene_or_script(hass, match.group(1)):
+                return True
+        elif action in ("turn_on", "turn_off", "dim", "brighten", "lock", "unlock", "open", "close", "set_temp_named"):
+            name = match.group(1).strip()
+            if name in _JH_PRONOUNS:
+                return True
+            found = _find_entity(hass, name, hint, aliases) or _find_entity(hass, name, None, aliases)
+            if found and found[0].split(".")[0] in _JH_ACT_DOMAINS:
+                return True
+    return False
+
+
+def device_command(hass, text, aliases=None):
+    """True when these words order a device about. By the local patterns, or, in any language, by an action word that opens the
+    sentence (after please, the assistant's name or a polite opening) and a device or room name after it. Nothing else counts:
+    a sentence that opens with its own subject is a statement, and missing a command costs less than replacing ordinary chat."""
+    body, polite, mark = _jh_opening(text)
+    if (mark and not polite) or (not polite and _JH_ASK_RE.match(body)):
+        return False
+    body = _normalize(body)
+    while _JH_TAIL_RE.search(body):
+        body = _JH_TAIL_RE.sub("", body)
+    if not body:
+        return False
+    if _jh_local_order(hass, body, aliases):
+        return True
+    words = body.split()
+    if words[0] in _JH_ORDER_VERBS or (words[0] in _JH_SOFT_VERBS and words[-1] in _JH_ORDER_ENDS):
+        target = " ".join(words[1:])   # "lock in the plan": the verb itself is no device
+    elif polite and words[-1] in _JH_ORDER_LAST:
+        target = body
+    else:
+        return False
+    return not _JH_NO_ORDER_RE.search(body) and _jh_names_device(hass, target)
 
 
 def _find_scene_or_script(hass, name_fragment):
@@ -753,18 +996,34 @@ def _query_resp(hass, action, entity_id, fname, h="sir"):
     return ""
 
 
+def _jh_offline(hass):
+    """Jarvis Home patch (2026-11-06): door, window and lock devices with no usable state. An all-clear must
+    not rest on them."""
+    found = [s for s in hass.states.async_all("binary_sensor")
+             if s.attributes.get("device_class") in ("door", "window", "garage_door")]
+    found += list(hass.states.async_all("cover")) + list(hass.states.async_all("lock"))
+    return [s.attributes.get("friendly_name", s.entity_id) for s in found
+            if s.state in ("unavailable", "unknown", "jammed")]
+
+
 def _home_status(hass, h="sir"):
     lights_on = sum(1 for s in hass.states.async_all("light") if s.state == "on")
     locks_ul = sum(1 for s in hass.states.async_all("lock") if s.state == "unlocked")
     doors_open = sum(1 for s in hass.states.async_all("binary_sensor")
                      if s.attributes.get("device_class") == "door" and s.state == "on")
     people = sum(1 for s in hass.states.async_all("person") if s.state == "home")
-    parts = [f"All systems nominal, {h}."]
+    parts = [f"Home status, {h}."]
     parts.append(f"{lights_on} light{'s' if lights_on != 1 else ''} on.")
-    parts.append("All locks secured." if not locks_ul else
-                 f"{locks_ul} lock{'s' if locks_ul != 1 else ''} unlocked.")
+    _jh_dark = _jh_offline(hass)
+    _jh_locks = hass.states.async_all("lock")  # Jarvis Home patch: only report locks that exist
+    if locks_ul:
+        parts.append(f"{locks_ul} lock{'s' if locks_ul != 1 else ''} unlocked.")
+    elif _jh_locks and all(s.state == "locked" for s in _jh_locks):
+        parts.append("All locks secured.")
     if doors_open:
         parts.append(f"{doors_open} door{'s' if doors_open != 1 else ''} open.")
+    if _jh_dark:
+        parts.append(f"Not reporting: {', '.join(_jh_dark)}.")
     parts.append(f"{people} person{'s' if people != 1 else ''} home.")
     return " ".join(parts)
 
@@ -794,8 +1053,15 @@ def _ctx_query(hass, qtype, h="sir", area_match=""):
             if s.state == "unlocked":
                 items.append(s.attributes.get("friendly_name", s.entity_id) + " (unlocked)")
         if not items:
+            if not (hass.states.async_all("lock") or hass.states.async_all("cover") or any(
+                    s.attributes.get("device_class") in ("door", "window", "garage_door")
+                    for s in hass.states.async_all("binary_sensor"))):
+                return f"I have no door, window or lock sensors in this home, {h}."
+            if _jh_offline(hass):
+                return f"Nothing reports open, {h}, but these are not reporting: {', '.join(_jh_offline(hass))}."
             return f"Everything is closed and secured, {h}."
-        return f"Currently open or unlocked: {', '.join(items)}."
+        _jh_tail = f" Not reporting: {', '.join(_jh_offline(hass))}." if _jh_offline(hass) else ""
+        return f"Currently open or unlocked: {', '.join(items)}.{_jh_tail}"
 
     if qtype == "lights_on":
         on = [s.attributes.get("friendly_name", s.entity_id)
@@ -862,7 +1128,56 @@ def _ctx_query(hass, qtype, h="sir", area_match=""):
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
-async def try_local(hass, text, honorific="sir", force=False):
+_JH_COLOR_RE = re.compile(r"^(?:(?:hey\s+)?jarvis[,\s]+)?(?:please\s+|could you\s+|can you\s+|would you\s+)*(?:switch|set|change|make|turn|put)\s+(?:the\s+)?(.+?)\s+(?:to\s+|in\s+)?([a-z]+)(?:\s+colou?r)?$")
+
+
+def _jh_shows(state, want) -> bool:
+    """Jarvis Home patch (2026-11-06): the lamp is on and reports roughly the asked colour. Lamps round
+    colours, so a wide margin only rejects a lamp that still shows something clearly different."""
+    if state is None or state.state != "on":
+        return False
+    got = state.attributes.get("rgb_color")
+    if not got:
+        return True
+    return sum((int(a) - int(b)) ** 2 for a, b in zip(got, want)) <= 130 ** 2
+
+
+async def _jh_try_color(hass, normalized, honorific):
+    """Jarvis Home patch (2026-11-05): colour commands, read from the lamp's real abilities."""
+    m = _JH_COLOR_RE.match(normalized)
+    if not m or m.group(1).split()[0] in ("on", "off") or m.group(2) in ("please", "now") or m.group(1).strip() in _JH_PRONOUNS:
+        return None
+    from homeassistant.util.color import color_name_to_rgb
+    try:
+        want = color_name_to_rgb(m.group(2))
+    except ValueError:
+        return None
+    found = _find_entity(hass, m.group(1), "light")
+    if not found:
+        return None
+    entity_id, fname = found
+    state = hass.states.get(entity_id)
+    if state is None or state.state in ("unavailable", "unknown"):
+        return LocalResult(text=f"{fname} is offline, {honorific}. Nothing was changed.", success=False)
+    modes = set(state.attributes.get("supported_color_modes") or [])
+    if not modes & {"hs", "rgb", "rgbw", "rgbww", "xy"}:
+        return LocalResult(text=f"{fname} cannot show colours, {honorific}.", success=False)
+    if _needs_confirmation(hass, "turn_on", entity_id):
+        return None
+    colour = m.group(2)
+    if not await _seam_execute(hass, "light", "turn_on", {"entity_id": entity_id, "color_name": colour},
+                               blocking=True, action="turn_on"):
+        return LocalResult(text=f"I wasn't able to set {fname} to {colour}, {honorific}.", success=False)
+    _update_ctx(entity=entity_id, domain="light", action="turn_on")
+    import asyncio
+    for _ in range(8):
+        if _jh_shows(hass.states.get(entity_id), want):
+            return LocalResult(text=f"Done, {honorific}. {fname} is {colour}.", success=True)
+        await asyncio.sleep(0.25)
+    return LocalResult(text=f"I sent {colour} to {fname}, {honorific}, but it has not confirmed the change.", success=False)
+
+
+async def try_local(hass, text, honorific="sir", force=False, pending_key=""):
     """
     PRIMARY handler. Returns LocalResult if handled, None for LLM fallback.
 
@@ -875,11 +1190,30 @@ async def try_local(hass, text, honorific="sir", force=False):
     """
     normalized = _normalize(text)
     complexity = score_complexity(text)
+    for _jh_k in [k for k, v in _JH_PENDING.items() if time.time() - v["at"] >= 90]:
+        del _JH_PENDING[_jh_k]
+    _jh_p = _JH_PENDING.pop(pending_key, None)
+    if _jh_p:
+        _jh_w = re.sub(r"\s+please$", "", re.sub(r"^(?:the|in the)\s+", "", normalized)).split()
+        _jh_m = [x for x in _jh_p["options"] if _jh_w and set(_jh_w) <= set(x[1].lower().split())]
+        if not _jh_m and len(_jh_p["options"]) == 1 and re.fullmatch(_JH_YES, " ".join(_jh_w)):
+            _jh_m = _jh_p["options"]   # "Do you mean X?" has a yes for an answer
+        if len(_jh_m) == 1:
+            _jh_eid, _jh_name = _jh_m[0]
+            if _needs_confirmation(hass, _jh_p["action"], _jh_eid):
+                return None
+            _jh_ok = await _execute_action(hass, _jh_p["action"], _jh_eid, {})
+            _update_ctx(entity=_jh_eid, domain=_jh_eid.split(".")[0], action=_jh_p["action"])
+            return LocalResult(text=_resp(_jh_p["action"], _jh_name, _jh_ok, {}, honorific), success=_jh_ok)
 
     # High complexity → immediate LLM (skipped in force/offline mode)
     if complexity >= 70 and not force:
         _LOGGER.debug("Local: complexity %d for '%s' — LLM", complexity, text[:60])
         return None
+
+    _jh_color = await _jh_try_color(hass, normalized, honorific)
+    if _jh_color is not None:
+        return _jh_color
 
     # Contextual queries
     for pattern, qtype in _QUERY_PATTERNS:
@@ -904,14 +1238,15 @@ async def try_local(hass, text, honorific="sir", force=False):
             total = 0
             for d in ("light", "switch", "fan"):
                 ents = [(s.entity_id, s.attributes.get("friendly_name", s.entity_id))
-                        for s in hass.states.async_all(d) if s.state == "on"]
+                        for s in hass.states.async_all(d)
+                        if s.state == "on" and not _jh_is_setting(hass, s.entity_id)]  # Jarvis Home patch: settings stay out
                 for eid, fn in ents:
                     if await _execute_action(hass, "turn_off", eid, {}):
                         total += 1
             return LocalResult(text=f"Done, {honorific}. {total} device{'s' if total != 1 else ''} turned off.", success=True)
         entities = _find_entities_in_area(hass, area_name, domain) if area_name else [
             (s.entity_id, s.attributes.get("friendly_name", s.entity_id))
-            for s in hass.states.async_all(domain)]
+            for s in hass.states.async_all(domain) if not _jh_is_setting(hass, s.entity_id)]
         if not entities:
             continue
         ok = 0
@@ -959,7 +1294,7 @@ async def try_local(hass, text, honorific="sir", force=False):
                 _LOGGER.warning("JARVIS: goodnight scene/script '%s' failed to run: %s", eid, exc)
         off_count = 0
         for s in hass.states.async_all("light"):
-            if s.state == "on":
+            if s.state == "on" and not _jh_is_setting(hass, s.entity_id):
                 if await _seam_execute(hass, "light", "turn_off",
                                        {"entity_id": s.entity_id},
                                        blocking=False, action="turn_off"):
@@ -972,7 +1307,7 @@ async def try_local(hass, text, honorific="sir", force=False):
                                            {"entity_id": s.entity_id},
                                            blocking=False, action="lock"):
                     _LOGGER.warning("JARVIS: goodnight could not lock %s", s.entity_id)
-        return LocalResult(text=f"Goodnight, {honorific}. {off_count} lights off, all locks secured. Rest well.", success=True)
+        return LocalResult(text=f"Goodnight, {honorific}. {off_count} lights off. Rest well.", success=True)
 
     # Single-entity patterns
     _last_failed_name = None  # Track for end-of-loop error
@@ -1032,9 +1367,16 @@ async def try_local(hass, text, honorific="sir", force=False):
         extra_arg = groups[1] if len(groups) > 1 else None
         if not name_frag:
             continue
-        resolved = _find_entity(
+        if name_frag.strip() in _JH_PRONOUNS:
+            _last_failed_name = name_frag
+            continue
+        _jh_said = normalized[match.start(1):]
+        _jh_named = _jh_whole(hass, name_frag) or _jh_whole(hass, _jh_said)
+        resolved = _jh_named or _find_entity(
             hass, name_frag, domain_hint, learned_aliases
         ) or _find_entity(hass, name_frag, None, learned_aliases)
+        if resolved and not _jh_named and (_jh_wrong_kind(name_frag, resolved) or _jh_wrong_kind(_jh_said, resolved)):
+            resolved = None   # the fan was asked for, so the lamp of that room is no answer
         if not resolved:
             # Track failure but keep trying other patterns/domains
             _last_failed_name = name_frag
@@ -1044,7 +1386,40 @@ async def try_local(hass, text, honorific="sir", force=False):
                 action, name_frag, domain_hint,
             )
             continue
+        if action in ("turn_on", "turn_off") and not _jh_named:
+            _jh_many = _jh_vague(hass, name_frag, normalized)
+            if _jh_many:
+                def _jh_st(e):
+                    st = hass.states.get(e)
+                    return st.state if st else "unavailable"
+                _jh_live = [x for x in _jh_many if _jh_st(x[0]) not in ("unavailable", "unknown")]
+                _jh_dead = [x[1] for x in _jh_many if _jh_st(x[0]) in ("unavailable", "unknown")]
+                _jh_verb = "is" if len(_jh_dead) == 1 else "are"
+                if not _jh_live:
+                    return LocalResult(text=f"{', '.join(_jh_dead)} {_jh_verb} unavailable, {honorific}. Nothing was changed.", success=False)
+                _jh_fit = [x for x in _jh_live if (_jh_st(x[0]) != "off") == (action == "turn_off")]
+                if not _jh_fit:
+                    _jh_who = "They are all" if len(_jh_live) > 1 else f"{_jh_live[0][1]} is"
+                    _jh_tail = f" {', '.join(_jh_dead)} {_jh_verb} unavailable." if _jh_dead else ""
+                    return LocalResult(text=f"{_jh_who} already {'off' if action == 'turn_off' else 'on'}, {honorific}.{_jh_tail}", success=True)
+                if len(_jh_fit) == 1 and action == "turn_on" and any(
+                        x[1] in _jh_dead and x[0].split(".")[0] != _jh_fit[0][0].split(".")[0] for x in _jh_many):
+                    # the person may well mean the lamp that is gone, and switching on another kind of device is no safe guess
+                    _JH_PENDING[pending_key] = {"action": action, "options": _jh_fit, "at": time.time()}
+                    return LocalResult(text=f"{', '.join(_jh_dead)} {_jh_verb} unavailable, {honorific}. Do you mean {_jh_fit[0][1]}?", success=False)
+                if len(_jh_fit) == 1:
+                    resolved = _jh_fit[0]
+                elif any(_needs_confirmation(hass, action, x[0]) for x in _jh_fit):
+                    return None   # protected device: the agent runs the confirmation gate
+                else:
+                    _JH_PENDING[pending_key] = {"action": action, "options": _jh_fit, "at": time.time()}
+                    _jh_n = [x[1] for x in _jh_fit]
+                    return LocalResult(text=f"Which one, {honorific}: {', '.join(_jh_n[:-1])} or {_jh_n[-1]}?", success=False)
         entity_id, fname = resolved
+        _jh_now = hass.states.get(entity_id)
+        if _jh_now is not None and _jh_now.state == "unavailable" and not action.startswith("query_"):
+            # Jarvis Home patch (2026-11-06): a command to a device that is not there does nothing, so never report it done.
+            return LocalResult(text=f"{fname} is unavailable, {honorific}. Nothing was changed.", success=False)
         args = {}
         if action == "dim" and extra_arg:
             args["brightness_pct"] = int(extra_arg)
@@ -1150,7 +1525,7 @@ async def try_local(hass, text, honorific="sir", force=False):
     # Follow-up ("also turn off the kitchen")
     if _ctx_fresh() and re.search(r"^(?:also|and|now)\s+", normalized):
         stripped = re.sub(r"^(?:also|and|now)\s+", "", normalized)
-        result = await try_local(hass, stripped, honorific, force=force)
+        result = await try_local(hass, stripped, honorific, force=force, pending_key=pending_key)
         if result and result.handled:
             return result
 

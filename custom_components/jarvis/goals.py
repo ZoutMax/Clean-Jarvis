@@ -68,6 +68,14 @@ def _connect(db_path: str) -> sqlite3.Connection:
                 last_result TEXT DEFAULT ''
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_goal_due ON goals(status, next_check_ts)")
+        # Jarvis Home patch (2026-11-06): who asked for this. '' is voice with no login. Rows from before this patch stay NULL:
+        # nobody knows whose they are, so they run with the limits of an unknown login.
+        if "user_id" not in {r[1] for r in conn.execute("PRAGMA table_info(goals)")}:
+            try:
+                conn.execute("ALTER TABLE goals ADD COLUMN user_id TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         return conn
     except Exception:
         conn.close()
@@ -98,7 +106,8 @@ def create(title: str, outcome: str, steps: Optional[list] = None, *,
            check_interval_min: float = DEFAULT_INTERVAL_MIN,
            deadline_minutes: Optional[float] = None,
            now: Optional[datetime] = None,
-           db_path: Optional[str] = None) -> dict:
+           db_path: Optional[str] = None,
+           user_id: str = "") -> dict:
     """Open a new goal. Returns the row, or an 'error' dict — never raises."""
     db_path = db_path or DB_PATH
     outcome = (outcome or "").strip()
@@ -129,10 +138,10 @@ def create(title: str, outcome: str, steps: Optional[list] = None, *,
                 return {"error": f"goal list is full ({MAX_ACTIVE} active)"}
             cur = conn.execute(
                 "INSERT INTO goals (created_ts, updated_ts, title, outcome, steps, "
-                "next_check_ts, check_interval_min, deadline_ts) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "next_check_ts, check_interval_min, deadline_ts, user_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (_iso(t), _iso(t), title, outcome, json.dumps(norm_steps),
-                 _iso(t), interval, deadline))   # due immediately: first engagement
+                 _iso(t), interval, deadline, user_id or ""))   # due immediately: first engagement
             _shadow_plan(cur.lastrowid, title, outcome, norm_steps)   # F1: mirror into kernel.plan
             return {"id": cur.lastrowid, "title": title, "outcome": outcome,
                     "steps": norm_steps, "next_check_ts": _iso(t),
@@ -673,7 +682,7 @@ async def async_process_due(
             pass
         prompt = build_prompt(g, deadline_passed=deadline_passed)
         try:
-            result = (await runner(prompt, "") or "").strip()
+            result = (await runner(prompt, "", g.get("user_id")) or "").strip()
         except Exception as exc:
             _LOGGER.warning("goal #%s run failed: %s", gid, exc)
             await hass.async_add_executor_job(
@@ -699,7 +708,7 @@ async def async_process_due(
             from . import database
             await hass.async_add_executor_job(
                 lambda: database.save_activity(
-                    category="goal", urgency="low",
+                    category="goal", urgency="low", user_id=g.get("user_id") or "",
                     message=f"Goal #{gid} '{g['title']}' engaged (run {runs}): "
                             f"{(result or 'no report')[:160]}",
                     source="agent")

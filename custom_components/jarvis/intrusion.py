@@ -335,7 +335,9 @@ async def capture_snapshot(hass, camera_entity: str,
             return None
         ts = int(time.time())
         slug = camera_entity.split(".", 1)[-1]
-        fname = f"{tag}_{slug}_{ts}.jpg"
+        import secrets
+        # Jarvis Home patch (2026-11-06): www is served with no login, so the name must not be guessable.
+        fname = f"{tag}_{slug}_{ts}_{secrets.token_urlsafe(16)}.jpg"
         path = os.path.join(SNAPSHOT_DIR, fname)
         await hass.async_add_executor_job(_store_snapshot, path, content)
         info = {

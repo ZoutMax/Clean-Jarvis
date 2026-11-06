@@ -715,7 +715,8 @@ async def ws_get_panel_data(
             dominant = {
                 "area_id":    None,
                 "name":       "AWAY" if not anyone else "AT HOME",
-                "subtitle":   "no presence detected",
+                # Jarvis Home patch (2026-11-04): show who is home when there are no room presence sensors.
+                "subtitle":   ((", ".join(sorted(st.attributes.get("friendly_name", st.entity_id) for st in hass.states.async_all("person") if st.state == "home")) + " home \u00b7 room unknown (no motion sensors)") if anyone else "nobody home"),
                 "coord":      "—",
                 "temp":       "—",
                 "humidity":   "—",
@@ -954,6 +955,7 @@ async def ws_get_panel_data(
                 # the panel's selects snap back to their defaults on every
                 # re-render even though the value was saved (v6.64.1 fix).
                 "banter_level":         _runtime_opt(hass, entry, "banter_level", 1),
+            "camera_watch_default": str(_runtime_opt(hass, entry, "camera_watch_default", "") or ""),
                 "search_backend":       str(_runtime_opt(hass, entry, "search_backend", "duckduckgo") or "duckduckgo"),
                 "searxng_url":          str(_runtime_opt(hass, entry, "searxng_url", "") or ""),
                 "web_research_llm_fallback": bool(_runtime_opt(hass, entry, "web_research_llm_fallback", False)),
@@ -1018,6 +1020,13 @@ async def ws_get_panel_data(
                 "home_bathrooms":       _runtime_opt(hass, entry, "home_bathrooms", ""),
             },
         }
+        if not _is_admin(connection):
+            # Jarvis Home patch (2026-11-06): the panel stays open to everyone, the owner's connection details do not.
+            for _jh_key in ("imap_host", "imap_user", "llm_base_url", "custom_base_url", "ollama_base_url",
+                            "searxng_url", "departure_osrm_url", "hazard_lat", "hazard_lon"):
+                if _jh_key in result.get("config", {}):
+                    result["config"][_jh_key] = ""
+            result["goals"] = [g for g in result.get("goals", []) if g.get("owner") == connection.user.id]
         connection.send_result(msg["id"], result)
     except Exception as exc:
         _LOGGER.exception("ws_get_panel_data failed: %s", exc)
@@ -1144,6 +1153,7 @@ def _get_goals() -> list[dict]:
             steps = g.get("steps") or []
             done = sum(1 for s in steps if s.get("status") == "done")
             out.append({
+                "owner": g.get("user_id"),
                 "id": g.get("id"),
                 "title": g.get("title", ""),
                 "outcome": g.get("outcome", ""),
@@ -1434,6 +1444,9 @@ async def _async_get_observer_stats(hass) -> dict:
 
 # ─── Activity log WebSocket command ──────────────────────────────────────────
 
+# Jarvis Home patch (2026-11-06): these lines quote what a person asked for and what came back.
+_JH_PRIVATE_ACTIVITY = ("followup", "goal")
+
 @websocket_api.websocket_command({
     vol.Required("type"): "jarvis/get_activity_log",
     vol.Optional("hours", default=24): int,
@@ -1451,6 +1464,9 @@ async def ws_get_activity_log(
         entries = await hass.async_add_executor_job(
             lambda: get_recent_activity(hours=msg["hours"], limit=msg["limit"])
         )
+        if not _is_admin(connection):
+            entries = [e for e in entries if e.get("category") not in _JH_PRIVATE_ACTIVITY
+                       or e.get("user_id") == connection.user.id]
         # Format for the panel
         result = []
         for e in entries:
@@ -1551,6 +1567,7 @@ PANEL_WRITABLE_KEYS = {
     "web_research_llm_fallback", # bool: opt-in — escalate to the LLM's own web search on empty results
     "calendar_tight_gap_min",    # int: back-to-back gap flagged as "tight"
     # Persona (v6.51.0)
+    "camera_watch_default",      # str: camera Camera Watch opens on
     "banter_level",              # int: 0 plain · 1 dry (default) · 2 full MCU wit
     # Local semantic search via Ollama embeddings (v6.57.0)
     "semantic_search",           # bool: use Ollama embeddings for doc retrieval
@@ -1962,6 +1979,15 @@ async def ws_get_knowledge(
     """Return the curated facts JARVIS knows, for the Memory panel."""
     try:
         from . import knowledge
+        if not _is_admin(connection):
+            # Jarvis Home patch (2026-11-06): a non-admin sees only their own facts and the household's.
+            from . import identity
+            mine = [identity.subject_for_user(hass, connection.user.id), knowledge.DEFAULT_SUBJECT]
+            wanted = [msg["subject"]] if msg.get("subject") else mine
+            allowed = [s for s in wanted if s in mine]
+            facts = await hass.async_add_executor_job(lambda: knowledge.all_facts(subjects=allowed)) if allowed else []
+            connection.send_result(msg["id"], {"facts": facts, "stats": {"total": len(facts), "by_kind": {}, "by_subject": {}}})
+            return
         subject = msg.get("subject")
         facts = await hass.async_add_executor_job(lambda: knowledge.all_facts(subject=subject))
         kstats = await hass.async_add_executor_job(knowledge.stats)
@@ -2052,7 +2078,8 @@ async def ws_root_cause(
             lambda: rca.analyze(
                 msg["entity_id"],
                 msg.get("event_time"),
-                int(msg.get("window_secs") or rca.DEFAULT_WINDOW_SECS)))
+                int(msg.get("window_secs") or rca.DEFAULT_WINDOW_SECS),
+                viewer=None if _is_admin(connection) else connection.user.id))
         connection.send_result(msg["id"], result)
     except Exception as exc:
         _LOGGER.exception("root_cause failed: %s", exc)
@@ -2652,8 +2679,11 @@ async def ws_search_memory(
     """Search long-term memory for relevant past conversations."""
     try:
         from .memory import search_memory
+        # Jarvis Home patch: an admin searches everything, anyone else only their own memory.
+        _jh_k = max(1, min(int(msg["k"]), 50))
+        _jh_who = None if _is_admin(connection) else connection.user.id
         results = await hass.async_add_executor_job(
-            lambda: search_memory(msg["query"], k=msg["k"])
+            lambda: search_memory(msg["query"], k=_jh_k, user_id=_jh_who)
         )
         connection.send_result(msg["id"], {"results": results})
     except Exception as exc:
@@ -2754,8 +2784,8 @@ async def ws_get_debug_log(
     connection: websocket_api.ActiveConnection,
     msg: dict,
 ) -> None:
-    """Return JARVIS internal debug log entries."""
-    connection.send_result(msg["id"], {"entries": list(_DEBUG_LOG)})
+    """Return JARVIS internal debug log entries. They hold what people said, so admins only; others get none."""
+    connection.send_result(msg["id"], {"entries": list(_DEBUG_LOG) if _is_admin(connection) else []})
 
 
 @websocket_api.websocket_command({
@@ -2971,7 +3001,7 @@ async def ws_camera_snapshot(
             connection.send_error(msg["id"], "unknown_camera", entity_id)
             return
         from . import camera as cam
-        img = await cam._get_best_image(hass, entity_id)
+        img = await cam._get_best_image(hass, entity_id, poll=True)
         if not img:
             _snap_log(entity_id,
                       "no frame — backend and proxy paths all empty "
@@ -3217,7 +3247,7 @@ async def ws_intrusion(
             # Reviewable event history with snapshots (v6.76.0)
             await intrusion.async_load(hass)
             connection.send_result(msg["id"], {
-                "events": intrusion.get_log(msg.get("limit", 50)),
+                "events": intrusion.get_log(msg.get("limit", 50)) if _is_admin(connection) else [],
                 "learning": intrusion.learning_summary(),
             })
         elif msg["action"] == "label":
@@ -3232,7 +3262,10 @@ async def ws_intrusion(
             await intrusion.async_load(hass)
             connection.send_result(msg["id"], intrusion.learning_summary())
         else:
-            connection.send_result(msg["id"], intrusion.status())
+            _jh_status = intrusion.status()
+            if not _is_admin(connection):
+                _jh_status = {**_jh_status, "last_snapshot": None}
+            connection.send_result(msg["id"], _jh_status)
     except Exception as exc:
         _LOGGER.exception("ws_intrusion failed: %s", exc)
         connection.send_error(msg["id"], "intrusion_failed", str(exc))
@@ -3260,6 +3293,12 @@ async def ws_faces(
         action = msg.get("action", "list")
         if action in ("add_resident", "remove_resident", "set_reference",
                       "remove_reference") and _deny_non_admin(connection, msg):
+            return
+        if not _is_admin(connection):
+            # Jarvis Home patch (2026-11-06): faces and residents are for admins. An empty list keeps the panel calm.
+            connection.send_result(msg["id"], {
+                "recent": [], "residents": [], "references": [], "auto_references": [],
+                "llm_face_recognition": False, "llm_face_autotrain": False, "recognition_source": "both"})
             return
         # Roster file I/O happens on the executor; the read below then runs on the
         # event loop against an already-loaded roster (no blocking file read).
@@ -3289,7 +3328,8 @@ async def ws_faces(
             jarvis_log("CAMERA", f"Resident reference photo removed: {msg['name']}")
         else:
             await hass.async_add_executor_job(face_roster._load)
-        recent = recognition.recent_faces(hass, int(msg.get("limit", 20)))
+        recent = await hass.async_add_executor_job(
+            recognition.inline_snapshots, recognition.recent_faces(hass, int(msg.get("limit", 20))))
         refs = await hass.async_add_executor_job(recognition.list_face_references)
         auto_refs = await hass.async_add_executor_job(recognition.list_auto_references)
         entry = _get_entry(hass)
@@ -3352,6 +3392,9 @@ async def ws_face_reference(
     the Faces panel can show the snapshot the user uploaded (#394). A read, so
     it is not admin-gated — the whole Faces panel sits behind Home Assistant
     auth, and this only ever returns a photo the user themselves enrolled."""
+    if not _is_admin(connection):  # Jarvis Home patch: a resident's photo is not for every login
+        connection.send_result(msg["id"], {"image": None})
+        return
     try:
         data_url = await hass.async_add_executor_job(
             _read_reference_data_url, msg["name"])
@@ -3609,7 +3652,7 @@ async def ws_semantic_search(
             connection.send_result(msg["id"], {
                 "enabled": enabled,
                 "ollama_configured": bool(base),
-                "base": base or "",
+                "base": (base or "") if _is_admin(connection) else "",
                 "model": embeddings._model(),
                 "vector_count": vcount,
             })
@@ -3911,7 +3954,7 @@ async def ws_goal_action(
             if msg.get("interval_min") is not None:
                 kwargs["check_interval_min"] = float(msg["interval_min"])
             res = await hass.async_add_executor_job(
-                lambda: goals.create(title, outcome, **kwargs))
+                lambda: goals.create(title, outcome, user_id=connection.user.id, **kwargs))
             if res.get("error"):
                 connection.send_error(msg["id"], "create_failed", res["error"])
                 return
@@ -3953,6 +3996,10 @@ async def ws_get_person_routines(
     """Per-person learned routines, grouped by person, for the Memory panel."""
     try:
         routines = await hass.async_add_executor_job(_get_person_routines)
+        if not _is_admin(connection):  # Jarvis Home patch: a non-admin sees only their own routines
+            from . import identity
+            mine = identity.subject_for_user(hass, connection.user.id)
+            routines = {k: v for k, v in routines.items() if identity.normalize(k) == mine}
         connection.send_result(msg["id"], {"routines": routines})
     except Exception as exc:
         _LOGGER.exception("get_person_routines failed: %s", exc)

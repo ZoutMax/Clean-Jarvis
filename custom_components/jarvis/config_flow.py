@@ -708,6 +708,14 @@ class JarvisOptionsFlow(OptionsFlow):
                          description=self._sv(CONF_WEB_RESEARCH_LLM_FALLBACK,
                                               DEFAULT_WEB_RESEARCH_LLM_FALLBACK)):
                 selector.BooleanSelector(),
+            vol.Optional("camera_watch_default", description=self._sv("camera_watch_default", "")):
+                selector.EntitySelector(selector.EntitySelectorConfig(domain="camera")),
+            vol.Optional("jh_strict_actions", description=self._sv("jh_strict_actions", True)):
+                selector.BooleanSelector(),
+            vol.Optional("jh_mail_block", description=self._sv("jh_mail_block", True)):
+                selector.BooleanSelector(),
+            vol.Optional("jh_facts_only_briefings", description=self._sv("jh_facts_only_briefings", True)):
+                selector.BooleanSelector(),
         })
         return self.async_show_form(step_id="core", data_schema=schema)
 

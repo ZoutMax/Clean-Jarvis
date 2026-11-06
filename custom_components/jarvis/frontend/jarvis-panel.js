@@ -1369,6 +1369,11 @@ class JarvisPanel extends HTMLElement {
     this._chatMessages = [];
     this._chatBusy = false;         // a request is in flight (disables send)
     this._chatConvId = null;        // HA conversation_id, for multi-turn context
+    this._chatLoaded = false;       // saved history fetched once per page
+    this._chatRemoved = new Set();  // ids deleted on this device
+    this._chatDraft = "";           // the message box survives a full render
+    this._chatSpeak = false;
+    try { this._chatSpeak = localStorage.getItem("jarvis_chat_speak") === "1"; } catch (e) {}
     this._knowledge = { facts: [], stats: {} }; // curated memory tab state
     this._knowledgeLoaded = false;
     this._logFilter = "all";       // log category filter
@@ -1460,6 +1465,14 @@ class JarvisPanel extends HTMLElement {
 
   disconnectedCallback() {
     this._stopIntervals();
+    if (this._chatResize) { window.removeEventListener("resize", this._chatResize); this._chatResize = null; }
+    if (this._micRelease) {
+      ["pointerup", "pointercancel"].forEach((n) => window.removeEventListener(n, this._micRelease));
+      this._micRelease = null;
+    }
+    this._micHeld = false;
+    if (this._micStop) this._micStop();
+    this._stopChatAudio();
   }
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────
@@ -1589,7 +1602,7 @@ class JarvisPanel extends HTMLElement {
       const structuralChange = !prev ||
         prev.areas?.length !== result.areas?.length;
       const interacting = this._currentTab === "settings" || this._currentTab === "logs"
-        || this._currentTab === "memory" || this._currentTab === "suggestions";
+        || this._currentTab === "memory" || this._currentTab === "suggestions" || this._currentTab === "chat";
       if (structuralChange && !interacting) {
         this._render();
       } else {
@@ -2328,15 +2341,15 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
     if (!this._chatMessages.length) {
       return `<div class="chat-empty">Ask JARVIS anything — "is the garage open?", "turn off the lab lights", "what's on my calendar tomorrow?"</div>`;
     }
-    const rows = this._chatMessages.map((m) => {
+    const rows = this._chatMessages.map((m, i) => {
       const cls = m.role === "user" ? "chat-msg chat-user"
                 : m.role === "error" ? "chat-msg chat-error"
                 : "chat-msg chat-jarvis";
       const who = m.role === "user" ? "YOU" : m.role === "error" ? "ERROR" : "JARVIS";
-      return `<div class="${cls}"><span class="chat-who">${who}</span><span class="chat-text">${this._esc(m.text)}</span></div>`;
+      return `<div class="${cls}"><button class="chat-del" data-i="${i}" title="Delete">✕</button><span class="chat-who">${who}</span><span class="chat-text">${this._esc(m.text)}</span></div>`;
     }).join("");
     const typing = this._chatBusy
-      ? `<div class="chat-msg chat-jarvis chat-typing"><span class="chat-who">JARVIS</span><span class="chat-text">…</span></div>`
+      ? `<div class="chat-msg chat-jarvis chat-typing"><span class="chat-who">JARVIS</span><span class="chat-think"><svg class="chat-spark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1l2.6 8.4L23 12l-8.4 2.6L12 23l-2.6-8.4L1 12l8.4-2.6z"/></svg><span class="chat-think-t">Thinking</span><span class="chat-think-s">${Math.floor((Date.now() - (this._chatStart || Date.now())) / 1000)}s</span></span></div>`
       : "";
     return rows + typing;
   }
@@ -2344,6 +2357,7 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
   /** Repaint only the chat log + compose controls — never a full _render(), so
    *  the input keeps focus and the message history isn't torn down mid-type. */
   _refreshChat() {
+    this._chatTag();
     const log = this.shadowRoot?.getElementById("chat-log");
     if (log) {
       log.innerHTML = this._renderChatMessages();
@@ -2355,20 +2369,310 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
     if (send)  { send.disabled = this._chatBusy; send.textContent = this._chatBusy ? "…" : "SEND"; }
   }
 
-  _clearChat() {
-    this._chatMessages = [];
-    this._chatConvId = null;
+  // Jarvis Home patch (2026-11-06): history follows the login on every device. A save reads what is stored first and merges
+  // by message id, so a phone and a PC cannot erase each other. Deleted ids travel in "removed". Nothing is written unless
+  // that read worked, so a failed load cannot wipe the history.
+  _chatTag() {
+    this._chatMessages.forEach((m) => {
+      m.t = m.t || Date.now();
+      m.id = m.id || m.t.toString(36) + Math.random().toString(36).slice(2, 8);
+    });
+  }
+
+  _chatMerge(stored) {
+    this._chatTag();
+    const gone = new Set(Array.isArray(stored?.removed) ? stored.removed : []);
+    this._chatRemoved.forEach((id) => gone.add(id));
+    const byId = new Map();
+    let last = 0;
+    (Array.isArray(stored?.messages) ? stored.messages : []).forEach((m, i) => {
+      if (!m || typeof m.text !== "string") return;
+      const id = m.id || "old" + i + "-" + m.role + "-" + m.text.length;   // saved before ids existed: the same on every device
+      last = m.t || last + 1;   // no time of its own: it stays right after the message before it
+      byId.set(id, { ...m, id, t: last });
+    });
+    if (this._chatWipe) byId.forEach((m, id) => gone.add(id));
+    this._chatMessages.forEach((m) => byId.set(m.id, m));
+    return {
+      messages: [...byId.values()].filter((m) => !gone.has(m.id)).sort((a, b) => a.t - b.t).slice(-200),
+      removed: [...gone].slice(-1000),
+    };
+  }
+
+  _chatApply(list) {
+    const same = list.length === this._chatMessages.length && list.every((m, i) => m === this._chatMessages[i]);
+    this._chatMessages = list;
+    if (!same) this._refreshChat();
+  }
+
+  async _loadChat() {
+    if (this._chatLoaded || this._chatLoading || !this._hass) return;
+    this._chatLoading = true;
+    try {
+      const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+      this._chatApply(this._chatMerge(res?.value).messages);
+      this._chatLoaded = true;
+    } catch (err) { console.warn("JARVIS chat: history not loaded", err); }
+    this._chatLoading = false;
+  }
+
+  // Home Assistant has no compare-and-set, so two devices saving at the same moment can overwrite each other. A moment after a
+  // write, read it back and put back what went missing. This narrows the window; it cannot close it.
+  async _chatRecheck(value) {
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+      const have = new Set((res?.value?.messages || []).map((m) => m?.id));
+      if (value.messages.every((m) => have.has(m.id))) return;
+      const again = this._chatMerge(res?.value);
+      this._chatApply(again.messages);
+      await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_chat", value: again });
+    } catch (err) { console.warn("JARVIS chat: history not checked", err); }
+  }
+
+  _saveChat() {
+    if (!this._hass) return Promise.resolve();
+    const run = async () => {
+      let wipe = false;
+      try {
+        const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+        const value = this._chatMerge(res?.value);
+        wipe = this._chatWipe;
+        this._chatWipe = false;
+        this._chatApply(value.messages);
+        this._chatLoaded = true;
+        await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_chat", value });
+        await this._chatRecheck(value);
+      } catch (err) {
+        this._chatWipe = this._chatWipe || wipe;   // the next save tries again with everything still in memory
+        console.warn("JARVIS chat: history not saved", err);
+      }
+    };
+    this._chatSaving = (this._chatSaving || Promise.resolve()).then(run);
+    return this._chatSaving;
+  }
+
+  // Jarvis Home patch (2026-11-05): the chat box fills the window on any screen; messages scroll inside it.
+  _sizeChat() {
+    const pn = this.shadowRoot?.querySelector(".chat-panel");
+    if (!pn) return;
+    const ft = this.shadowRoot.querySelector(".footer");
+    const h = window.innerHeight - pn.getBoundingClientRect().top - (ft ? ft.offsetHeight : 0) - 28;
+    pn.style.height = Math.max(320, Math.round(h)) + "px";
+    const log = this.shadowRoot.getElementById("chat-log");
+    if (log) log.scrollTop = log.scrollHeight;
+  }
+
+  // Jarvis Home patch (2026-11-05): the indicator lives only while a request is really pending.
+  _startThink() {
+    this._chatStart = Date.now();
+    clearInterval(this._thinkTimer);
+    this._thinkTimer = setInterval(() => {
+      if (!this._chatBusy) { clearInterval(this._thinkTimer); return; }
+      const el = this.shadowRoot?.querySelector(".chat-think-s");
+      if (el) el.textContent = Math.floor((Date.now() - this._chatStart) / 1000) + "s";
+    }, 1000);
+  }
+
+  _deleteChatMessage(i) {
+    if (this._chatBusy && i === this._chatMessages.length - 1 && this._chatMessages[i]?.role === "user") {
+      this._chatReq = (this._chatReq || 0) + 1;
+      this._chatBusy = false;
+    }
+    this._chatTag();
+    if (this._chatMessages[i]) this._chatRemoved.add(this._chatMessages[i].id);
+    this._chatMessages.splice(i, 1);
+    this._saveChat();
     this._refreshChat();
   }
 
-  async _sendChat() {
+  // Jarvis Home patch (2026-11-06): voice in the Chat tab, through Home Assistant's own Assist pipeline. One recording at a
+  // time, and the microphone is released on every path. Audio is kept from the first moment and sent when HA is ready, so the
+  // first word is not lost. While the button is held a pause does not end the recording: the release does.
+  async _toggleMic() {
+    if (this._micStop) { this._micStop(); return; }
+    if (this._micStarting) return;
+    const conn = this._hass?.connection;
+    const fail = (t) => { this._chatMessages.push({ role: "error", text: t }); this._refreshChat(); };
+    if (!conn) return;
+    if (!navigator.mediaDevices?.getUserMedia) { fail("The microphone needs the https address of this page."); return; }
+    this._micStarting = true;
+    let stream, ctx, src, proc, hid = null, done = false, unsub = null, ended = false, quiet = false;
+    const early = [];
+    const box = () => this.shadowRoot?.getElementById("chat-input");
+    const btn = () => this.shadowRoot?.getElementById("chat-mic");
+    const hint0 = box()?.placeholder;
+    const endByte = () => { try { conn.socket.send(new Uint8Array([hid])); } catch (e) {} };
+    const stop = () => {
+      if (done) return;
+      done = true;
+      this._micStarting = false;
+      this._micStop = null;
+      if (box()) box().placeholder = hint0;
+      try { proc?.disconnect(); src?.disconnect(); } catch (e) {}
+      stream?.getTracks().forEach((t) => t.stop());
+      ctx?.close()?.catch?.(() => {});
+      if (hid !== null) endByte();
+      btn()?.classList.remove("on");
+    };
+    const finish = () => {
+      ended = true;
+      if (!unsub) return;
+      const u = unsub;
+      unsub = null;
+      Promise.resolve().then(u).catch(() => {});
+    };
+    const send = (pcm) => {
+      const msg = new Uint8Array(1 + pcm.byteLength);
+      msg[0] = hid;
+      msg.set(new Uint8Array(pcm.buffer), 1);
+      try { conn.socket.send(msg); } catch (err) {}
+    };
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (err) { this._micStarting = false; fail("Microphone not available: " + (err?.message || err)); return; }
+    if (!this._micHeld) { stop(); return; }   // released during the permission prompt: no run, no message
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      try {
+        ctx = new AC({ sampleRate: 16000 });
+        src = ctx.createMediaStreamSource(stream);
+      } catch (err) {   // some browsers refuse a 16 kHz context on the microphone; Home Assistant converts other rates itself
+        ctx?.close()?.catch?.(() => {});
+        ctx = new AC();
+        src = ctx.createMediaStreamSource(stream);
+      }
+      proc = ctx.createScriptProcessor(4096, 1, 1);
+      proc.onaudioprocess = (e) => {
+        if (done) return;
+        const f = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(f.length);
+        for (let i = 0; i < f.length; i++) pcm[i] = Math.max(-1, Math.min(1, f[i])) * 0x7fff;
+        if (hid !== null) send(pcm);
+        else if (early.length < 400) early.push(pcm);
+      };
+      src.connect(proc);
+      proc.connect(ctx.destination);
+    } catch (err) { stop(); fail("Microphone not available: " + (err?.message || err)); return; }
+    this._micStop = stop;
+    this._micStarting = false;
+    btn()?.classList.add("on");
+    const onEvent = (ev) => {
+      if (ev.type === "run-start") {
+        hid = ev.data?.runner_data?.stt_binary_handler_id ?? null;
+        if (hid === null) return;
+        early.splice(0).forEach(send);
+        if (done) { quiet = true; endByte(); }   // released before HA was ready: a tap, so no complaint if nothing was said
+        else if (box()) box().placeholder = "Listening...";   // show that the mic is listening
+      } else if (ev.type === "stt-vad-end") stop();
+      else if (ev.type === "stt-end") {
+        stop();
+        finish();
+        const text = (ev.data?.stt_output?.text || "").trim();
+        if (text) {
+          this._chatDraft = text;
+          if (box()) box().value = text;
+          setTimeout(() => { if (this._chatDraft === text) this._sendChat(text); }, 1200);
+        }
+      } else if (ev.type === "error") {
+        stop();
+        finish();
+        if (!quiet) fail("Voice: " + (ev.data?.message || ev.data?.code || "not understood"));
+      } else if (ev.type === "run-end") { stop(); finish(); }
+    };
+    try {
+      const pipeId = await this._chatPipeline();
+      if (done) return;   // released before anything was asked of Home Assistant
+      const ask = (extra) => conn.subscribeMessage(onEvent, { type: "assist_pipeline/run", pipeline: pipeId, start_stage: "stt", end_stage: "stt",
+        input: { sample_rate: Math.round(ctx.sampleRate), ...extra }, timeout: 30 });
+      try { unsub = await ask({ no_vad: true }); }
+      catch (err) {
+        if (err?.code !== "invalid_format") throw err;
+        unsub = await ask({});   // a Home Assistant without no_vad here: a pause then ends the recording
+      }
+      if (ended) finish();
+    } catch (err) { stop(); fail("Voice: " + (err?.message || err)); }
+  }
+
+  async _speakChat(text) {
+    if (!this._chatSpeak || !text || !this.isConnected) return;   // a reply that lands after leaving the panel stays silent
+    const gen = this._speakGen;
+    try {
+      const pipeId = await this._chatPipeline();
+      const unsub = await this._hass.connection.subscribeMessage((ev) => {
+        if (ev.type === "tts-end") {
+          const url = ev.data?.tts_output?.url;
+          this._chatLastAudio = url;
+          if (url && this._chatSpeak && gen === this._speakGen) {
+            this._chatAudio?.pause();
+            this._chatAudio = new Audio(url);
+            this._chatAudio.play().catch((e) => console.warn("JARVIS chat: audio blocked", e));
+          }
+        }
+        if (ev.type === "run-end" || ev.type === "error") unsub();
+      }, { type: "assist_pipeline/run", pipeline: pipeId, start_stage: "tts", end_stage: "tts", input: { text } });
+    } catch (err) { console.warn("JARVIS chat: speech failed", err); }
+  }
+
+  _chatIcon(path) { return `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="${path}"/></svg>`; }
+
+  _ttsIcon() {
+    return this._chatIcon(this._chatSpeak
+      ? "M14,3.23V5.29C16.89,6.15 19,8.83 19,12C19,15.17 16.89,17.84 14,18.7V20.77C18,19.86 21,16.28 21,12C21,7.72 18,4.14 14,3.23M16.5,12C16.5,10.23 15.5,8.71 14,7.97V16C15.5,15.29 16.5,13.76 16.5,12M3,9V15H7L12,20V4L7,9H3Z"
+      : "M12,4L9.91,6.09L12,8.18M4.27,3L3,4.27L7.73,9H3V15H7L12,20V13.27L16.25,17.53C15.58,18.04 14.83,18.46 14,18.7V20.77C15.38,20.45 16.63,19.82 17.68,18.96L19.73,21L21,19.73L12,10.73M19,12C19,12.94 18.8,13.82 18.46,14.64L19.97,16.15C20.62,14.91 21,13.5 21,12C21,7.72 18,4.14 14,3.23V5.29C16.89,6.15 19,8.83 19,12M16.5,12C16.5,10.23 15.5,8.71 14,7.97V10.18L16.45,12.63C16.5,12.43 16.5,12.21 16.5,12Z");
+  }
+
+  _micIcon() {
+    return this._chatIcon("M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z");
+  }
+
+  // Jarvis Home patch (2026-11-05): use the speech settings of the assistant that runs JARVIS.
+  async _chatPipeline() {
+    try {
+      const res = await this._hass.callWS({ type: "assist_pipeline/pipeline/list" });
+      const agent = this._jarvisAgentId();
+      const all = (res?.pipelines || []).filter((x) => x.conversation_engine === agent);
+      const pick = all.find((x) => x.id === res?.preferred_pipeline) || all[0];
+      return pick?.id;
+    } catch (err) { return undefined; }
+  }
+
+  _toggleSpeak() {
+    this._chatSpeak = !this._chatSpeak;
+    try { localStorage.setItem("jarvis_chat_speak", this._chatSpeak ? "1" : "0"); } catch (e) {}
+    const b = this.shadowRoot?.getElementById("chat-speak");
+    if (b) { b.classList.toggle("on", this._chatSpeak); b.innerHTML = this._ttsIcon(); }
+    if (!this._chatSpeak && this._chatAudio) { this._chatAudio.pause(); this._chatAudio = null; }
+  }
+
+  _stopChatAudio() {
+    this._speakGen = (this._speakGen || 0) + 1;   // speech still being prepared must not start either
+    if (this._chatAudio) { this._chatAudio.pause(); this._chatAudio = null; }
+  }
+
+  _clearChat() {
+    this._chatTag();
+    this._chatMessages.forEach((m) => this._chatRemoved.add(m.id));
+    this._chatMessages = [];
+    this._chatConvId = null;
+    this._chatReq = (this._chatReq || 0) + 1;   // a reply still on its way stays out of the cleared chat
+    this._chatBusy = false;
+    this._stopChatAudio();
+    this._chatWipe = true;
+    this._saveChat();
+    this._refreshChat();
+  }
+
+  async _sendChat(spoken) {
     if (this._chatBusy) return;
     const input = this.shadowRoot?.getElementById("chat-input");
-    const text = (input?.value || "").trim();
+    const text = (input?.value || spoken || "").trim();
     if (!text) return;
     if (input) input.value = "";
+    this._chatDraft = "";
     this._chatMessages.push({ role: "user", text });
+    const reqId = (this._chatReq = (this._chatReq || 0) + 1);
     this._chatBusy = true;
+    this._startThink();
     this._refreshChat();
     try {
       const payload = {
@@ -2380,17 +2684,22 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
       if (agent) payload.agent_id = agent;
       if (this._chatConvId) payload.conversation_id = this._chatConvId;
       const res = await this._hass.callWS(payload);
+      if (reqId !== this._chatReq) return;  // cancelled with the red cross
       this._chatConvId = res?.conversation_id || this._chatConvId;
       const reply = res?.response?.speech?.plain?.speech
         || "(JARVIS returned no text.)";
       this._chatMessages.push({ role: "jarvis", text: reply });
+      this._speakChat(reply);
     } catch (err) {
+      if (reqId !== this._chatReq) return;
       this._chatMessages.push({
         role: "error",
         text: "Couldn't reach JARVIS — " + (err?.message || String(err)),
       });
     } finally {
+      if (reqId !== this._chatReq) return;
       this._chatBusy = false;
+      this._saveChat();
       this._refreshChat();
       this.shadowRoot?.getElementById("chat-input")?.focus();
     }
@@ -3847,6 +4156,8 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
   }
 
   _house3dFloor() {
+    // Jarvis Home patch (2026-11-04f): the owner's model has one floor; other styles keep their floors.
+    if (['my_apartment', 'appart_light'].includes(this._residenceStyle())) { this._currentFloor = 'all'; return 'all'; }
     const f = this._currentFloor || 'all';
     return f === 'bsmt' ? 'b' : f;
   }
@@ -3942,6 +4253,8 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
       modern:    { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
       townhouse: { roof: 'gable', pitch: 0.85, dormersFront: 0, dormersRear: 0 },
       apartment: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
+      my_apartment: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
+      appart_light: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
       cabin:     { roof: 'gable', pitch: 1.25, dormersFront: 2, dormersRear: 1 },
       semi_detached: { roof: 'gable', pitch: 0.9, dormersFront: 0, dormersRear: 0 },
       end_terrace:   { roof: 'gable', pitch: 0.9, dormersFront: 0, dormersRear: 0 },
@@ -3989,6 +4302,90 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
   _renderHouse3d() {
     const mount = this.shadowRoot?.querySelector('#res-iso');
     if (!mount || typeof JARVIS3D === 'undefined') return;
+    // Jarvis Home patch (2026-11-04b): ALL view = wireframe model of the owner's apartment (walls, doors, windows, balcony).
+    if (this._house3dFloor() === 'all' && ['my_apartment', 'appart_light'].includes(this._residenceStyle())) {
+      try {
+        const S = 0.02256, H = 2.6, SILL = 0.9, HEAD = 2.15, DH = 2.1, E = 0.25, I = 0.12;
+        const th = (this._house3dTheta != null ? this._house3dTheta : 35) * Math.PI / 180, co = Math.cos(th), si = Math.sin(th);
+        const CX = 207, CY = 330, B = [];
+        const seg = (a, b, t, y0, y1, k) => { const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]), z0 = Math.min(a[1], b[1]), z1 = Math.max(a[1], b[1]); const h = (z0 === z1); const tt = t / S / 2; B.push({ x0: (h ? x0 - tt : x0 - tt), x1: (h ? x1 + tt : x1 + tt), z0: (h ? z0 - tt : z0 - tt), z1: (h ? z1 + tt : z1 + tt), y0, y1, k }); };
+        const win = (a, b, t, ws, k) => { const h = a[1] === b[1], lo = h ? Math.min(a[0], b[0]) : Math.min(a[1], b[1]), hi = h ? Math.max(a[0], b[0]) : Math.max(a[1], b[1]); const pt = v => h ? [v, a[1]] : [a[0], v]; let cur = lo; ws.forEach(([w0, w1]) => { if (w0 > cur) seg(pt(cur), pt(w0), t, 0, H, k); seg(pt(w0), pt(w1), t, 0, SILL, k); seg(pt(w0), pt(w1), t, HEAD, H, k); seg(pt(w0), pt(w1), 0.03, SILL, HEAD, 'g'); cur = w1; }); if (cur < hi) seg(pt(cur), pt(hi), t, 0, H, k); };
+        const lin = (a, b, t, glass) => { seg(a, b, t, DH, H, 'i'); if (glass) seg(a, b, 0.03, 0.05, DH, 'g'); };
+        // exterior
+        seg([168, 62], [185, 62], E, 0, H, 'e'); win([230, 62], [410, 62], E, [[275, 365]], 'e'); seg([410, 62], [410, 598], E, 0, H, 'e');
+        win([168, 598], [410, 598], E, [[195, 335], [360, 400]], 'e'); seg([168, 537], [168, 598], E, 0, H, 'e');
+        win([5, 537], [115, 537], E, [[15, 105]], 'e'); seg([150, 537], [168, 537], E, 0, H, 'e');
+        seg([5, 350], [5, 537], E, 0, H, 'e'); seg([5, 350], [168, 350], E, 0, H, 'e'); seg([168, 62], [168, 350], E, 0, H, 'e');
+        lin([185, 62], [230, 62], E); lin([115, 537], [150, 537], E, true);
+        // interior
+        [[[168,112],[190,112]],[[235,112],[250,112]],[[250,62],[250,150]],[[250,185],[250,228]],[[250,262],[250,308]],[[250,342],[250,350]],
+         [[250,195],[410,195]],[[380,62],[380,195]],[[250,300],[410,300]],[[318,300],[318,348]],[[250,348],[410,348]],
+         [[168,350],[190,350]],[[225,350],[250,350]],[[168,350],[168,400]],[[168,490],[168,537]]].forEach(([a, b]) => seg(a, b, I, 0, H, 'i'));
+        lin([190,112],[235,112], I); lin([250,150],[250,185], I); lin([250,228],[250,262], I); lin([250,308],[250,342], I); lin([190,350],[225,350], I); lin([168,400],[168,490], I);
+        B.push({ x0: 318, x1: 410, z0: 300, z1: 348, y0: 0, y1: H, k: 's' });                     // shaft
+        seg([5, 598], [168, 598], 0.04, 0, 1.0, 'r'); seg([5, 537], [5, 598], 0.04, 0, 1.0, 'r'); // balcony railing
+        const floors = [['ENTRY',168,62,250,112],['HALL',168,112,250,350],['KITCHEN',250,62,410,195],['BATHROOM',250,195,410,300],['WC',250,300,318,348],
+                        ['BEDROOM',5,350,168,537],['LIVING ROOM',168,350,410,598],['BALCONY',5,537,168,598]];
+        const GHOST = this._residenceStyle && this._residenceStyle() === 'appart_light';
+        if (GHOST) { B.length = 0; floors.forEach(([n, x0, z0, x1, z1]) => B.push({ x0, x1, z0, z1, y0: 0, y1: n === 'BALCONY' ? 0.35 : 0.7, k: n === 'BALCONY' ? 'r' : 'e' })); }
+        const lit = this._house3dLit ? (this._house3dLit() || {}) : {};
+        // people first: a room with someone in it glows and counts as occupied (no motion sensors in this home).
+        // Room = where they last switched something (input_text.person_rooms JSON, set by the 'Person room from last
+        // action' automation); default: living room.
+        const hs = (this._hass && this._hass.states) || {};
+        let pmap = {}; try { pmap = JSON.parse((hs['input_text.person_rooms'] || {}).state || '{}'); } catch (_) { pmap = {}; }
+        const defRooms = {}, perRoom = {};
+        const people = Object.keys(hs).filter(id => id.startsWith('person.') && hs[id].state === 'home').sort().map(pid => {
+          const key = pid.split('.')[1], want = String(pmap[key] || defRooms[key] || 'LIVING ROOM').toUpperCase();
+          return { pid, key, room: (floors.find(r => r[0] === want) || floors.find(r => r[0] === 'LIVING ROOM')) };
+        }).filter(p => p.room);
+        const taken = new Set(people.map(p => p.room[0]));
+        // projection (plan units -> metres -> rotated iso)
+        const pr = (x, z, y) => { const X = (x - CX) * S, Z = (z - CY) * S, xr = X * co - Z * si, zr = X * si + Z * co; return [xr * 40, zr * 20 - y * 34, zr]; };
+        const polys = [];
+        const face = (pts, k) => { const P = pts.map(p => pr(p[0], p[1], p[2])); polys.push({ P, d: P.reduce((s, p) => s + p[2], 0) / P.length + (k === 'f' ? -100 : 0), k }); };
+        floors.forEach(([n, x0, z0, x1, z1]) => face([[x0, z0, 0], [x1, z0, 0], [x1, z1, 0], [x0, z1, 0]], taken.has(n) || lit[n.toLowerCase()] ? 'fl' : (n === 'BALCONY' ? 'fb' : 'f')));
+        polys.forEach(p => { if (p.k !== 'f') p.d -= 100; });
+        B.forEach(b => { const { x0, x1, z0, z1, y0, y1, k } = b;
+          if (!GHOST) face([[x0, z0, y1], [x1, z0, y1], [x1, z1, y1], [x0, z1, y1]], k);
+          face([[x0, z0, y0], [x1, z0, y0], [x1, z0, y1], [x0, z0, y1]], k);
+          face([[x0, z1, y0], [x1, z1, y0], [x1, z1, y1], [x0, z1, y1]], k); face([[x0, z0, y0], [x0, z1, y0], [x0, z1, y1], [x0, z0, y1]], k);
+          face([[x1, z0, y0], [x1, z1, y0], [x1, z1, y1], [x1, z0, y1]], k); });
+        polys.sort((a, b) => a.d - b.d);
+        const st = { e: ['rgba(0,242,254,0.025)', 'rgba(0,242,254,0.55)'], i: ['rgba(0,242,254,0.015)', 'rgba(0,242,254,0.35)'], g: ['rgba(120,220,255,0.12)', 'rgba(150,235,255,0.7)'],
+                     s: ['rgba(0,242,254,0.05)', 'rgba(0,242,254,0.3)'], r: ['rgba(0,245,160,0.12)', 'rgba(0,245,160,0.8)'],
+                     f: ['rgba(0,242,254,0.035)', 'rgba(0,242,254,0.22)'], fl: ['rgba(255,200,90,0.18)', 'rgba(255,200,90,0.6)'], fb: ['rgba(0,245,160,0.07)', 'rgba(0,245,160,0.45)'] };
+        // 'My apart low': simple copy of the apartment, one clean low outline per room.
+        if (GHOST) Object.assign(st, { e: ['rgba(120,225,255,0.05)', 'rgba(160,238,255,0.75)'], r: ['rgba(100,245,190,0.05)', 'rgba(120,255,205,0.75)'],
+          f: ['rgba(90,205,255,0.09)', 'rgba(160,238,255,0.75)'], fl: ['rgba(255,205,110,0.30)', 'rgba(255,215,130,0.9)'], fb: ['rgba(90,245,190,0.08)', 'rgba(120,255,205,0.75)'] });
+        let mnx = 1e9, mny = 1e9, mxx = -1e9, mxy = -1e9;
+        polys.forEach(p => p.P.forEach(q => { mnx = Math.min(mnx, q[0]); mny = Math.min(mny, q[1]); mxx = Math.max(mxx, q[0]); mxy = Math.max(mxy, q[1]); }));
+        const pad = 30, vb = [mnx - pad, mny - pad, (mxx - mnx) + 2 * pad, (mxy - mny) + 2 * pad].map(v => v.toFixed(1)).join(' ');
+        let svg = '<svg viewBox="' + vb + '" style="width:100%;height:100%;display:block" preserveAspectRatio="xMidYMid meet"><defs><filter id="jhglow"><feGaussianBlur stdDeviation="0.8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#jhglow)">';
+        polys.forEach(p => { const c = st[p.k] || st.i; svg += '<polygon points="' + p.P.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(' ') + '" fill="' + c[0] + '" stroke="' + c[1] + '" stroke-width="' + (GHOST ? 1 : 0.6) + '" stroke-linejoin="round"/>'; });
+        svg += '</g>';
+        floors.forEach(([n, x0, z0, x1, z1]) => { const q = pr((x0 + x1) / 2, (z0 + z1) / 2, 0.05); svg += '<text x="' + q[0].toFixed(1) + '" y="' + q[1].toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="9" letter-spacing="1.5" fill="' + (n === 'BALCONY' ? '#5fffc0' : '#7fe9ff') + '" opacity="0.85">' + n + '</text>'; });
+        // people markers (Jarvis Home 2026-11-04): every person.* that is home gets a marker with their HA map picture.
+        const esc = v => String(v).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+        people.forEach(({ pid, key, room: fl }, idx) => {
+          const st = hs[pid];
+          const n = perRoom[fl[0]] = (perRoom[fl[0]] || 0) + 1;
+          const q = pr((fl[1] + fl[3]) / 2, (fl[2] + fl[4]) / 2, 1.4), x = q[0] + (n - 1) * 34, y = q[1] - 6, R = 13, cid = 'jhpc' + idx;
+          const nm = st.attributes.friendly_name || key, pic = st.attributes.entity_picture;
+          svg += '<line x1="' + x.toFixed(1) + '" y1="' + (y + R).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + (q[1] + 34).toFixed(1) + '" stroke="#ffd166" stroke-width="1" stroke-dasharray="2 2" opacity="0.8"/>';
+          svg += '<defs><clipPath id="' + cid + '"><circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + R + '"/></clipPath></defs>';
+          svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (R + 2) + '" fill="#06121a" stroke="#ffd166" stroke-width="1.6"/>';
+          if (pic) svg += '<image href="' + esc(pic) + '" x="' + (x - R).toFixed(1) + '" y="' + (y - R).toFixed(1) + '" width="' + (2 * R) + '" height="' + (2 * R) + '" clip-path="url(#' + cid + ')" preserveAspectRatio="xMidYMid slice"/>';
+          else svg += '<text x="' + x.toFixed(1) + '" y="' + (y + 4).toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="11" fill="#ffd166">' + esc(nm.slice(0, 1).toUpperCase()) + '</text>';
+          svg += '<text x="' + x.toFixed(1) + '" y="' + (y - R - 6).toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="8" letter-spacing="1" fill="#ffd166">' + esc(nm.toUpperCase()) + '</text>';
+        });
+        svg += '</svg>';
+        mount.innerHTML = svg;
+        const occEl = this.shadowRoot && this.shadowRoot.getElementById('res-occ');
+        if (occEl) occEl.textContent = taken.size + ' / ' + floors.length;
+        return;
+      } catch (e) { console.error('JARVIS apartment model', e); }
+    }
     const floor = this._house3dFloor();
     const spec = this._houseSpec();
     const plan = this._house3dPlan();
@@ -4064,6 +4461,9 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
       townhouse: { label: 'Townhouse',  roof: 'gable', pitch: 0.85 },
       apartment: { label: 'Apartment',  roof: 'flat',  pitch: 0 },
       cabin:     { label: 'Cabin',      roof: 'gable', pitch: 1.25 },
+      // Jarvis Home patch (2026-11-04e): the owner's own apartment model, added after the ready-made styles.
+      my_apartment: { label: 'My residence', roof: 'flat', pitch: 0 },
+      appart_light: { label: 'My Resid', roof: 'flat', pitch: 0 },
       semi_detached: { label: 'Semi-Detached (UK)', roof: 'gable', pitch: 0.9 },
       end_terrace:   { label: 'End-of-Terrace (UK)', roof: 'gable', pitch: 0.9 },
       terrace:       { label: 'Mid Terrace (UK)',   roof: 'gable', pitch: 0.85 },
@@ -5074,7 +5474,7 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
             ${this._residenceStyleOptions(d)}
           </select>
         </div>
-        <div class="floor-tabs">
+        <div class="floor-tabs" style="${['my_apartment', 'appart_light'].includes(this._residenceStyle()) ? 'display:none' : ''}">
           <button class="floor-tab ${this._currentFloor === 'all' ? 'active' : ''}" data-floor="all">All</button>
           <button class="floor-tab ${this._currentFloor === '1f' ? 'active' : ''}" data-floor="1f">1st Floor</button>
           ${String(d.config?.home_stories ?? '1.5') !== '1' ? `<button class="floor-tab ${this._currentFloor === '2f' ? 'active' : ''}" data-floor="2f">2nd Floor</button>` : ''}
@@ -6260,15 +6660,19 @@ ${this._renderExcludedEntities(d)}
   <div class="chat-tab">
     <div class="panel chat-panel">
       <div class="head">
-        <span>Talk to JARVIS</span>
+        <span>Talk to JARVIS<button id="chat-clear" class="chat-clean">CLEAN</button></span>
         <span class="side">${this._chatAgentLabel()}</span>
       </div>
       <div id="chat-log" class="chat-log">${this._renderChatMessages()}</div>
       <div class="chat-compose">
-        <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message — Enter to send, Shift+Enter for a new line" ${this._chatBusy ? 'disabled' : ''} autocomplete="off"></textarea>
+        <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message — Enter to send, Shift+Enter for a new line" ${this._chatBusy ? 'disabled' : ''} autocomplete="off">${this._esc(this._chatDraft)}</textarea>
+        <div class="chat-voice">
+          <button id="chat-speak" class="chat-tts ${this._chatSpeak ? 'on' : ''}" title="Spoken replies on or off" aria-label="Spoken replies">${this._ttsIcon()}</button>
+          <button id="chat-mic" class="chat-mic ${this._micStop ? 'on' : ''}" title="Hold to talk" aria-label="Hold to talk">${this._micIcon()}</button>
+        </div>
         <button id="chat-send" class="chat-send" ${this._chatBusy ? 'disabled' : ''} title="Send">${this._chatBusy ? '…' : 'SEND'}</button>
       </div>
-      <div class="chat-hint">Same brain as voice &amp; the HA Assist box — it can answer questions and control the home. History clears on reload. <button id="chat-clear" class="chat-clear">clear</button></div>
+      <!-- chat-hint-removed -->
     </div>
   </div>
   ` : ''}
@@ -6561,6 +6965,7 @@ ${this._renderExcludedEntities(d)}
     if (chatSend) chatSend.addEventListener("click", () => this._sendChat());
     const chatInput = this.shadowRoot.querySelector("#chat-input");
     if (chatInput) {
+      chatInput.addEventListener("input", () => { this._chatDraft = chatInput.value; });
       chatInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this._sendChat(); }
       });
@@ -6571,6 +6976,40 @@ ${this._renderExcludedEntities(d)}
     }
     const chatClear = this.shadowRoot.querySelector("#chat-clear");
     if (chatClear) chatClear.addEventListener("click", () => this._clearChat());
+    const chatLogEl = this.shadowRoot.getElementById("chat-log");
+    if (chatLogEl) {
+      chatLogEl.addEventListener("click", (e) => {
+        const del = e.target.closest(".chat-del");
+        if (del) this._deleteChatMessage(Number(del.dataset.i));
+      });
+      this._loadChat();
+      this._sizeChat();
+      requestAnimationFrame(() => this._sizeChat());
+      const micBtn = this.shadowRoot.getElementById("chat-mic");
+      if (micBtn) {
+        micBtn.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          try { micBtn.setPointerCapture(e.pointerId); } catch (err) {}
+          this._micHeld = true;
+          this._micPointer = e.pointerId;
+          if (!this._micStop) this._toggleMic();
+        });
+        micBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+      }
+      this.shadowRoot.getElementById("chat-speak")?.addEventListener("click", () => this._toggleSpeak());
+      if (!this._chatResize) {
+        this._chatResize = () => this._sizeChat();
+        window.addEventListener("resize", this._chatResize);
+      }
+      if (!this._micRelease) {   // on the window: a full render may replace the button while it is held
+        this._micRelease = (e) => {
+          if (e.pointerId !== this._micPointer) return;
+          this._micHeld = false;
+          if (this._micStop) this._micStop();
+        };
+        ["pointerup", "pointercancel"].forEach((n) => window.addEventListener(n, this._micRelease));
+      }
+    }
 
     // Settings sub-navigation: switch section without a full re-render (cards
     // stay in the DOM; we just show the active section's cards).
@@ -8544,7 +8983,9 @@ ${this._renderExcludedEntities(d)}
       let stored = null;
       try { stored = window.localStorage.getItem("jarvis_active_cam"); } catch (_) {}
       const remembered = stored && this._cams.some(c => c.entity_id === stored);
-      this._activeCam = remembered ? stored : this._cams[0].entity_id;
+      // Jarvis Home patch (2026-11-04c): every page open starts on the camera chosen in Core settings.
+      const _jhCam = this._liveData?.config?.camera_watch_default;
+      this._activeCam = this._cams.some(c => c.entity_id === _jhCam) ? _jhCam : this._cams[0].entity_id;
       this._manualCam = this._activeCam;
     }
     this._lastCamKey = "";  // a full render replaced the feed node — force re-attach
@@ -13250,9 +13691,8 @@ ${this._renderExcludedEntities(d)}
   .chat-tab { padding: 4px 0 16px; }
   .chat-panel { display: flex; flex-direction: column; }
   .chat-log {
-    flex: 1 1 auto;
-    min-height: 240px;
-    max-height: 56vh;
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
     padding: 12px 4px;
     display: flex;
@@ -13269,6 +13709,39 @@ ${this._renderExcludedEntities(d)}
     font-size: 13px; line-height: 1.5; word-wrap: break-word;
     white-space: pre-wrap;
   }
+  .chat-msg { position: relative; padding-right: 26px !important; }
+  .chat-del { position: absolute; top: 4px; right: 6px; background: none; border: 0; color: #ff4d4d;
+    cursor: pointer; font-size: 13px; line-height: 1; padding: 2px; }
+  .chat-del:hover { color: #ff1f1f; }
+  .chat-clean { margin-left: 12px; background: none; border: 1px solid var(--line-hot); color: var(--cyan);
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; padding: 2px 8px;
+    border-radius: var(--radius); cursor: pointer; }
+  .chat-clean:hover { background: var(--cyan-faint); }
+  .chat-think { display: inline-flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; }
+  .chat-spark { width: 16px; height: 16px; color: var(--cyan); animation: chatSpark 1.6s ease-in-out infinite; transform-origin: center; }
+  .chat-think-t { background: linear-gradient(90deg, var(--text-dim) 25%, var(--cyan) 50%, var(--text-dim) 75%);
+    background-size: 220% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: chatShimmer 1.8s linear infinite; }
+  .chat-think-s { color: var(--text-dim); font-size: 11px; opacity: 0.8; }
+  @keyframes chatSpark { 0%, 100% { transform: scale(0.8) rotate(0deg); opacity: 0.55; } 50% { transform: scale(1.1) rotate(90deg); opacity: 1; } }
+  @keyframes chatShimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+  .chat-clean.on, .chat-mic.on { background: var(--cyan-faint); }
+  .chat-mic { background: none; border: 1px solid var(--line-hot); color: var(--cyan); font-family: var(--font-mono);
+    font-size: 11px; letter-spacing: 0.08em; padding: 0 14px; border-radius: var(--radius); cursor: pointer; }
+  .chat-mic.on { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-mic { touch-action: none; user-select: none; -webkit-user-select: none; }
+  .chat-voice { display: flex; flex-direction: column; gap: 4px; }
+  .chat-voice button { flex: 1 1 0; min-height: 26px; }
+  .chat-tts { background: none; border: 1px solid var(--line-hot); color: var(--text-dim); font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.08em; padding: 0 10px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+  .chat-tts.on { color: var(--cyan); background: var(--cyan-faint); }
+  /* chat-compose-even */
+  .chat-compose { align-items: stretch !important; }
+  /* chat-compose-oneline */
+  .chat-compose .chat-input { height: 40px; min-height: 40px; box-sizing: border-box; }
+  .chat-compose .chat-send { height: 40px; align-self: stretch; }
+  .chat-voice { flex: none; flex-direction: row !important; width: auto; height: 40px; gap: 8px !important; align-self: stretch; }
+  .chat-voice button { flex: none; width: 40px; height: 40px; min-height: 0; padding: 0; display: flex;
+    align-items: center; justify-content: center; }
   .chat-who {
     font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.08em;
     opacity: 0.7;

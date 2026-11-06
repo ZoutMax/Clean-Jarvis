@@ -51,12 +51,13 @@ def shape_history(rows, limit: int = DEFAULT_MAX, char_cap: int = _CHAR_CAP) -> 
     return out[-limit:] if limit else out
 
 
-async def load_recent(hass, hours: int = DEFAULT_HOURS, limit: int = DEFAULT_MAX) -> list:
+async def load_recent(hass, hours: int = DEFAULT_HOURS, limit: int = DEFAULT_MAX,
+                      user_id: str = "", device_id: str = "") -> list:
     """Recent cross-session turns to seed a fresh conversation with. Reads the
     DB in the executor. Never raises."""
     try:
-        from .database import get_recent_messages
-        rows = await hass.async_add_executor_job(get_recent_messages, hours, None, limit)
+        from .database import get_thread_messages  # Jarvis Home patch: one person only
+        rows = await hass.async_add_executor_job(get_thread_messages, hours, limit, user_id, device_id)
         return shape_history(rows, limit)
     except Exception as exc:
         _LOGGER.debug("memory_thread load_recent failed: %s", exc)
