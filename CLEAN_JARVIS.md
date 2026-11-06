@@ -22,12 +22,20 @@ Clean Jarvis is a patch of [JARVIS AI Assistant](https://github.com/sam3gp8/jarv
 
 Requires Home Assistant 2026.11 or newer, which includes the Marketplace.
 
+**If you already have the original JARVIS**, make a backup, then remove it first. The Marketplace will not install over it:
+
+1. Go to **Settings > Devices & services**, open JARVIS and delete it.
+2. Go to **Settings > Marketplace**, open JARVIS and uninstall it.
+
+**Then install Clean Jarvis:**
+
 1. Go to **Settings > Marketplace**.
 2. Select **Add from link** in the upper-right corner. Connect GitHub if asked.
 3. Enter `https://github.com/ZoutMax/Clean-Jarvis`, then install it as an integration.
 4. Restart Home Assistant.
+5. If JARVIS does not appear under **Settings > Devices & services**, add it there.
 
-Clean Jarvis uses the same internal name as the original, so it replaces it. Your settings, memory and chat history stay. Make a backup first. New chat data is stored in a newer format, so going back to the original later may not keep everything.
+In our test, stored facts survived this swap. Clean Jarvis uses the same internal name as the original, so you can only have one of them. New chat data is stored in a newer format, so going back to the original later may not keep everything.
 
 ## Updates
 
