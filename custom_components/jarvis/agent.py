@@ -1512,6 +1512,9 @@ async def _exec_search_entities(hass: HomeAssistant, args: dict) -> str:
                 fuzz = _fuzzy(query, fname)
                 if fuzz > 45:
                     score = fuzz * 0.7  # Scale down fuzzy scores
+                from .local_engine import _jh_sound
+                if len(_jh_sound(query)) >= 3 and _jh_sound(query) == _jh_sound(fname):
+                    score = 64   # Jarvis Home patch: sounds the same, just under every normal match
 
                 # Word-level fuzzy — check each query word
                 if not score and query_words:
@@ -1858,11 +1861,13 @@ async def _exec_execute_plan(hass: HomeAssistant, args: dict) -> str:
     # failed step). Authority stays as-is (per-step confirm-gate, log-only).
     from . import actuation
     from .kernel import plan as _kplan
-    from homeassistant.core import Context
 
     # Jarvis Home patch: the service call carries the login, so Home Assistant applies that person's own rights too.
     _jh_limited = await _jh_limited_caller(hass)
-    _jh_ctx = Context(user_id=_JH_CALLER.get()) if _JH_CALLER.get() else None
+    _jh_ctx = None
+    if _JH_CALLER.get():
+        from homeassistant.core import Context
+        _jh_ctx = Context(user_id=_JH_CALLER.get())
     results = []
     succeeded = 0
     for i, step in enumerate(steps):

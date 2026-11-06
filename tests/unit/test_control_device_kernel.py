@@ -27,12 +27,33 @@ def agent(load):
 async def test_previous_state_comes_from_worldmodel_snapshot(agent, fake_hass):
     """The result's previous_state is the snapshot state read via WorldModel."""
     fake_hass.states.set("light.den", "off")
+    async def flip(domain, service, data=None, blocking=False, **kw):
+        fake_hass.service_calls.append((domain, service, dict(data or {})))
+        fake_hass.states.set("light.den", "on")
+    fake_hass.services.async_call = flip
     out = await agent._exec_control_device(
         fake_hass, {"entity_id": "light.den", "action": "turn_on"})
     await fake_hass.drain()
     res = json.loads(out)
-    assert res["success"] is True
+    assert res["success"] is True and res["confirmed"] is True
     assert res["previous_state"] == "off"
+    assert res["new_state"] == "on"
+
+
+async def test_a_device_that_never_reports_is_not_a_success(agent, fake_hass, monkeypatch):
+    """Clean Jarvis truth rule: a command that was sent but never showed up in the
+    device state is reported as sent and unconfirmed, not as done."""
+    async def _no_wait(_secs):
+        return None
+    monkeypatch.setattr(agent.asyncio, "sleep", _no_wait)
+    fake_hass.states.set("light.den", "off")
+    out = await agent._exec_control_device(
+        fake_hass, {"entity_id": "light.den", "action": "turn_on"})
+    res = json.loads(out)
+    assert res["success"] is False and res["confirmed"] is False
+    assert res["sent"] is True and "not confirmed" in res["warning"]
+    assert res["previous_state"] == "off" and res["new_state"] == "off"
+    assert ("light", "turn_on", {"entity_id": "light.den"}) in fake_hass.service_calls
 
 
 async def test_area_surfaced_from_worldmodel(agent, fake_hass):
@@ -219,6 +240,10 @@ async def test_control_device_routes_execution_through_planner(agent, fake_hass,
         return await real(plan, **kw)
     monkeypatch.setattr(kplan, "aexecute_plan", _spy)
     fake_hass.states.set("lock.front", "unlocked")
+    async def flip(domain, service, data=None, blocking=False, **kw):
+        fake_hass.service_calls.append((domain, service, dict(data or {})))
+        fake_hass.states.set("lock.front", "locked")
+    fake_hass.services.async_call = flip
     out = await agent._exec_control_device(
         fake_hass, {"entity_id": "lock.front", "action": "lock"})
     await fake_hass.drain()

@@ -32,5 +32,5 @@ def test_briefing_gives_reasoning_room():
     with open("custom_components/jarvis/briefing.py") as f:
         brief = f.read()
     # budget large enough for a reasoning model to think AND answer
-    m = re.search(r"max_tokens=(\d+),\s*\n\s*temperature=0\.6", brief)
+    m = re.search(r"max_tokens=(\d+),\s*temperature=0\.6", brief)
     assert m and int(m.group(1)) >= 1200, "briefing needs a larger token budget"

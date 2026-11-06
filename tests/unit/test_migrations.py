@@ -18,7 +18,7 @@ def test_full_chain_v1_to_current(m):
     assert "tts_premium_engine" in options                         # v2
     assert options["tts_premium_contexts"] == [
         "briefing", "camera", "doorbell", "recognition"]
-    assert options["directive_preset"] == "guardian_steward"      # v3
+    assert options["directive_preset"] == "clean_jarvis"          # v3, the Clean Jarvis default
     assert options["llm_provider"] == "groq"                       # v4
     assert options["room_routing"] is True                        # v5
     assert options["voice_satellites"] == []

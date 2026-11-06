@@ -1,3 +1,17 @@
+## [1.0.3] — Clean Jarvis: punctuation, sound-alike names, Hey JARVIS
+
+- Punctuation never changes a command. "Switch, lamp, green." now works like "switch lamp green", on the local path and in the check that a reply has a real action behind it. Numbers and times keep their marks, such as 21.5 and 7:30.
+- Device names that only sound the same are found as a last fallback, so "fone" finds a device called Phone. Names shown stay as they are, and two devices that both sound right get the question which one is meant.
+- New Hey JARVIS switch in the Chat tab, off by default and remembered per browser. It uses the wake word of the assistant in Home Assistant, sends its audio to Home Assistant only, and rests during hold to talk and while JARVIS speaks.
+
+## [1.0.2] — Clean Jarvis: the original test suite passes
+
+- The new Core options now exist in every translation file, with the English text where no translation exists yet.
+- The action check, mail block, facts-only briefing switches and the Camera Watch default can also be set in the panel.
+- With no default camera chosen, Camera Watch remembers the last camera again, as in the original.
+- Briefings and plans no longer depend on an import that could fail. If the facts-only switch cannot be read, briefings stay with facts.
+- The original test suite now describes Clean Jarvis behaviour where it differs on purpose.
+
 ## [9.86.0] — Faces tab: Frigate / Double Take provenance, and training the best-effort matcher
 
 The Faces tab now shows where each identity comes from and lets a real face

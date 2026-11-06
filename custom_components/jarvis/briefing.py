@@ -186,6 +186,16 @@ def _speakable(text: str) -> str:
     return text.replace(" Power is drawing", " is drawing")
 
 
+def _jh_facts_only_on(hass) -> bool:
+    """Jarvis Home patch (2026-11-05): the Core switch for facts-only briefings. If it cannot be read, stay with facts."""
+    try:
+        from . import jarvis_config
+        from .directive_helper import get_entry
+        return bool(jarvis_config.runtime_get(hass, get_entry(hass), "jh_facts_only_briefings", True))
+    except Exception:
+        return True
+
+
 def _facts_home(hass, people: bool = False, energy: bool = True) -> list[str]:
     """Jarvis Home patch: real facts for spoken briefings, straight from HA states. Heaters come from
     local_engine._jh_heaters, and a heater line is only spoken when heater data exists."""
@@ -325,9 +335,7 @@ async def async_briefing(
         except Exception:
             pass
 
-    from . import jarvis_config as _jh_cfg
-    from .directive_helper import get_entry as _jh_entry
-    _jh_facts_only = _jh_cfg.runtime_get(hass, _jh_entry(hass), "jh_facts_only_briefings", True)
+    _jh_facts_only = _jh_facts_only_on(hass)
 
     # Camera detection summary from proactive briefing system
     try:

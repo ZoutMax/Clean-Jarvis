@@ -85,9 +85,19 @@ def _ctx_fresh():
 
 # ── Normalization ───────────────────────────────────────────────────────────
 
+# Jarvis Home patch (2026-11-06): punctuation is how speech-to-text writes a pause, so it never changes what a command does.
+# Digits keep what numbers and times need (21.5, 1,5, 7:30, -5, 50%), and words keep their apostrophes and hyphens.
+_JH_MARKS_RE = re.compile(r"(?<!\d)[,:]|[,:](?!\d)|[!?;…¡¿\"“”„«»()\[\]{}–—。、，！？；：]|(?<!\w)['`]|['`](?!\w)|(?<!\S)-+(?!\S)")
+
+
+def _jh_clean(text: str) -> str:
+    text = str(text or "").replace("’", "'").replace("‘", "'")
+    text = re.sub(r"(?<!\d)\.|\.(?!\d)", "", text)   # gone without a space, so "a.m." stays one word
+    return " ".join(_JH_MARKS_RE.sub(" ", text).split())
+
+
 def _normalize(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[.,!?;:]+$", "", text)
+    text = _jh_clean(text.lower())
     text = re.sub(r"\s+", " ", text)
     return text
 
@@ -217,7 +227,7 @@ _QUERY_PATTERNS = [
 
 def score_complexity(text: str) -> int:
     """Score 0-100. Higher = needs LLM. <70 handled locally."""
-    t = text.lower()
+    t = _jh_clean(text).lower()
     score = 20
     # Strong LLM signals
     for w in ("explain", "why", "how does", "what do you think",
@@ -351,6 +361,46 @@ def _jh_frag(name_fragment):
             if shorter != fragment:
                 fragment, changed = shorter, True
     return re.sub(r"^(?:my|the|light|lamp|plug|switch)\s+(?=\S)", "", fragment.strip()).strip()  # Jarvis Home patch: filler words
+
+
+def _jh_sound(text):
+    """Jarvis Home patch (2026-11-06): how a name sounds, for comparing only. k, ck and q become c, ph becomes f, z becomes s and
+    doubled letters count once. Digits stay as they are, so Lamp 11 is never Lamp 1."""
+    t = _jh_clean(text).lower().replace("colour", "color").replace("ph", "f").replace("ck", "c")
+    t = re.sub(r"[kq]", "c", t).replace("z", "s")
+    return re.sub(r"([^\W\d_])\1+", r"\1", t)
+
+
+def _jh_sound_hits(hass, fragment, domains):
+    """The real names that sound like these words, read live: the whole name when one sounds alike, else names that hold every
+    word. Whole words only, and three letters at least, so a sound never stretches to an unrelated name."""
+    want = _jh_sound(fragment)
+    if len(want.replace(" ", "")) < 3:
+        return []
+    words = set(want.split())
+    whole, part = [], []
+    for domain in domains:
+        for st in hass.states.async_all(domain):
+            name = st.attributes.get("friendly_name") or ""
+            if not name or _jh_is_setting(hass, st.entity_id):
+                continue
+            sound = _jh_sound(name)
+            box = whole if sound == want else part if words <= set(sound.split()) else None
+            if box is not None and name not in [x[1] for x in box]:
+                box.append((st.entity_id, name))
+    return whole or part
+
+
+_JH_SOUND_DOMAINS = ("light", "switch", "lock", "cover", "climate", "fan", "media_player", "sensor", "binary_sensor")
+
+
+def _jh_sound_many(hass, name_fragment, resolved, domains=None):
+    """Two or more devices that sound like these words, when normal matching did not find the name. Never guess between them."""
+    frag = _jh_frag(name_fragment)
+    if not frag or (resolved and frag in str(resolved[1]).lower().replace("colour", "color")):
+        return []
+    hits = _jh_sound_hits(hass, frag, domains or _JH_SOUND_DOMAINS)
+    return hits if len(hits) > 1 else []
 
 
 def _jh_heaters(hass):
@@ -514,6 +564,11 @@ def _find_entity(hass, name_fragment, domain_hint=None, learned_aliases=None):
         _LOGGER.info("Entity resolve: '%s' → %s (score=%.0f)", fragment, best_match[0], best_score)
         return best_match
 
+    _jh_heard = _jh_sound_hits(hass, fragment, domains)
+    if len(_jh_heard) == 1:   # two sound-alikes are for the caller to ask about
+        _LOGGER.info("Entity resolve: sounds like '%s' → %s", fragment, _jh_heard[0][0])
+        return _jh_heard[0]
+
     # A failed resolution is normal, expected control flow: the phrase looked
     # vaguely command-like but matched no device, so the caller falls through
     # to the LLM (which has fuzzy search + aliases). DEBUG, not WARNING — this
@@ -539,6 +594,9 @@ def _find_entities_in_area(hass, area_name, domain):
             if area_name.lower() in area.name.lower():
                 target = area
                 break
+        if not target:
+            _jh_rooms = [a for a in area_reg.async_list_areas() if len(_jh_sound(area_name)) >= 3 and _jh_sound(a.name) == _jh_sound(area_name)]
+            target = _jh_rooms[0] if len(_jh_rooms) == 1 else None
         if not target:
             return []
         for entry in ent_reg.entities.values():
@@ -709,7 +767,7 @@ _JH_ACT_DOMAINS = ("light", "switch", "fan", "cover", "lock", "climate", "media_
 def _jh_opening(text):
     """(the words without greetings and politeness, was it a polite request, did it end in a question mark)."""
     said = (text or "").strip().lower().replace("’", "'")
-    body = _JH_FILLER_RE.sub("", said)
+    body = _JH_FILLER_RE.sub("", _jh_clean(said))
     polite = _JH_POLITE_RE.match(body)
     if polite:
         body = _JH_FILLER_RE.sub("", body[polite.end():])
@@ -735,7 +793,11 @@ def _jh_names_device(hass, body):
     except Exception:
         pass
     # "set the mood in the bedroom" is about the room, not an order to it, and "sun's up" is no device called Sun
-    return any(len(n) >= 3 and re.search(rf"(?<!\bin )(?<!\bat )(?<!\bto )(?<!\bof )(?<!\bfor )(?<!\bwith )(?<!\bfrom )\b{re.escape(n.lower())}\b(?!['\u2019])", re.sub(_JH_ARTICLE, " ", body)) for n in names)
+    hay = re.sub(_JH_ARTICLE, " ", body)
+    ears = _jh_sound(hay)
+    def said(name, words):
+        return len(name) >= 3 and re.search(rf"(?<!\bin )(?<!\bat )(?<!\bto )(?<!\bof )(?<!\bfor )(?<!\bwith )(?<!\bfrom )\b{re.escape(name)}\b(?!['\u2019])", words)
+    return any(said(n.lower(), hay) or said(_jh_sound(n), ears) for n in names)
 
 
 def _jh_local_order(hass, body, aliases):
@@ -758,6 +820,8 @@ def _jh_local_order(hass, body, aliases):
             found = _find_entity(hass, name, hint, aliases) or _find_entity(hass, name, None, aliases)
             if found and found[0].split(".")[0] in _JH_ACT_DOMAINS:
                 return True
+            if any(x[0].split(".")[0] in _JH_ACT_DOMAINS for x in _jh_sound_many(hass, name, None)):
+                return True
     return False
 
 
@@ -765,8 +829,8 @@ def device_command(hass, text, aliases=None):
     """True when these words order a device about. By the local patterns, or, in any language, by an action word that opens the
     sentence (after please, the assistant's name or a polite opening) and a device or room name after it. Nothing else counts:
     a sentence that opens with its own subject is a statement, and missing a command costs less than replacing ordinary chat."""
-    body, polite, mark = _jh_opening(text)
-    if (mark and not polite) or (not polite and _JH_ASK_RE.match(body)):
+    body, polite, _mark = _jh_opening(text)
+    if not polite and _JH_ASK_RE.match(body):
         return False
     body = _normalize(body)
     while _JH_TAIL_RE.search(body):
@@ -799,6 +863,9 @@ def _find_scene_or_script(hass, name_fragment):
             if fragment.replace(" ", "_") in state.entity_id:
                 return (state.entity_id,
                         state.attributes.get("friendly_name", state.entity_id), dtype)
+    _jh_heard = _jh_sound_hits(hass, fragment, ("scene", "script"))
+    if len(_jh_heard) == 1:
+        return (*_jh_heard[0], _jh_heard[0][0].split(".")[0])
     return None
 
 
@@ -1142,9 +1209,12 @@ def _jh_shows(state, want) -> bool:
     return sum((int(a) - int(b)) ** 2 for a, b in zip(got, want)) <= 130 ** 2
 
 
-async def _jh_try_color(hass, normalized, honorific):
+async def _jh_try_color(hass, normalized, honorific, pending_key=""):
     """Jarvis Home patch (2026-11-05): colour commands, read from the lamp's real abilities."""
-    m = _JH_COLOR_RE.match(normalized)
+    said = _jh_opening(normalized)[0]   # "Jarvis, switch the lamp green, please" is the same colour command
+    while _JH_TAIL_RE.search(said):
+        said = _JH_TAIL_RE.sub("", said)
+    m = _JH_COLOR_RE.match(said)
     if not m or m.group(1).split()[0] in ("on", "off") or m.group(2) in ("please", "now") or m.group(1).strip() in _JH_PRONOUNS:
         return None
     from homeassistant.util.color import color_name_to_rgb
@@ -1154,7 +1224,12 @@ async def _jh_try_color(hass, normalized, honorific):
         return None
     found = _find_entity(hass, m.group(1), "light")
     if not found:
-        return None
+        _jh_ears = _jh_sound_many(hass, m.group(1), None, ["light"])
+        if not _jh_ears:
+            return None
+        _JH_PENDING[pending_key] = {"action": "turn_on", "colour": m.group(2), "options": _jh_ears, "at": time.time()}
+        _jh_n = [x[1] for x in _jh_ears]
+        return LocalResult(text=f"Which one, {honorific}: {', '.join(_jh_n[:-1])} or {_jh_n[-1]}?", success=False)
     entity_id, fname = found
     state = hass.states.get(entity_id)
     if state is None or state.state in ("unavailable", "unknown"):
@@ -1198,6 +1273,8 @@ async def try_local(hass, text, honorific="sir", force=False, pending_key=""):
         _jh_m = [x for x in _jh_p["options"] if _jh_w and set(_jh_w) <= set(x[1].lower().split())]
         if not _jh_m and len(_jh_p["options"]) == 1 and re.fullmatch(_JH_YES, " ".join(_jh_w)):
             _jh_m = _jh_p["options"]   # "Do you mean X?" has a yes for an answer
+        if len(_jh_m) == 1 and _jh_p.get("colour"):
+            return await _jh_try_color(hass, f"set {_jh_m[0][1].lower()} to {_jh_p['colour']}", honorific)
         if len(_jh_m) == 1:
             _jh_eid, _jh_name = _jh_m[0]
             if _needs_confirmation(hass, _jh_p["action"], _jh_eid):
@@ -1211,7 +1288,7 @@ async def try_local(hass, text, honorific="sir", force=False, pending_key=""):
         _LOGGER.debug("Local: complexity %d for '%s' — LLM", complexity, text[:60])
         return None
 
-    _jh_color = await _jh_try_color(hass, normalized, honorific)
+    _jh_color = await _jh_try_color(hass, normalized, honorific, pending_key)
     if _jh_color is not None:
         return _jh_color
 
@@ -1377,6 +1454,13 @@ async def try_local(hass, text, honorific="sir", force=False, pending_key=""):
         ) or _find_entity(hass, name_frag, None, learned_aliases)
         if resolved and not _jh_named and (_jh_wrong_kind(name_frag, resolved) or _jh_wrong_kind(_jh_said, resolved)):
             resolved = None   # the fan was asked for, so the lamp of that room is no answer
+        _jh_ears = None if _jh_named else _jh_sound_many(hass, name_frag, resolved, None if action in ("turn_on", "turn_off") or not domain_hint else [domain_hint])
+        if _jh_ears:
+            if action not in ("turn_on", "turn_off", "lock", "unlock", "open", "close") or any(_needs_confirmation(hass, action, x[0]) for x in _jh_ears):
+                return None   # a value to carry or a protected device: the agent asks
+            _JH_PENDING[pending_key] = {"action": action, "options": _jh_ears, "at": time.time()}
+            _jh_n = [x[1] for x in _jh_ears]
+            return LocalResult(text=f"Which one, {honorific}: {', '.join(_jh_n[:-1])} or {_jh_n[-1]}?", success=False)
         if not resolved:
             # Track failure but keep trying other patterns/domains
             _last_failed_name = name_frag

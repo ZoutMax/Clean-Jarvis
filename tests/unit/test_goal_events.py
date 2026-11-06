@@ -82,7 +82,7 @@ async def test_process_due_publishes_engaged_and_closed(load, tmp_path, monkeypa
     hass, bus, captured = bus_hass
     gid = _mk(goals)["id"]
 
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         goals.update(gid, status="done", result="ready, sir.",
                      now=NOW, db_path=goals.DB_PATH)
         return "done"
@@ -102,7 +102,7 @@ async def test_process_due_active_goal_emits_engaged_only(load, tmp_path, monkey
     hass, bus, captured = bus_hass
     gid = _mk(goals)["id"]
 
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         goals.update(gid, progress_note="still working",
                      now=NOW, db_path=goals.DB_PATH)
         return "working"

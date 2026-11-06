@@ -236,6 +236,11 @@ def _install_trigger_dependencies(pb, monkeypatch, *, provider=None, sleeping=Fa
     briefing._gather_calendar = lambda _hass: []
     briefing._gather_energy_anomalies = lambda _hass: []
     briefing._greeting_instruction = lambda _hass, name: f"Greet {name}. "
+    # The spoken text is built from these, never by a model.
+    briefing._facts_home = lambda _hass, people=False: ["At home: Sam."] if people else []
+    briefing._plain_briefing = lambda greeting, honorific, lines: " ".join([f"{greeting}, {honorific}."] + lines)
+    briefing._speakable = lambda text: text
+    briefing._time_greeting = lambda: "Good day"
     monkeypatch.setitem(sys.modules, "jc.briefing", briefing)
 
     tts = types.ModuleType("jc.tts_helper")
@@ -315,13 +320,16 @@ async def test_trigger_away_builds_context_and_pushes(pb, fake_hass, monkeypatch
     pb._STATE.config = {"honorific": "captain"}
     await pb._trigger_briefing("scheduled")
 
-    context = provider.messages[1]["content"]
-    assert "Weather: clear." in context
-    assert "Open/unlocked: garage." in context
-    assert "Recent events: door opened." in context
-    assert "This is a scheduled briefing." in context
-    assert "Person at gate" in context
-    assert pushes == [(fake_hass, pb._STATE.config, "Briefing text", "scheduled")]
+    assert provider.messages is None                  # Clean Jarvis: no model writes this text
+    assert len(pushes) == 1
+    assert pushes[0][:2] == (fake_hass, pb._STATE.config) and pushes[0][3] == "scheduled"
+    text = pushes[0][2]
+    assert text.startswith("Good day, captain.")
+    assert "Weather: clear." in text
+    assert "Open/unlocked: garage." in text
+    assert "Recent events: door opened." in text
+    assert "At home: Sam." in text
+    assert "Person at gate" not in text               # camera summaries are AI text, not read aloud
     assert announcements == []
 
 
@@ -329,6 +337,7 @@ async def test_trigger_away_builds_context_and_pushes(pb, fake_hass, monkeypatch
 async def test_trigger_home_awake_announces_and_pushes(pb, fake_hass, monkeypatch):
     provider = _Provider("Hello")
     announcements = _install_trigger_dependencies(pb, monkeypatch, provider=provider)
+    sys.modules["jc.briefing"]._plain_briefing = lambda *_args: "Hello"
     pushes = []
 
     async def push(*args):
@@ -345,6 +354,7 @@ async def test_trigger_home_awake_announces_and_pushes(pb, fake_hass, monkeypatc
     assert args[1:4] == ("Hello", "tts.house", ["media_player.kitchen"])
     assert kwargs == {"context": "briefing"}
     assert len(pushes) == 1
+    assert provider.messages is None
 
 
 @pytest.mark.asyncio
@@ -366,7 +376,7 @@ async def test_trigger_sleeping_only_pushes_and_empty_output_stops(pb, fake_hass
     assert len(pushes) == 1
 
     pb._STATE.last_briefing_time = 0
-    provider.text = "  "
+    sys.modules["jc.briefing"]._speakable = lambda _text: ""    # nothing left to read
     await pb._trigger_briefing("security")
     assert len(pushes) == 1
 
@@ -393,10 +403,18 @@ async def test_trigger_provider_fallback_and_failure_are_handled(pb, fake_hass, 
     assert len(pushes) == 1
     assert announcements == []
 
+    # Clean Jarvis: facts need no model, so a provider failure no longer costs the briefing.
     pb._STATE.last_briefing_time = 0
     provider_module.create_provider = lambda *_args: (_ for _ in ()).throw(RuntimeError("offline"))
     await pb._trigger_briefing("camera")
-    assert len(pushes) == 1
+    assert len(pushes) == 2
+    assert provider.messages is None
+
+    # A failure while gathering is still handled: no crash and nothing sent.
+    pb._STATE.last_briefing_time = 0
+    sys.modules["jc.briefing"]._plain_briefing = lambda *_args: (_ for _ in ()).throw(RuntimeError("no facts"))
+    await pb._trigger_briefing("camera")
+    assert len(pushes) == 2
 
 
 @pytest.mark.asyncio

@@ -152,7 +152,11 @@
           "directive": "Własna dyrektywa (opcjonalnie, zastępuje ustawienie wstępne)",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "Włącz sterowanie domem (światła, klimat, zamki itp.)",
-          "web_research_llm_fallback": "Pozwól, aby wyszukiwanie w sieci eskalowało do własnej wyszukiwarki internetowej LLM, gdy domyślny backend niczego nie znajdzie"
+          "web_research_llm_fallback": "Pozwól, aby wyszukiwanie w sieci eskalowało do własnej wyszukiwarki internetowej LLM, gdy domyślny backend niczego nie znajdzie",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {

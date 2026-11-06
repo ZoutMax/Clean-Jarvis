@@ -36,26 +36,38 @@ def test_shape_handles_junk(mt):
 
 async def test_load_recent_reads_and_shapes(mt, fake_hass, load, monkeypatch):
     db = load("database")
-    monkeypatch.setattr(db, "get_recent_messages",
-                        lambda hours, device_id, limit: [
+    monkeypatch.setattr(db, "get_thread_messages",
+                        lambda hours, limit, user_id, device_id: [
                             {"role": "user", "content": "earlier q"},
                             {"role": "assistant", "content": "earlier a"}])
-    assert await mt.load_recent(fake_hass, 48, 12) == [
+    assert await mt.load_recent(fake_hass, 48, 12, "user-1") == [
         {"role": "user", "content": "earlier q"},
         {"role": "assistant", "content": "earlier a"},
     ]
 
 
-async def test_load_recent_passes_global_scope(mt, fake_hass, load, monkeypatch):
+async def test_load_recent_passes_the_persons_scope(mt, fake_hass, load, monkeypatch):
     seen = {}
     db = load("database")
 
-    def _rec(hours, device_id, limit):
-        seen.update(hours=hours, device_id=device_id, limit=limit)
+    def _rec(hours, limit, user_id, device_id):
+        seen.update(hours=hours, limit=limit, user_id=user_id, device_id=device_id)
         return []
-    monkeypatch.setattr(db, "get_recent_messages", _rec)
-    await mt.load_recent(fake_hass, 24, 7)
-    assert seen == {"hours": 24, "device_id": None, "limit": 7}   # global, bounded
+    monkeypatch.setattr(db, "get_thread_messages", _rec)
+    await mt.load_recent(fake_hass, 24, 7, "user-1", "tablet")
+    # Clean Jarvis: one person, bounded; never the global thread
+    assert seen == {"hours": 24, "limit": 7, "user_id": "user-1", "device_id": "tablet"}
+
+
+def test_thread_messages_never_mix_people(load, tmp_path, monkeypatch):
+    db = load("database")
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "chat.db")
+    db.save_message("user", "mine", device_id="tablet", user_id="user-1")
+    db.save_message("user", "theirs", device_id="tablet", user_id="user-2")
+    db.save_message("user", "no login", device_id="tablet", user_id="")
+    assert [r["content"] for r in db.get_thread_messages(48, 10, "user-1", "tablet")] == ["mine"]
+    assert [r["content"] for r in db.get_thread_messages(48, 10, "", "tablet")] == ["no login"]
+    assert db.get_thread_messages(48, 10, "", "") == []       # nobody known: nothing, never everything
 
 
 async def test_load_recent_db_error_empty(mt, fake_hass, load, monkeypatch):
@@ -63,8 +75,8 @@ async def test_load_recent_db_error_empty(mt, fake_hass, load, monkeypatch):
 
     def boom(*a, **k):
         raise RuntimeError("db down")
-    monkeypatch.setattr(db, "get_recent_messages", boom)
-    assert await mt.load_recent(fake_hass, 48, 12) == []
+    monkeypatch.setattr(db, "get_thread_messages", boom)
+    assert await mt.load_recent(fake_hass, 48, 12, "user-1") == []
 
 
 def test_config_reads_jarvis_config(mt, load, monkeypatch):

@@ -956,6 +956,9 @@ async def ws_get_panel_data(
                 # re-render even though the value was saved (v6.64.1 fix).
                 "banter_level":         _runtime_opt(hass, entry, "banter_level", 1),
             "camera_watch_default": str(_runtime_opt(hass, entry, "camera_watch_default", "") or ""),
+                "jh_strict_actions": bool(_runtime_opt(hass, entry, "jh_strict_actions", True)),
+                "jh_mail_block": bool(_runtime_opt(hass, entry, "jh_mail_block", True)),
+                "jh_facts_only_briefings": bool(_runtime_opt(hass, entry, "jh_facts_only_briefings", True)),
                 "search_backend":       str(_runtime_opt(hass, entry, "search_backend", "duckduckgo") or "duckduckgo"),
                 "searxng_url":          str(_runtime_opt(hass, entry, "searxng_url", "") or ""),
                 "web_research_llm_fallback": bool(_runtime_opt(hass, entry, "web_research_llm_fallback", False)),
@@ -1568,6 +1571,9 @@ PANEL_WRITABLE_KEYS = {
     "calendar_tight_gap_min",    # int: back-to-back gap flagged as "tight"
     # Persona (v6.51.0)
     "camera_watch_default",      # str: camera Camera Watch opens on
+    "jh_strict_actions",   # bool: Core switch, on by default
+    "jh_mail_block",   # bool: Core switch, on by default
+    "jh_facts_only_briefings",   # bool: Core switch, on by default
     "banter_level",              # int: 0 plain · 1 dry (default) · 2 full MCU wit
     # Local semantic search via Ollama embeddings (v6.57.0)
     "semantic_search",           # bool: use Ollama embeddings for doc retrieval
