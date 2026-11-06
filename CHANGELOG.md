@@ -1,3 +1,7 @@
+## 1.0.4
+
+- Clean Jarvis: settings such as a display backlight no longer count as lights in the home summary.
+
 ## [1.0.3] — Clean Jarvis: punctuation, sound-alike names, Hey JARVIS
 
 - Punctuation never changes a command. "Switch, lamp, green." now works like "switch lamp green", on the local path and in the check that a reply has a real action behind it. Numbers and times keep their marks, such as 21.5 and 7:30.
