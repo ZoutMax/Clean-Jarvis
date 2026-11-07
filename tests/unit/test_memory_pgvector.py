@@ -175,11 +175,17 @@ def test_memory_prefers_pgvector_when_active(load, monkeypatch):
     memory = load("memory")
     mp = load("memory_pgvector")
     monkeypatch.setattr(memory, "_pgvector_available", True)
-    monkeypatch.setattr(mp, "search",
-                        lambda q, k=5, hours=None: [{"text": "from pg", "role": "user",
-                                                     "timestamp": "", "score": 1.0}])
+    asked = []
+
+    def _search(q, k=5, hours=None, user_id=None):
+        asked.append(user_id)
+        return [{"text": "from pg", "role": "user", "timestamp": "", "score": 1.0}]
+
+    monkeypatch.setattr(mp, "search", _search)
     out = memory.search_memory("anything", k=3)
     assert out == [{"text": "from pg", "role": "user", "timestamp": "", "score": 1.0}]
+    memory.search_memory("anything", k=3, user_id="user-1")
+    assert asked == [None, "user-1"]      # the backend itself filters per person
 
 
 def test_memory_store_routes_to_pgvector(load, monkeypatch):

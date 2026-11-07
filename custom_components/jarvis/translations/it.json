@@ -152,7 +152,11 @@
           "directive": "Direttiva personalizzata (facoltativa, sostituisce il preset)",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "Abilita il controllo della casa (luci, clima, serrature, ecc.)",
-          "web_research_llm_fallback": "Consenti alla ricerca web di passare alla ricerca web nativa dell'LLM quando il backend predefinito non trova nulla"
+          "web_research_llm_fallback": "Consenti alla ricerca web di passare alla ricerca web nativa dell'LLM quando il backend predefinito non trova nulla",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {

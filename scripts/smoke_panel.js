@@ -304,6 +304,19 @@ setTimeout(async () => {
       el._setupCameras();
       return el._activeCam === "camera.back";
     })()],
+    ["a camera chosen in Core settings wins over the remembered one", (() => {
+      const cfg = el._liveData.config, before = cfg.camera_watch_default;
+      cfg.camera_watch_default = "camera.front";
+      el._activeCam = null; el._manualCam = null;
+      el._setupCameras();
+      const won = el._activeCam === "camera.front";
+      cfg.camera_watch_default = "camera.gone";     // removed camera: back to the remembered one
+      el._activeCam = null; el._manualCam = null;
+      el._setupCameras();
+      const fellBack = el._activeCam === "camera.back";
+      cfg.camera_watch_default = before;
+      return won && fellBack;
+    })()],
     ["an unknown stored camera falls back to the first (#231)", (() => {
       try { window.localStorage.setItem("jarvis_active_cam", "camera.gone"); } catch (_) {}
       el._activeCam = null; el._manualCam = null;

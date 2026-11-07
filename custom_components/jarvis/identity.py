@@ -537,6 +537,21 @@ def resolve(hass: HomeAssistant, *, device_id: Optional[str] = None,
                           "+".join(sorted(methods)), candidates)
 
 
+def subject_for_user(hass: HomeAssistant, user_id: str) -> str:
+    """Jarvis Home patch (2026-11-06): the knowledge subject of a logged-in Home Assistant user, from the person
+    entity linked to that login. A login with no person gets a private subject of its own, never a shared one.
+    Empty when nobody is logged in, so only voice turns fall back to the presence guess."""
+    if not user_id:
+        return ""
+    try:
+        for state in hass.states.async_all("person"):
+            if state.attributes.get("user_id") == user_id:
+                return normalize(state.attributes.get("friendly_name") or state.entity_id.split(".", 1)[-1])
+    except Exception as exc:
+        _LOGGER.debug("identity: person lookup failed: %s", exc)
+    return f"user_{user_id}"
+
+
 def resolve_subject(hass: HomeAssistant, **kwargs) -> str:
     """Convenience: resolve and return the knowledge subject id directly."""
     return subject_for(resolve(hass, **kwargs))

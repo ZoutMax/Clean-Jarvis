@@ -57,7 +57,7 @@ def migrate_1_to_2(data: dict, options: dict) -> tuple[dict, dict]:
 
 def migrate_2_to_3(data: dict, options: dict) -> tuple[dict, dict]:
     """v2 → v3: introduce directive system."""
-    options.setdefault("directive_preset", "guardian_steward")
+    options.setdefault("directive_preset", "clean_jarvis")
     options.setdefault("directive", "")
     _LOGGER.info("JARVIS migration v2→v3: added prime directive")
     return data, options

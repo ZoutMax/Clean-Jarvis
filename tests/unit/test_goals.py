@@ -160,7 +160,7 @@ def test_build_prompt_contents(goals):
 async def test_active_goal_runs_quietly_and_rearms(goals, fake_hass, quiet_activity):
     gid = _mk(goals)["id"]
     seen = []
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         seen.append(prompt)
         goals.update(gid, progress_note="checked, nothing yet",
                      now=NOW, db_path=goals.DB_PATH)
@@ -175,9 +175,22 @@ async def test_active_goal_runs_quietly_and_rearms(goals, fake_hass, quiet_activ
     assert quiet_activity and quiet_activity[0]["category"] == "goal"
 
 
+async def test_goal_runs_with_its_owner_and_logs_for_them(goals, fake_hass, quiet_activity):
+    gid = _mk(goals, user_id="user-1")["id"]
+    owners = []
+    async def runner(prompt, ctx, owner=None):
+        owners.append(owner)
+        goals.update(gid, progress_note="checked", now=NOW, db_path=goals.DB_PATH)
+        return "Working on it."
+    await goals.async_process_due(fake_hass, {}, runner, now=NOW, db_path=goals.DB_PATH)
+    assert owners == ["user-1"]
+    assert goals.get(gid)["user_id"] == "user-1"
+    assert quiet_activity[0]["user_id"] == "user-1"
+
+
 async def test_model_next_check_overrides_default(goals, fake_hass, quiet_activity):
     gid = _mk(goals)["id"]
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         goals.update(gid, next_check_minutes=120, now=NOW, db_path=goals.DB_PATH)
         return "Re-engaging in two hours."
     await goals.async_process_due(fake_hass, {}, runner, now=NOW,
@@ -188,7 +201,7 @@ async def test_model_next_check_overrides_default(goals, fake_hass, quiet_activi
 
 async def test_completion_announces_result(goals, fake_hass, quiet_activity):
     gid = _mk(goals)["id"]
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         goals.update(gid, status="done", result="The house is guest-ready, sir.",
                      now=NOW, db_path=goals.DB_PATH)
         return "done"
@@ -201,7 +214,7 @@ async def test_completion_announces_result(goals, fake_hass, quiet_activity):
 
 async def test_deadline_passed_forces_closure(goals, fake_hass, quiet_activity):
     gid = _mk(goals, deadline_minutes=10)["id"]
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         assert "DEADLINE HAS PASSED" in prompt
         return "Ran out of time."                     # model leaves it active
     late = NOW + timedelta(minutes=30)
@@ -214,7 +227,7 @@ async def test_deadline_passed_forces_closure(goals, fake_hass, quiet_activity):
 
 async def test_runner_error_keeps_goal_active(goals, fake_hass, quiet_activity):
     gid = _mk(goals)["id"]
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         raise RuntimeError("provider down")
     actions = await goals.async_process_due(fake_hass, {}, runner, now=NOW,
                                             db_path=goals.DB_PATH)
@@ -230,7 +243,7 @@ async def test_run_budget_force_fails(goals, fake_hass, quiet_activity):
     with closing(sqlite3.connect(goals.DB_PATH)) as c:
         c.execute("UPDATE goals SET runs=? WHERE id=?", (goals.MAX_RUNS, gid))
         c.commit()
-    async def runner(prompt, ctx):
+    async def runner(prompt, ctx, owner=None):
         raise AssertionError("budget-exhausted goal must not run")
     actions = await goals.async_process_due(fake_hass, {}, runner, now=NOW,
                                             db_path=goals.DB_PATH)

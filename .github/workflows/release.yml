@@ -62,7 +62,7 @@ jobs:
         run: |
           gh release create "${{ steps.ver.outputs.version }}" \
             --repo "${{ github.repository }}" \
-            --title "JARVIS AIO v.${{ steps.ver.outputs.version }}" \
+            --title "Clean Jarvis ${{ steps.ver.outputs.version }}" \
             --notes-file release-notes.md \
             --target "${{ github.sha }}"
-          echo "Published JARVIS AIO v.${{ steps.ver.outputs.version }}"
+          echo "Published Clean Jarvis ${{ steps.ver.outputs.version }}"

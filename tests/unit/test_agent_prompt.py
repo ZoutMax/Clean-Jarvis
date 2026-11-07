@@ -52,7 +52,9 @@ def test_get_entity_state_returns_last_changed():
     # the rule tells the model to read last_changed; the tool must actually
     # return it, or the instruction is hollow
     assert '"last_changed"' in AGENT_SRC
-    assert "state.last_changed.isoformat()" in AGENT_SRC
+    # Clean Jarvis: in local time, the model read UTC stamps out as if they were local
+    assert "state.last_changed.astimezone().isoformat()" in AGENT_SRC
+    assert "state.last_changed.isoformat()" not in AGENT_SRC
 
 
 def test_prompt_routes_weather_time_questions_to_forecast():

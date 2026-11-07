@@ -1,3 +1,7 @@
+> **This is Clean Jarvis**, a patch of the original JARVIS: honest replies, privacy between people, and hands-free voice control with a "Hey Jarvis" switch on the web page. See [what is different and how to install it](CLEAN_JARVIS.md).
+
+![Clean Jarvis: Hey JARVIS voice control in the Chat tab](docs/images/clean-jarvis-voice.png)
+
 <div align="center">
 
 # JARVIS AI Assistant

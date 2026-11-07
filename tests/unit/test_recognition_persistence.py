@@ -73,12 +73,17 @@ def test_snapshot_index_restored_only_if_frame_exists(recog):
     live = tmp_path / "faces" / "sam.jpg"
     live.parent.mkdir(parents=True, exist_ok=True)
     live.write_bytes(b"\xff\xd8\xff")      # a frame that still exists on disk
+    public = tmp_path / "faces" / "old.jpg"
+    public.write_bytes(b"\xff\xd8\xff")
     mod._FACE_SNAPSHOTS["sam"] = {
-        "url": "/local/jarvis/faces/sam.jpg", "path": str(live),
+        "url": "jarvis-private/faces/sam.jpg", "path": str(live),
         "ts": 1.0, "camera_entity": "camera.front_door"}
     mod._FACE_SNAPSHOTS["ghost"] = {
-        "url": "/local/jarvis/faces/ghost.jpg",
+        "url": "jarvis-private/faces/ghost.jpg",
         "path": str(tmp_path / "faces" / "ghost.jpg"),   # no such file
+        "ts": 1.0, "camera_entity": "camera.driveway"}
+    mod._FACE_SNAPSHOTS["old"] = {
+        "url": "/local/jarvis/faces/old.jpg", "path": str(public),   # from before the move out of www
         "ts": 1.0, "camera_entity": "camera.driveway"}
     mod._persist_save(force=True)
 
@@ -87,6 +92,7 @@ def test_snapshot_index_restored_only_if_frame_exists(recog):
 
     assert "sam" in mod._FACE_SNAPSHOTS          # frame present → restored
     assert "ghost" not in mod._FACE_SNAPSHOTS    # frame gone → dropped
+    assert "old" not in mod._FACE_SNAPSHOTS      # public web path → never restored
 
 
 def test_stale_entries_age_out_on_restore(recog):

@@ -152,7 +152,11 @@
           "directive": "自定義指令（可選，會覆蓋預設）",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "啟用家居控制（燈光、空調、門鎖等）",
-          "web_research_llm_fallback": "當預設後端找不到結果時，允許網路調查升級為 LLM 自帶的網路搜尋"
+          "web_research_llm_fallback": "當預設後端找不到結果時，允許網路調查升級為 LLM 自帶的網路搜尋",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {
