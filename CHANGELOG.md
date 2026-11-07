@@ -1,4 +1,4 @@
-## 1.0.4
+## [1.0.4] — Clean Jarvis: settings are not counted as lights
 
 - Clean Jarvis: settings such as a display backlight no longer count as lights in the home summary.
 
