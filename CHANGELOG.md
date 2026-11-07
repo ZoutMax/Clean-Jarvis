@@ -1,3 +1,14 @@
+## [1.1.0] — Clean Jarvis on JARVIS 9.92.0
+
+Clean Jarvis is the original JARVIS 9.92.0 with one patch on top. The assistant, its name and its settings stay as in the original. See CLEAN_JARVIS.md for the full list.
+
+- **Honest:** a cleaned personality, briefings from real facts only, and a device action is only claimed when a device tool really ran.
+- **Private:** chat history, memory, facts, reminders and goals are kept per person; non-admin logins cannot reach admin actions, mail or other people's data; face snapshots stay out of the public web folder.
+- **Voice control:** a Hey JARVIS switch in the Chat tab listens through the computer microphone on the web page. A pause after the wake word does not end the command, nothing is sent when nothing was said, and a lone "Okay." invented from silence is ignored.
+- **Clear commands:** punctuation from speech recognition never changes a command, sound-alike device names are found, and a vague name gets the question which device is meant.
+- **Day to day:** Chat tab with saved history, press-to-talk, read-aloud and cancel; settings such as a display backlight are not counted as lights.
+- Earlier test releases 1.0.0 to 1.0.4 are folded into this release. Existing data and settings are kept on update.
+
 ## [9.92.0] — Token telemetry: attribute camera/vision spend to the vision tier (Tranche 1)
 
 Continues MCU roadmap **Tranche 1 (foundation trust)** token cost-accounting.
@@ -17,6 +28,7 @@ No behaviour change to any call path — telemetry stays observe-only, and an
 untagged provider still reads honestly as `unknown`. Still open in Tranche 1:
 per-request correlation IDs on usage records and a durable (cross-restart)
 telemetry store.
+
 
 ## [9.91.0] — Settings HUD visual upgrade: uniform cards, toggles & time inputs
 

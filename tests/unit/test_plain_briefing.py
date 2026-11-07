@@ -163,6 +163,13 @@ async def test_async_briefing_falls_back_to_plain_facts_when_model_is_empty(b, f
     assert "At home: Sam" in result["briefing"]
     assert recorded["save_message"][1].startswith("[Briefing]")
     assert recorded["announce"][1].startswith("Good ")
+    assert "messages" not in recorded                # facts-only: the model is not asked at all
+
+    # With the Core switch off the model writes it, and an empty reply still falls back to the facts.
+    monkeypatch.setattr(b, "_jh_facts_only_on", lambda hass: False)
+    result = await b.async_briefing(hass, call, DummyClient(), "sir", "tts.piper", ["media_player.kitchen"])
+    assert recorded["messages"]
+    assert "At home: Sam" in result["briefing"]
 
 
 def test_time_greeting_hits_all_time_branches(b, monkeypatch):
@@ -252,6 +259,15 @@ async def test_async_briefing_collects_hazards_and_snapshot_context(b, fake_hass
     assert "Calendar: Team standup" in result["context"]
     assert "High power draw: Main Panel is drawing 750W" in result["context"]
     assert "Active hazards nearby" in result["context"]
+    # Clean Jarvis: camera summaries are AI text, so facts-only leaves them out and no model writes the text
+    assert "camera: 2 motion events detected" not in result["context"]
+    assert "Good morning update." not in result["briefing"]
+    assert recorded["save_message"][1].startswith("[Briefing] ")
+    assert "Team standup" in recorded["announce"][1]
+
+    # With the Core switch off, the model gets the camera summary and its text is read.
+    monkeypatch.setattr(b, "_jh_facts_only_on", lambda hass: False)
+    result = await b.async_briefing(hass, call, DummyClient(), "sir", "tts.piper", ["media_player.kitchen"])
     assert "camera: 2 motion events detected" in result["context"]
     assert recorded["save_message"][1].startswith("[Briefing] Good morning update.")
     assert recorded["announce"][1].startswith("Good morning update.")
@@ -273,6 +289,8 @@ async def test_async_briefing_handles_provider_and_announce_failures(b, fake_has
     # Pin the greeting so the assertion holds regardless of the wall-clock hour.
     monkeypatch.setattr(b, "_time_greeting", lambda: "Good afternoon")
 
+    # The provider is only reached when the facts-only switch is off.
+    monkeypatch.setattr(b, "_jh_facts_only_on", lambda hass: False)
     result = await b.async_briefing(hass, call, BoomClient(), "sir", None, [])
     assert "Good " in result["briefing"]
     assert "JARVIS briefing error" in caplog.text

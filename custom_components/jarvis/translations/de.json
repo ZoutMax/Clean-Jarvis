@@ -152,7 +152,11 @@
           "directive": "Eigene Direktive (optional, überschreibt Vorlage)",
           "llm_provider": "Anbieter des Gesprächsmodells",
           "use_hass_api": "Haussteuerung aktivieren (Licht, Klima, Schlösser usw.)",
-          "web_research_llm_fallback": "Websuche bei leerem Ergebnis des Standard-Backends an die eigene Websuche des LLM eskalieren lassen"
+          "web_research_llm_fallback": "Websuche bei leerem Ergebnis des Standard-Backends an die eigene Websuche des LLM eskalieren lassen",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {

@@ -328,7 +328,7 @@ def _load_conversation_module(monkeypatch):
     spy_mod.recognition_context_string = lambda hass: "Recognition: Sam"
     _setter("recognition", spy_mod)
 
-    async def try_local(hass, text, honorific, force=False):
+    async def try_local(hass, text, honorific, force=False, pending_key=""):
         return types.SimpleNamespace(handled=True, text=f"Handled: {text}")
 
     local_engine = types.ModuleType(f"{pkg_name}.local_engine")
@@ -628,21 +628,21 @@ def test_history_is_bounded_and_cross_session_seeded_once(monkeypatch):
     calls = []
     memory_thread.config = lambda: (True, 24, 5)
 
-    async def load_recent(hass, hours, limit):
-        calls.append((hours, limit))
+    async def load_recent(hass, hours, limit, user_id="", device_id=""):
+        calls.append((hours, limit, user_id, device_id))
         return [{"role": "assistant", "content": "Earlier context"}]
 
     memory_thread.load_recent = load_recent
     history = []
 
     async def seed_twice():
-        await agent._maybe_seed_history("fresh", history)
-        await agent._maybe_seed_history("fresh", history)
+        await agent._maybe_seed_history("fresh", history, "user-1")
+        await agent._maybe_seed_history("fresh", history, "user-1")
 
     asyncio.run(seed_twice())
 
     assert history == [{"role": "assistant", "content": "Earlier context"}]
-    assert calls == [(24, 5)]
+    assert calls == [(24, 5, "user-1", "fresh")]   # seeded with this person's turns only
 
 
 def test_get_hass_api_returns_api_or_degrades_to_chat_only(monkeypatch):
@@ -846,7 +846,7 @@ def test_handle_message_uses_offline_response_when_local_salvage_fails(monkeypat
     connectivity = sys.modules[f"{mod.__package__}.connectivity"]
     calls = []
 
-    async def unhandled_local(hass, text, honorific, force=False):
+    async def unhandled_local(hass, text, honorific, force=False, pending_key=""):
         calls.append(force)
         return types.SimpleNamespace(handled=False, text="")
 
@@ -921,7 +921,7 @@ def test_handle_message_salvages_when_agent_raises(monkeypatch):
     local_engine = sys.modules[f"{mod.__package__}.local_engine"]
     calls = []
 
-    async def local_sequence(hass, text, honorific, force=False):
+    async def local_sequence(hass, text, honorific, force=False, pending_key=""):
         calls.append(force)
         return types.SimpleNamespace(
             handled=force, text="Local salvage succeeded" if force else "")
@@ -952,7 +952,8 @@ def test_handle_message_accepts_and_declines_pending_offers(monkeypatch):
     cognitive_core = sys.modules[f"{mod.__package__}.cognitive_core"]
     cognitive_core.get_pending_offer = lambda: {"offer": "routine"}
 
-    async def accept_offer():
+    async def accept_offer(record=True):
+        assert record is True          # voice with no login still builds autonomy
         return {"ok": True, "approvals": 2}
 
     declined = []
@@ -1047,7 +1048,7 @@ def test_direct_reasoning_skips_local_triage_and_goes_straight_to_agent(monkeypa
 
     local_engine = sys.modules[f"{mod.__package__}.local_engine"]
     local_calls = []
-    async def spy_local(hass, text, honorific, force=False):
+    async def spy_local(hass, text, honorific, force=False, pending_key=""):
         local_calls.append(force)
         return types.SimpleNamespace(handled=force, text="salvage" if force else "")
     local_engine.try_local = spy_local
@@ -1080,7 +1081,7 @@ def test_local_first_still_default_when_direct_reasoning_off(monkeypatch):
 
     local_engine = sys.modules[f"{mod.__package__}.local_engine"]
     local_calls = []
-    async def spy_local(hass, text, honorific, force=False):
+    async def spy_local(hass, text, honorific, force=False, pending_key=""):
         local_calls.append(force)
         return types.SimpleNamespace(handled=True, text="Handled locally.")
     local_engine.try_local = spy_local
@@ -1091,4 +1092,27 @@ def test_local_first_still_default_when_direct_reasoning_off(monkeypatch):
     result = asyncio.run(agent._handle_message_impl(user_input))
 
     assert local_calls == [False], "try_local must be consulted first by default"
+
     assert "Handled locally." in result.response.speech
+
+
+def test_local_engine_keeps_which_one_per_conversation(monkeypatch):
+    """Clean Jarvis: a pending 'which one' question belongs to its own conversation."""
+    import asyncio
+    import sys
+
+    mod = _load_conversation_module(monkeypatch)
+    agent = _make_dispatch_agent(mod)
+    local_engine = sys.modules[f"{mod.__package__}.local_engine"]
+    keys = []
+
+    async def spy_local(hass, text, honorific, force=False, pending_key=""):
+        keys.append(pending_key)
+        return types.SimpleNamespace(handled=True, text="Done")
+
+    local_engine.try_local = spy_local
+    user_input = types.SimpleNamespace(
+        text="turn on the lamp", device_id=None,
+        conversation_id="kitchen-tablet", language="en", context={})
+    asyncio.run(agent._handle_message_impl(user_input))
+    assert keys == ["kitchen-tablet"]

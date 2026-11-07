@@ -152,7 +152,11 @@
           "directive": "Egendefinert direktiv (valgfritt, overstyrer forhåndsinnstilling)",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "Aktiver hjemstyring (lys, klima, låser osv.)",
-          "web_research_llm_fallback": "La websøk eskalere til LLM-ens egen websøk når standard-backend ikke finner noe"
+          "web_research_llm_fallback": "La websøk eskalere til LLM-ens egen websøk når standard-backend ikke finner noe",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {

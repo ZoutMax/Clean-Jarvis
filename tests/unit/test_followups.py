@@ -72,29 +72,31 @@ async def test_process_due_runs_marks_and_returns_action(fu, load, fake_hass, mo
     db = load("database")
     logged = []
     monkeypatch.setattr(db, "save_activity", lambda **kw: logged.append(kw))
-    fu.schedule("verify the heat reached 72", 1, now=NOW)
+    fu.schedule("verify the heat reached 72", 1, now=NOW, user_id="user-1")
 
     ran = []
-    async def runner(instruction, context):
-        ran.append((instruction, context))
+    async def runner(instruction, context, owner=None):
+        ran.append((instruction, context, owner))
         return "The living room is at 72 degrees, sir."
 
     actions = await fu.async_process_due(
         fake_hass, {}, runner, now=NOW + timedelta(minutes=2),
         db_path=fu.DB_PATH)
     assert ran and ran[0][0] == "verify the heat reached 72"
+    assert ran[0][2] == "user-1"                      # runs with the rights of who asked
     assert len(actions) == 1
     assert actions[0]["type"] == "followup" and actions[0]["urgency"] == "medium"
     assert "72 degrees" in actions[0]["message"]
     row = [r for r in _all(fu)][0]
     assert row["status"] == "done" and "72 degrees" in row["result"]
     assert logged and logged[0]["category"] == "followup"
+    assert logged[0]["user_id"] == "user-1"           # the log line is theirs
 
 
 async def test_process_due_failure_marks_failed(fu, fake_hass):
     fu.schedule("boom", 1, now=NOW)
 
-    async def runner(instruction, context):
+    async def runner(instruction, context, owner=None):
         raise RuntimeError("provider down")
 
     actions = await fu.async_process_due(

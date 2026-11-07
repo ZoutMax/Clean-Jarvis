@@ -152,7 +152,11 @@
           "directive": "Diretriz personalizada (opcional, substitui a predefinição)",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "Ativar controle da casa (luzes, climatização, fechaduras etc.)",
-          "web_research_llm_fallback": "Permitir que a pesquisa na web escale para a busca na web do próprio LLM quando o backend padrão não encontrar nada"
+          "web_research_llm_fallback": "Permitir que a pesquisa na web escale para a busca na web do próprio LLM quando o backend padrão não encontrar nada",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {

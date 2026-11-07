@@ -370,7 +370,10 @@ async def test_step_agents_disabling_friday_needs_no_confirm(config_flow, fake_h
 async def test_step_core_renders_fields(config_flow, fake_hass):
     res = await _flow(config_flow, fake_hass).async_step_core(None)
     assert res["type"] == "form" and res["step_id"] == "core"
-    assert len(res["data_schema"].schema) == 6   # persona, preset, directive, model, hass-api, web-research-fallback
+    # persona, preset, directive, model, hass-api, web-research-fallback, plus the Clean Jarvis camera and switches
+    assert len(res["data_schema"].schema) == 10
+    names = {str(k) for k in res["data_schema"].schema}
+    assert {"camera_watch_default", "jh_strict_actions", "jh_mail_block", "jh_facts_only_briefings"} <= names
 
 
 async def test_step_routing_renders_fields(config_flow, fake_hass):

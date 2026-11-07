@@ -290,6 +290,58 @@ async def async_setup_entry(
     async_add_entities([JarvisAgent(hass, config_entry, client)])
 
 
+# Jarvis Home patch (2026-11-06): a history key belongs to someone. conversation/process takes any conversation id from any login,
+# and the id user_<login> can be worked out, so without this a limited login could read another person's live chat.
+_JH_KEY_OWNERS: dict = {}   # history key -> the login that first used it, "" for voice with no login. Lives as long as the histories do.
+
+
+async def _jh_limited_login(hass, uid: str) -> bool:
+    """True for a logged-in non-admin, and for a login that cannot be read. Voice with no login is not limited."""
+    if not uid:
+        return False
+    try:
+        user = await hass.auth.async_get_user(uid)
+    except Exception:
+        user = None
+    return user is None or not user.is_admin
+
+
+def _jh_key_owner(hass, cid: str):
+    """Whose history this key is, or None when nobody has used it yet."""
+    if cid.startswith("user_"):
+        return cid[len("user_"):]
+    if cid == "default":
+        return ""
+    if cid in _JH_KEY_OWNERS:
+        return _JH_KEY_OWNERS[cid]
+    try:
+        from homeassistant.helpers import device_registry as _dr
+        if _dr.async_get(hass).async_get(cid) is not None:
+            return ""   # a voice device: what is said there belongs to no login
+    except Exception:
+        pass
+    return None
+
+
+def _jh_history_key(hass, cid: str, uid: str, limited: bool) -> str:
+    """The key this turn may use. A limited login asking for a key of someone else gets its own private key instead."""
+    owner = _jh_key_owner(hass, cid)
+    if limited and owner is not None and owner != uid:
+        _LOGGER.warning("JARVIS: ignored a conversation id that belongs to someone else")
+        return f"user_{uid}"
+    if owner is None:
+        _JH_KEY_OWNERS[cid] = uid
+    return cid
+
+
+def _jh_offer_refused(offer: dict) -> bool:
+    """A limited login may accept an offer only for an ordinary device action, the same list its plans use."""
+    from .agent import _jh_plan_refused
+    data = (offer or {}).get("action_data") or {}
+    ids = data.get("entity_ids") or []
+    return not ids or any(_jh_plan_refused(str(data.get("domain")), str(data.get("service")), e) for e in ids)
+
+
 class JarvisAgent(conversation.ConversationEntity):
     """
     JARVIS conversation agent — Groq-powered, HA home control.
@@ -571,7 +623,7 @@ class JarvisAgent(conversation.ConversationEntity):
             self._histories[cid] = h[-MAX_HISTORY:]
         return self._histories[cid]
 
-    async def _maybe_seed_history(self, cid: str, history: list) -> None:
+    async def _maybe_seed_history(self, cid: str, history: list, user_id: str = "") -> None:
         """Seed a fresh conversation with recent cross-session history, once,
         so JARVIS continues where you left off across sessions (v6.86.0)."""
         if cid in self._threaded:
@@ -583,7 +635,8 @@ class JarvisAgent(conversation.ConversationEntity):
         enabled, hours, limit = memory_thread.config()
         if not enabled:
             return
-        seeded = await memory_thread.load_recent(self.hass, hours, limit)
+        # Jarvis Home patch: seed only this person's turns, or this device's when nobody is logged in.
+        seeded = await memory_thread.load_recent(self.hass, hours, limit, user_id=user_id, device_id=cid)
         if seeded:
             history[:0] = seeded  # prepend prior context ahead of this turn
 
@@ -777,10 +830,8 @@ class JarvisAgent(conversation.ConversationEntity):
         from .websocket import jarvis_log
         device_id = getattr(user_input, 'device_id', None)
         jarvis_log("CONV", f"ENTRY text='{user_input.text[:60]}' device={device_id}")
-        _LOGGER.warning(
-            "JARVIS async_process ENTRY: text='%s' device_id='%s'",
-            user_input.text[:60], device_id,
-        )
+        # Jarvis Home patch: no words in the log. People paste logs into bug reports, and jarvis_log above has them for admins.
+        _LOGGER.debug("JARVIS async_process ENTRY: %d characters, device_id='%s'", len(user_input.text), device_id)
 
         # Transcribed voice text arriving here means STT just worked (HA's
         # pipeline transcribed speech and routed it to us). Record it as a real
@@ -868,30 +919,33 @@ class JarvisAgent(conversation.ConversationEntity):
             except Exception as exc:
                 _LOGGER.debug("Presence gate check failed (non-fatal): %s", exc)
 
-        cid       = user_input.conversation_id or user_input.device_id or "default"
+        _jh_uid   = getattr(getattr(user_input, "context", None), "user_id", None) or ""  # Jarvis Home patch: per-user
+        cid       = user_input.conversation_id or user_input.device_id or (f"user_{_jh_uid}" if _jh_uid else "default")
+        _jh_limited = await _jh_limited_login(self.hass, _jh_uid)
+        cid = _jh_history_key(self.hass, cid, _jh_uid, _jh_limited)
         honorific = self._honorific()
         # Warm persona cache (reads file in executor) before sync _persona()
         await _ensure_persona_loaded(self.hass)
         persona   = self._persona()
         history   = self._history(cid)
-        await self._maybe_seed_history(cid, history)
+        await self._maybe_seed_history(cid, history, _jh_uid)
 
         history.append({"role": "user", "content": user_input.text})
-        save_message("user", user_input.text, device_id=cid)
+        save_message("user", user_input.text, device_id=cid, user_id=_jh_uid)
 
         # v5.6.1: Store user message in long-term memory
         try:
             from .memory import store_memory, get_conversation_context
             await self.hass.async_add_executor_job(
-                lambda: store_memory(user_input.text, role="user",
+                lambda: store_memory(user_input.text, role="user", user_id=_jh_uid,
                     device_id=user_input.device_id or "", conversation_id=cid)
             )
             # Retrieve relevant past context and inject into persona
             mem_context = await self.hass.async_add_executor_job(
-                get_conversation_context, user_input.text, 3,
+                get_conversation_context, user_input.text, 3, _jh_uid,
             )
             if mem_context:
-                persona = persona + "\n\n" + mem_context
+                persona = persona + "\n\n## Recalled for this message\n" + mem_context
         except Exception as exc:
             _LOGGER.debug("Memory store/retrieve: %s", exc)
 
@@ -902,15 +956,23 @@ class JarvisAgent(conversation.ConversationEntity):
         # facts don't leak into another's context.
         try:
             from . import knowledge, identity
-            ident = identity.resolve(
-                self.hass, device_id=getattr(user_input, "device_id", None))
-            subjects = [identity.subject_for(ident), "household"]
+            # Jarvis Home patch: a login says who this is. Presence is only a guess for voice with no login.
+            _jh_subject = identity.subject_for_user(self.hass, _jh_uid)
+            if _jh_subject:
+                subjects = [_jh_subject, "household"]
+                _jh_user = await self.hass.auth.async_get_user(_jh_uid)
+                if _jh_user is not None and _jh_user.is_admin:
+                    subjects.append(identity.DEFAULT_PERSONAL_SUBJECT)  # older unattributed facts
+            else:
+                ident = identity.resolve(
+                    self.hass, device_id=getattr(user_input, "device_id", None))
+                subjects = [identity.subject_for(ident), "household"]
             # Semantic-aware when embeddings are on (meaning, not just keywords);
             # falls back to keyword recall internally otherwise.
             kn_block = await knowledge.prompt_block_async(
                 self.hass, user_input.text, subjects=subjects)
             if kn_block:
-                persona = persona + "\n\n" + kn_block
+                persona = persona + "\n\n## Recalled for this message\n" + kn_block
         except Exception as exc:
             _LOGGER.debug("Knowledge inject: %s", exc)
 
@@ -934,8 +996,11 @@ class JarvisAgent(conversation.ConversationEntity):
                                "negative", "leave it", "nevermind", "never mind",
                                "cancel", "stop")
                 if affirm:
-                    res = await cognitive_core.accept_pending_offer()
-                    if res.get("now_autonomous"):
+                    # Jarvis Home patch: a limited login may say yes to this one action, but its yes builds no standing autonomy.
+                    res = None if _jh_limited and _jh_offer_refused(pending) else await cognitive_core.accept_pending_offer(record=not _jh_limited)
+                    if res is None:
+                        offer_reply = f"That needs an administrator login, {honorific}. Nothing was changed."
+                    elif res.get("now_autonomous"):
                         offer_reply = (
                             f"Done, {honorific}. I've noticed you consistently "
                             f"want this — I'll handle it automatically from now on. "
@@ -1012,7 +1077,7 @@ class JarvisAgent(conversation.ConversationEntity):
             # still falls back to a forced local salvage pass).
             _direct = bool(self._opt("direct_reasoning", False))
             local_result = None if _direct else await try_local(
-                self.hass, user_input.text, honorific)
+                self.hass, user_input.text, honorific, pending_key=cid)
 
             if local_result and local_result.handled:
                 response_text = local_result.text
@@ -1027,7 +1092,7 @@ class JarvisAgent(conversation.ConversationEntity):
                 if not connectivity.allow_request():
                     jarvis_log("OFFLINE", f"LLM down — local salvage: {user_input.text[:60]}")
                     salvage = await try_local(
-                        self.hass, user_input.text, honorific, force=True
+                        self.hass, user_input.text, honorific, force=True, pending_key=cid
                     )
                     if salvage and salvage.handled:
                         response_text = salvage.text
@@ -1100,7 +1165,7 @@ class JarvisAgent(conversation.ConversationEntity):
                         if _is_connectivity_failure(response_text):
                             connectivity.record_failure()
                             salvage = await try_local(
-                                self.hass, user_input.text, honorific, force=True
+                                self.hass, user_input.text, honorific, force=True, pending_key=cid
                             )
                             if salvage and salvage.handled:
                                 response_text = salvage.text
@@ -1110,7 +1175,7 @@ class JarvisAgent(conversation.ConversationEntity):
                         _LOGGER.warning("Agent call raised: %s", agent_exc)
                         connectivity.record_failure()
                         salvage = await try_local(
-                            self.hass, user_input.text, honorific, force=True
+                            self.hass, user_input.text, honorific, force=True, pending_key=cid
                         )
                         if salvage and salvage.handled:
                             response_text = salvage.text
@@ -1267,7 +1332,7 @@ class JarvisAgent(conversation.ConversationEntity):
             history.append({"role": "assistant", "content": response_text})
             try:
                 await self.hass.async_add_executor_job(
-                    save_message, "assistant", response_text, cid,
+                    save_message, "assistant", response_text, cid, _jh_uid,
                 )
             except Exception:
                 pass
@@ -1276,7 +1341,7 @@ class JarvisAgent(conversation.ConversationEntity):
             # Store assistant response in long-term memory
             try:
                 await self.hass.async_add_executor_job(
-                    lambda: store_memory(response_text, role="assistant",
+                    lambda: store_memory(response_text, role="assistant", user_id=_jh_uid,
                         device_id=user_input.device_id or "", conversation_id=cid)
                 )
             except Exception:

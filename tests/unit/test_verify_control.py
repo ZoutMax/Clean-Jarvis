@@ -43,7 +43,8 @@ async def test_persistent_failure_retries_once_and_logs(agent, fake_hass, fast_s
     fake_hass.states.set("cover.garage_door", "open")   # never reaches 'closed'
     out = await agent._exec_control_device(
         fake_hass, {"entity_id": "cover.garage_door", "action": "close"})
-    assert '"success": true' in out.lower()
+    # Clean Jarvis truth rule: the state never moved, so the reply says sent, not done
+    assert '"success": false' in out.lower() and '"sent": true' in out.lower()
     await fake_hass.drain()                            # run the verify task
     assert len(_retries(fake_hass, "cover", "close_cover")) == 2   # act + 1 retry
     assert len(activity) == 1

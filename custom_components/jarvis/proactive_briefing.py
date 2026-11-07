@@ -78,6 +78,16 @@ def get_recent_snapshots(hours: float = 12) -> list[CameraSnapshot]:
     return [s for s in _SNAPSHOTS if s.timestamp > cutoff]
 
 
+def get_snapshot_counts(hours: float = 12) -> str:
+    """Jarvis Home patch (2026-11-06): camera detections as plain counts, without the AI description."""
+    by_camera: dict = {}
+    for s in get_recent_snapshots(hours):
+        by_camera[s.camera_name] = by_camera.get(s.camera_name, 0) + 1
+    if not by_camera:
+        return ""
+    return "Camera detections: " + ", ".join(f"{cam} {n}" for cam, n in by_camera.items()) + "."
+
+
 def get_snapshot_summary(hours: float = 12) -> str:
     """Build a text summary of recent camera detections for briefing inclusion."""
     recent = get_recent_snapshots(hours)
@@ -267,17 +277,13 @@ async def _trigger_briefing(
     # Build extra context based on reason
     extra_context = ""
     if reason == "arrival":
-        extra_context = f"{person_name} just arrived home. This is a welcome briefing."
+        extra_context = f"{person_name} just arrived home."
     elif reason == "security":
-        extra_context = (
-            "Multiple security events detected in a short period. "
-            "Summarize what happened and any concerns."
-        )
-    elif reason == "scheduled":
-        extra_context = "This is a scheduled briefing."
+        # Jarvis Home patch: these lines are read aloud as they stand, so they state facts only.
+        extra_context = f"Multiple security events were detected in a short period. {get_snapshot_counts(hours=4)}".strip()
 
     if snap_summary:
-        extra_context += f"\n\n{snap_summary}"
+        pass  # Jarvis Home patch: camera summaries are AI text, not read aloud
 
     # Try to use the existing briefing service
     try:
@@ -304,43 +310,10 @@ async def _trigger_briefing(
 
         context = "\n".join(context_lines)
 
-        task = (
-            f"You are delivering a proactive briefing ({reason}) to {honorific}. "
-            f"{_greeting_instruction(hass, honorific)}"
-            f"Cover only the important items. Under 100 words. Be direct."
-        )
-        system = build_system_prompt(hass, honorific, task)
-
-        # Generate briefing via LLM
-        from .llm_provider import create_provider, create_tier_provider
-        try:
-            provider = await hass.async_add_executor_job(
-                create_tier_provider, config, "reasoning",
-            )
-        except Exception:
-            from . import ha_secrets as _hs
-            from .const import resolve_provider_base_url
-            _provider_name = config.get("llm_provider", "groq")
-            provider = await hass.async_add_executor_job(
-                create_provider,
-                _provider_name,
-                await _hs.async_get_provider_key(hass, _provider_name),
-                config.get("model", "openai/gpt-oss-120b"),
-                resolve_provider_base_url(config, _provider_name),
-            )
-
-        result = await hass.async_add_executor_job(
-            provider.chat,
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": context},
-            ],
-            # Reasoning-tier models (e.g. gpt-oss) spend hidden tokens before the
-            # visible answer; 300 was too tight and truncated welcome briefings to
-            # just the greeting (issue #79). Give room to think *and* answer.
-            None, 1000, 0.6,
-        )
-        briefing_text = result.get("text", "").strip()
+        # Jarvis Home patch (2026-11-05): no AI text, real facts only.
+        from .briefing import _facts_home, _plain_briefing, _speakable, _time_greeting
+        context_lines.extend(_facts_home(hass, people=True))
+        briefing_text = _speakable(_plain_briefing(_time_greeting(), honorific, context_lines))
         if not briefing_text:
             return
 

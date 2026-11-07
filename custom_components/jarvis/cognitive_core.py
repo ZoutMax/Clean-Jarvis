@@ -4155,7 +4155,7 @@ def _make_followup_runner(hass, config):
     """A headless agent invocation for self-scheduled follow-ups: same brain,
     same tools, no user turn. The persona tells the model it queued this work
     itself, so replies read as JARVIS reporting back, not answering a question."""
-    async def _run(instruction: str, context: str) -> str:
+    async def _run(instruction: str, context: str, owner=None) -> str:
         from .agent import run_agent
         from .const import resolve_provider_base_url
         try:
@@ -4182,6 +4182,9 @@ def _make_followup_runner(hass, config):
             base_url=resolve_provider_base_url(config, config.get("llm_provider", "groq")),
             temperature=0.4,
             config=config,
+            # Jarvis Home patch (2026-11-06): the person who asked keeps their limits later on. "?" is no real login, so
+            # a row with an unknown owner gets the limits of an unknown login. "" is voice with no login, as when it was asked.
+            jh_owner="?" if owner is None else owner,
         )
     return _run
 
@@ -5184,7 +5187,7 @@ def get_pending_offer() -> Optional[dict]:
     return _CORE.pending_offer
 
 
-async def accept_pending_offer() -> dict:
+async def accept_pending_offer(record: bool = True) -> dict:
     """
     User said yes to the pending proactive offer. Execute it and record the
     acceptance toward graduated autonomy. Returns a result dict.
@@ -5195,6 +5198,9 @@ async def accept_pending_offer() -> dict:
     _CORE.pending_offer = None
     ok = await _execute_action_data(_CORE.hass, offer.get("action_data", {}))
     pkey = offer.get("pattern_key", "")
+    if ok and not record:
+        _CORE.actions_taken += 1   # Jarvis Home patch: done once, nothing learned from it
+        return {"ok": True}
     if ok and pkey and _CORE.autonomy_mgr:
         grant = await _CORE.autonomy_mgr.async_record_acceptance(
             _CORE.hass, pkey, 0.9

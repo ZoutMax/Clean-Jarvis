@@ -152,7 +152,11 @@
           "directive": "Власна директива (необов’язково, перевизначає пресет)",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "Увімкнути керування домом (світло, клімат, замки тощо)",
-          "web_research_llm_fallback": "Дозволити веб-дослідженню переходити до власного веб-пошуку LLM, коли типовий бекенд нічого не знаходить"
+          "web_research_llm_fallback": "Дозволити веб-дослідженню переходити до власного веб-пошуку LLM, коли типовий бекенд нічого не знаходить",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {
