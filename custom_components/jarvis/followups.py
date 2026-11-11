@@ -45,6 +45,14 @@ def _connect(db_path: str) -> sqlite3.Connection:
                 result TEXT DEFAULT ''
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fu_due ON followups(status, due_ts)")
+        # Jarvis Home patch (2026-11-06): who asked for this. '' is voice with no login. Rows from before this patch stay NULL:
+        # nobody knows whose they are, so they run with the limits of an unknown login.
+        if "user_id" not in {r[1] for r in conn.execute("PRAGMA table_info(followups)")}:
+            try:
+                conn.execute("ALTER TABLE followups ADD COLUMN user_id TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         return conn
     except Exception:
         conn.close()
@@ -58,7 +66,8 @@ def _now(now: Optional[datetime]) -> datetime:
 # ── CRUD (sync — executor) ───────────────────────────────────────────────────
 
 def schedule(instruction: str, delay_minutes: float, *, context: str = "",
-             now: Optional[datetime] = None, db_path: Optional[str] = None) -> dict:
+             now: Optional[datetime] = None, db_path: Optional[str] = None,
+             user_id: str = "") -> dict:
     """Queue a self-directed follow-up. Returns the row, or an 'error' dict
     (queue full / bad input) — never raises."""
     instruction = (instruction or "").strip()
@@ -79,9 +88,9 @@ def schedule(instruction: str, delay_minutes: float, *, context: str = "",
             if open_n >= MAX_OPEN:
                 return {"error": f"follow-up queue is full ({MAX_OPEN} pending)"}
             cur = conn.execute(
-                "INSERT INTO followups (created_ts, due_ts, instruction, context) "
-                "VALUES (?,?,?,?)",
-                (t.isoformat(sep=" "), due.isoformat(sep=" "), instruction, context))
+                "INSERT INTO followups (created_ts, due_ts, instruction, context, user_id) "
+                "VALUES (?,?,?,?,?)",
+                (t.isoformat(sep=" "), due.isoformat(sep=" "), instruction, context, user_id or ""))
             return {"id": cur.lastrowid, "due_ts": due.isoformat(sep=" "),
                     "instruction": instruction}
     except Exception as exc:
@@ -109,13 +118,15 @@ def pending(*, now: Optional[datetime] = None, due_only: bool = False,
         return []
 
 
-def cancel(followup_id: int, *, db_path: Optional[str] = None) -> bool:
+def cancel(followup_id: int, *, db_path: Optional[str] = None, user_id: Optional[str] = None) -> bool:
+    """With user_id, only that person's own follow-up is cancelled."""
     db_path = db_path or DB_PATH
     try:
         with _connect(db_path) as conn:
             cur = conn.execute(
                 "UPDATE followups SET status='cancelled' "
-                "WHERE id=? AND status='pending'", (int(followup_id),))
+                "WHERE id=? AND status='pending' AND (? IS NULL OR user_id=?)",
+                (int(followup_id), user_id, user_id))
             return cur.rowcount > 0
     except Exception:
         return False
@@ -162,7 +173,7 @@ async def async_process_due(
 
     for row in due:
         try:
-            result = await runner(row["instruction"], row.get("context") or "")
+            result = await runner(row["instruction"], row.get("context") or "", row.get("user_id"))
             result = (result or "").strip() or "Done."
             await hass.async_add_executor_job(
                 lambda r=row, res=result: mark(r["id"], "done", res,
@@ -177,7 +188,7 @@ async def async_process_due(
                 from . import database
                 await hass.async_add_executor_job(
                     lambda: database.save_activity(
-                        category="followup", urgency="low",
+                        category="followup", urgency="low", user_id=row.get("user_id") or "",
                         message=f"Follow-up #{row['id']} ran: "
                                 f"{row['instruction'][:120]} → {result[:160]}",
                         source="agent")

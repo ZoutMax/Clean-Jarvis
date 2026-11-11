@@ -1370,6 +1370,13 @@ class JarvisPanel extends HTMLElement {
     this._chatMessages = [];
     this._chatBusy = false;         // a request is in flight (disables send)
     this._chatConvId = null;        // HA conversation_id, for multi-turn context
+    this._chatLoaded = false;       // saved history fetched once per page
+    this._chatRemoved = new Set();  // ids deleted on this device
+    this._chatDraft = "";           // the message box survives a full render
+    this._chatSpeak = false;
+    try { this._chatSpeak = localStorage.getItem("jarvis_chat_speak") === "1"; } catch (e) {}
+    this._wakeOn = false;           // Hey JARVIS: off until this browser turned it on
+    try { this._wakeOn = localStorage.getItem("jarvis_chat_wake") === "1"; } catch (e) {}
     this._knowledge = { facts: [], stats: {} }; // curated memory tab state
     this._knowledgeLoaded = false;
     this._logFilter = "all";       // log category filter
@@ -1430,6 +1437,7 @@ class JarvisPanel extends HTMLElement {
     } else {
       this._updateLiveValues();
     }
+    if (this._wakeOn && !this._wakeRun && !this._wakeTimer) this._wakeSync();
   }
   get hass() { return this._hass; }
 
@@ -1456,11 +1464,22 @@ class JarvisPanel extends HTMLElement {
     if (this._hass) {
       this._render();
       this._startIntervals();
+      this._wakeSync();
     }
   }
 
   disconnectedCallback() {
     this._stopIntervals();
+    if (this._chatResize) { window.removeEventListener("resize", this._chatResize); this._chatResize = null; }
+    if (this._micRelease) {
+      ["pointerup", "pointercancel"].forEach((n) => window.removeEventListener(n, this._micRelease));
+      this._micRelease = null;
+    }
+    this._micHeld = false;
+    if (this._micStop) this._micStop();
+    this._stopChatAudio();
+    this._wakeHalt();
+    this._wakeUnhook();
   }
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────
@@ -1590,7 +1609,7 @@ class JarvisPanel extends HTMLElement {
       const structuralChange = !prev ||
         prev.areas?.length !== result.areas?.length;
       const interacting = this._currentTab === "settings" || this._currentTab === "logs"
-        || this._currentTab === "memory" || this._currentTab === "suggestions";
+        || this._currentTab === "memory" || this._currentTab === "suggestions" || this._currentTab === "chat";
       if (structuralChange && !interacting) {
         this._render();
       } else {
@@ -2329,15 +2348,15 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
     if (!this._chatMessages.length) {
       return `<div class="chat-empty">Ask JARVIS anything — "is the garage open?", "turn off the lab lights", "what's on my calendar tomorrow?"</div>`;
     }
-    const rows = this._chatMessages.map((m) => {
+    const rows = this._chatMessages.map((m, i) => {
       const cls = m.role === "user" ? "chat-msg chat-user"
                 : m.role === "error" ? "chat-msg chat-error"
                 : "chat-msg chat-jarvis";
       const who = m.role === "user" ? "YOU" : m.role === "error" ? "ERROR" : "JARVIS";
-      return `<div class="${cls}"><span class="chat-who">${who}</span><span class="chat-text">${this._esc(m.text)}</span></div>`;
+      return `<div class="${cls}"><button class="chat-del" data-i="${i}" title="Delete">✕</button><span class="chat-who">${who}</span><span class="chat-text">${this._esc(m.text)}</span></div>`;
     }).join("");
     const typing = this._chatBusy
-      ? `<div class="chat-msg chat-jarvis chat-typing"><span class="chat-who">JARVIS</span><span class="chat-text">…</span></div>`
+      ? `<div class="chat-msg chat-jarvis chat-typing"><span class="chat-who">JARVIS</span><span class="chat-think"><svg class="chat-spark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1l2.6 8.4L23 12l-8.4 2.6L12 23l-2.6-8.4L1 12l8.4-2.6z"/></svg><span class="chat-think-t">Thinking</span><span class="chat-think-s">${Math.floor((Date.now() - (this._chatStart || Date.now())) / 1000)}s</span></span></div>`
       : "";
     return rows + typing;
   }
@@ -2345,6 +2364,7 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
   /** Repaint only the chat log + compose controls — never a full _render(), so
    *  the input keeps focus and the message history isn't torn down mid-type. */
   _refreshChat() {
+    this._chatTag();
     const log = this.shadowRoot?.getElementById("chat-log");
     if (log) {
       log.innerHTML = this._renderChatMessages();
@@ -2356,20 +2376,668 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
     if (send)  { send.disabled = this._chatBusy; send.textContent = this._chatBusy ? "…" : "SEND"; }
   }
 
-  _clearChat() {
-    this._chatMessages = [];
-    this._chatConvId = null;
+  // Jarvis Home patch (2026-11-06): history follows the login on every device. A save reads what is stored first and merges
+  // by message id, so a phone and a PC cannot erase each other. Deleted ids travel in "removed". Nothing is written unless
+  // that read worked, so a failed load cannot wipe the history.
+  _chatTag() {
+    this._chatMessages.forEach((m) => {
+      m.t = m.t || Date.now();
+      m.id = m.id || m.t.toString(36) + Math.random().toString(36).slice(2, 8);
+    });
+  }
+
+  _chatMerge(stored) {
+    this._chatTag();
+    const gone = new Set(Array.isArray(stored?.removed) ? stored.removed : []);
+    this._chatRemoved.forEach((id) => gone.add(id));
+    const byId = new Map();
+    let last = 0;
+    (Array.isArray(stored?.messages) ? stored.messages : []).forEach((m, i) => {
+      if (!m || typeof m.text !== "string") return;
+      const id = m.id || "old" + i + "-" + m.role + "-" + m.text.length;   // saved before ids existed: the same on every device
+      last = m.t || last + 1;   // no time of its own: it stays right after the message before it
+      byId.set(id, { ...m, id, t: last });
+    });
+    if (this._chatWipe) byId.forEach((m, id) => gone.add(id));
+    this._chatMessages.forEach((m) => byId.set(m.id, m));
+    return {
+      messages: [...byId.values()].filter((m) => !gone.has(m.id)).sort((a, b) => a.t - b.t).slice(-200),
+      removed: [...gone].slice(-1000),
+    };
+  }
+
+  _chatApply(list) {
+    const same = list.length === this._chatMessages.length && list.every((m, i) => m === this._chatMessages[i]);
+    this._chatMessages = list;
+    if (!same) this._refreshChat();
+  }
+
+  async _loadChat() {
+    if (this._chatLoaded || this._chatLoading || !this._hass) return;
+    this._chatLoading = true;
+    try {
+      const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+      this._chatApply(this._chatMerge(res?.value).messages);
+      this._chatLoaded = true;
+    } catch (err) { console.warn("JARVIS chat: history not loaded", err); }
+    this._chatLoading = false;
+  }
+
+  // Home Assistant has no compare-and-set, so two devices saving at the same moment can overwrite each other. A moment after a
+  // write, read it back and put back what went missing. This narrows the window; it cannot close it.
+  async _chatRecheck(value) {
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+      const have = new Set((res?.value?.messages || []).map((m) => m?.id));
+      if (value.messages.every((m) => have.has(m.id))) return;
+      const again = this._chatMerge(res?.value);
+      this._chatApply(again.messages);
+      await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_chat", value: again });
+    } catch (err) { console.warn("JARVIS chat: history not checked", err); }
+  }
+
+  _saveChat() {
+    if (!this._hass) return Promise.resolve();
+    const run = async () => {
+      let wipe = false;
+      try {
+        const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+        const value = this._chatMerge(res?.value);
+        wipe = this._chatWipe;
+        this._chatWipe = false;
+        this._chatApply(value.messages);
+        this._chatLoaded = true;
+        await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_chat", value });
+        await this._chatRecheck(value);
+      } catch (err) {
+        this._chatWipe = this._chatWipe || wipe;   // the next save tries again with everything still in memory
+        console.warn("JARVIS chat: history not saved", err);
+      }
+    };
+    this._chatSaving = (this._chatSaving || Promise.resolve()).then(run);
+    return this._chatSaving;
+  }
+
+  // Jarvis Home patch (2026-11-05): the chat box fills the window on any screen; messages scroll inside it.
+  _sizeChat() {
+    const pn = this.shadowRoot?.querySelector(".chat-panel");
+    if (!pn) return;
+    const ft = this.shadowRoot.querySelector(".footer");
+    const h = window.innerHeight - pn.getBoundingClientRect().top - (ft ? ft.offsetHeight : 0) - 28;
+    pn.style.height = Math.max(320, Math.round(h)) + "px";
+    const log = this.shadowRoot.getElementById("chat-log");
+    if (log) log.scrollTop = log.scrollHeight;
+  }
+
+  // Jarvis Home patch (2026-11-05): the indicator lives only while a request is really pending.
+  _startThink() {
+    this._chatStart = Date.now();
+    clearInterval(this._thinkTimer);
+    this._thinkTimer = setInterval(() => {
+      if (!this._chatBusy) { clearInterval(this._thinkTimer); return; }
+      const el = this.shadowRoot?.querySelector(".chat-think-s");
+      if (el) el.textContent = Math.floor((Date.now() - this._chatStart) / 1000) + "s";
+    }, 1000);
+  }
+
+  _deleteChatMessage(i) {
+    if (this._chatBusy && i === this._chatMessages.length - 1 && this._chatMessages[i]?.role === "user") {
+      this._chatReq = (this._chatReq || 0) + 1;
+      this._chatBusy = false;
+      this._spokenCut();   // spoken words still waiting to be sent go too
+    }
+    this._chatTag();
+    if (this._chatMessages[i]) this._chatRemoved.add(this._chatMessages[i].id);
+    this._chatMessages.splice(i, 1);
+    this._saveChat();
     this._refreshChat();
   }
 
-  async _sendChat() {
+  // Jarvis Home patch (2026-11-06): voice in the Chat tab, through Home Assistant's own Assist pipeline. One recording at a
+  // time, and the microphone is released on every path. Audio is kept from the first moment and sent when HA is ready, so the
+  // first word is not lost. While the button is held a pause does not end the recording: the release does.
+  async _toggleMic() {
+    if (this._micStop) { this._micStop(); return; }
+    if (this._micStarting) return;
+    const conn = this._hass?.connection;
+    const fail = (t) => { this._chatMessages.push({ role: "error", text: t }); this._refreshChat(); };
+    if (!conn) return;
+    if (!navigator.mediaDevices?.getUserMedia) { fail("The microphone needs the https address of this page."); return; }
+    this._micStarting = true;
+    this._wakeSync();
+    let stream, ctx, src, proc, hid = null, done = false, unsub = null, ended = false, quiet = false;
+    const early = [];
+    const box = () => this.shadowRoot?.getElementById("chat-input");
+    const btn = () => this.shadowRoot?.getElementById("chat-mic");
+    const hint0 = box()?.placeholder;
+    const endByte = () => { try { conn.socket.send(new Uint8Array([hid])); } catch (e) {} };
+    const stop = () => {
+      if (done) return;
+      done = true;
+      this._micStarting = false;
+      this._micStop = null;
+      this._micUntil = Date.now() + 2500;   // the words are still on their way from Home Assistant
+      if (box()) box().placeholder = hint0;
+      try { proc?.disconnect(); src?.disconnect(); } catch (e) {}
+      stream?.getTracks().forEach((t) => t.stop());
+      ctx?.close()?.catch?.(() => {});
+      if (hid !== null) endByte();
+      btn()?.classList.remove("on");
+    };
+    const finish = () => {
+      ended = true;
+      this._micUntil = 0;
+      if (!unsub) return;
+      const u = unsub;
+      unsub = null;
+      Promise.resolve().then(u).catch(() => {});
+    };
+    const send = (pcm) => this._micSend(conn, hid, pcm);
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (err) { this._micStarting = false; fail("Microphone not available: " + (err?.message || err)); return; }
+    if (!this._micHeld) { stop(); return; }   // released during the permission prompt: no run, no message
+    try {
+      ({ ctx, src, proc } = this._micPipe(stream, (pcm) => {
+        if (done) return;
+        if (hid !== null) send(pcm);
+        else if (early.length < 400) early.push(pcm);
+      }));
+    } catch (err) { stop(); fail("Microphone not available: " + (err?.message || err)); return; }
+    this._micStop = stop;
+    this._micStarting = false;
+    btn()?.classList.add("on");
+    const onEvent = (ev) => {
+      if (ev.type === "run-start") {
+        hid = ev.data?.runner_data?.stt_binary_handler_id ?? null;
+        if (hid === null) return;
+        early.splice(0).forEach(send);
+        if (done) { quiet = true; endByte(); }   // released before HA was ready: a tap, so no complaint if nothing was said
+        else if (box()) box().placeholder = "Listening...";   // show that the mic is listening
+      } else if (ev.type === "stt-vad-end") stop();
+      else if (ev.type === "stt-end") {
+        stop();
+        finish();
+        const text = (ev.data?.stt_output?.text || "").trim();
+        if (text) this._chatSpoken(text);
+      } else if (ev.type === "error") {
+        stop();
+        finish();
+        if (!quiet) fail("Voice: " + (ev.data?.message || ev.data?.code || "not understood"));
+      } else if (ev.type === "run-end") { stop(); finish(); }
+    };
+    try {
+      const pipeId = await this._chatPipeline();
+      if (done) return;   // released before anything was asked of Home Assistant
+      const ask = (extra) => conn.subscribeMessage(onEvent, { type: "assist_pipeline/run", pipeline: pipeId, start_stage: "stt", end_stage: "stt",
+        input: { sample_rate: Math.round(ctx.sampleRate), ...extra }, timeout: 30 });
+      try { unsub = await ask({ no_vad: true }); }
+      catch (err) {
+        if (err?.code !== "invalid_format") throw err;
+        unsub = await ask({});   // a Home Assistant without no_vad here: a pause then ends the recording
+      }
+      if (ended) finish();
+    } catch (err) { stop(); fail("Voice: " + (err?.message || err)); }
+  }
+
+  // Jarvis Home patch (2026-11-06): the audio path of hold to talk and Hey JARVIS alike: microphone to 16 bit PCM at 16 kHz.
+  _micPipe(stream, onPcm) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx, src;
+    try {
+      try {
+        ctx = new AC({ sampleRate: 16000 });
+        src = ctx.createMediaStreamSource(stream);
+      } catch (err) {   // some browsers refuse a 16 kHz context on the microphone; Home Assistant converts other rates itself
+        ctx?.close()?.catch?.(() => {});
+        ctx = new AC();
+        src = ctx.createMediaStreamSource(stream);
+      }
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      proc.onaudioprocess = (e) => {
+        const f = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(f.length);
+        for (let i = 0; i < f.length; i++) pcm[i] = Math.max(-1, Math.min(1, f[i])) * 0x7fff;
+        onPcm(pcm);
+      };
+      src.connect(proc);
+      proc.connect(ctx.destination);
+      return { ctx, src, proc };
+    } catch (err) { ctx?.close()?.catch?.(() => {}); throw err; }
+  }
+
+  _micSend(conn, hid, pcm) {
+    const msg = new Uint8Array(1 + pcm.byteLength);
+    msg[0] = hid;
+    msg.set(new Uint8Array(pcm.buffer), 1);
+    try { conn.socket.send(msg); } catch (err) {}
+  }
+
+  // Words that came from the microphone: shown in the box, then sent unless they were changed. A typed draft is never replaced
+  // and never sent by itself (audit 2026-11-07): the words are added after it and wait for Send. While JARVIS is still answering
+  // the words wait in the box and go as soon as the reply is in. Words that still wait to be sent are no typed draft (round 2):
+  // the next utterance joins them and both go as one message. CLEAN and the red-cross cancel drop them (_spokenCut).
+  _chatSpoken(text) {
+    const box = this.shadowRoot?.getElementById("chat-input");
+    const draft = (box ? box.value : this._chatDraft || "").trim();
+    if (draft && draft === this._spokenText) text = draft + " " + text;
+    else if (draft) {
+      this._chatDraft = draft + " " + text;
+      if (box) box.value = this._chatDraft;
+      this._wakeSync();   // the run that heard these words has ended: Hey JARVIS listens again unless a message is typed
+      return;
+    }
+    this._chatDraft = this._spokenText = text;
+    if (box) box.value = text;
+    this._spokenWait = (this._spokenWait || 0) + 1;
+    this._wakeSync();
+    const cut = this._chatCut || 0;
+    const send = () => {
+      const live = this._chatDraft === text && cut === (this._chatCut || 0);
+      if (live && this._chatBusy && this.isConnected) { setTimeout(send, 300); return; }
+      this._spokenWait--;
+      if (this._spokenText === text) this._spokenText = null;
+      if (live) this._sendChat(text);
+    };
+    setTimeout(send, 1200);
+  }
+
+  // CLEAN and the red-cross cancel: spoken words that still wait to be sent are dropped, from the box too. A typed draft stays.
+  _spokenCut() {
+    this._chatCut = (this._chatCut || 0) + 1;
+    const text = this._spokenText;
+    this._spokenText = null;
+    if (!text || this._chatDraft !== text) return;
+    this._chatDraft = "";
+    const box = this.shadowRoot?.getElementById("chat-input");
+    if (box) box.value = "";
+  }
+
+  // Jarvis Home patch (2026-11-06): Hey JARVIS. While the switch is on and the panel is open the microphone feeds Home Assistant's
+  // own pipeline, from wake word to speech-to-text; audio goes nowhere else. _wakeSync decides everything from the live state: it
+  // is safe to call at any time and from anywhere. While the person talks by hand or JARVIS answers it lets go of the microphone
+  // and looks again every half second, so JARVIS cannot wake itself. While a message is typed (the box has the focus and holds
+  // text) it rests too, and its button says so; leaving or emptying the box ends that at once (audit 2026-11-07, round 2). A
+  // focused empty box does not count, nor does text in a box that is not in use: the box keeps the focus after every reply.
+  _wakeBusy() {
+    const a = this._chatAudio;
+    return !!(this._micHeld || this._micStop || this._micStarting || Date.now() < (this._micUntil || 0) || this._spokenWait
+      || this._chatBusy || this._speakBusy || (a && !a.paused && !a.ended && !a.error));
+  }
+
+  // Round 3: Hey JARVIS's own words that wait to be sent are no typing. A click on Send or another control of the bar takes the
+  // focus from the box a moment before the click itself, so a rest gets a second of grace (_wakeGrace) instead of starting a
+  // new run that the send would stop again at once.
+  _wakeTyping() {
+    const box = this.shadowRoot?.getElementById("chat-input");
+    const text = box ? box.value.trim() : "";
+    if (!text || text === this._spokenText) return false;
+    return this.shadowRoot.activeElement === box || Date.now() < (this._wakeGrace || 0);
+  }
+
+  _wakeSync() {
+    const conn = this._hass?.connection;
+    const rest = !!this._wakeOn && this._wakeTyping();
+    if (rest !== !!this._wakeRest) {   // resting while a message is typed shows on the button; when it ends, listen at once
+      this._wakeRest = rest;
+      if (!rest) { clearTimeout(this._wakeTimer); this._wakeTimer = null; }
+      this._wakeShow();
+    }
+    if (!this._wakeOn || !this.isConnected || !conn || conn.connected === false) { this._wakeHalt(); return; }
+    this._wakeHook(conn);
+    if (rest || this._wakeBusy()) {
+      this._wakeHalt();
+      this._wakeLater(500);
+    } else if (!this._wakeRun && !this._wakeTimer) this._wakeStart(conn);
+  }
+
+  _wakeLater(ms) {
+    clearTimeout(this._wakeTimer);
+    this._wakeTimer = setTimeout(() => { this._wakeTimer = null; this._wakeSync(); }, ms);
+  }
+
+  _wakeHook(conn) {   // the socket can drop and return without the panel noticing
+    if (this._wakeConn === conn || !conn.addEventListener) return;
+    this._wakeUnhook();
+    this._wakeConn = conn;
+    this._wakeSeen = () => this._wakeSync();
+    conn.addEventListener("disconnected", this._wakeSeen);
+    conn.addEventListener("ready", this._wakeSeen);
+  }
+
+  _wakeUnhook() {
+    if (!this._wakeConn) return;
+    this._wakeConn.removeEventListener?.("disconnected", this._wakeSeen);
+    this._wakeConn.removeEventListener?.("ready", this._wakeSeen);
+    this._wakeConn = null;
+  }
+
+  _wakeHalt() {
+    clearTimeout(this._wakeTimer);
+    this._wakeTimer = null;
+    this._wakeRun?.end();
+    this._wakeRun = null;
+    const mic = this._wakeMic;
+    this._wakeMic = null;
+    if (mic) {
+      if (mic.resume) window.removeEventListener("pointerdown", mic.resume, true);
+      mic.stream.getAudioTracks().forEach((t) => t.removeEventListener("ended", mic.lost));
+      try { mic.proc.disconnect(); mic.src.disconnect(); } catch (e) {}
+      mic.stream.getTracks().forEach((t) => t.stop());
+      mic.ctx.close()?.catch?.(() => {});
+    }
+    if (this._wakeHot) this._wakeMark(false);
+  }
+
+  _wakeMark(hot) {
+    this._wakeHot = hot;
+    this._wakeShow();
+  }
+
+  _wakeShow() {
+    const btn = this.shadowRoot?.getElementById("chat-wake");
+    if (btn) {
+      btn.classList.toggle("on", !!this._wakeOn);
+      btn.classList.toggle("hot", !!this._wakeHot);
+      btn.classList.toggle("rest", !!(this._wakeOn && this._wakeRest));
+      btn.setAttribute("aria-pressed", this._wakeOn ? "true" : "false");
+      btn.title = this._wakeHot ? "Hey JARVIS heard you and is listening"
+        : this._wakeOn && this._wakeRest ? "Hey JARVIS is resting while you type. It listens again when you leave or empty the box. Click to turn it off"
+        : this._wakeOn ? "Hey JARVIS is on: listening for the wake word. Click to turn it off"
+        : "Hey JARVIS is off. Click to listen for the wake word";
+    }
+    const box = this.shadowRoot?.getElementById("chat-input");
+    if (!box) return;
+    if (this._wakeHot && box.dataset.hint === undefined) {
+      box.dataset.hint = box.placeholder;
+      box.placeholder = "Listening...";
+    } else if (!this._wakeHot && box.dataset.hint !== undefined) {
+      box.placeholder = box.dataset.hint;
+      delete box.dataset.hint;
+    }
+  }
+
+  _wakeSet(on, why) {
+    this._wakeOn = on;
+    try { localStorage.setItem("jarvis_chat_wake", on ? "1" : "0"); } catch (e) {}
+    this._wakeFails = 0;
+    this._wakeWarned = false;
+    this._wakeSync();
+    this._wakeShow();
+    if (why) { this._chatMessages.push({ role: "error", text: why }); this._refreshChat(); }
+  }
+
+  _wakeNone() {
+    return `No wake word is set for this assistant, ${this._honorific()}. Choose one in Home Assistant under Settings, Voice assistants. Hey JARVIS is off.`;
+  }
+
+  async _wakeOpen(conn, gone) {   // true when the microphone is ready for this run
+    if (this._wakeMic) return true;
+    const off = (t) => { if (!gone()) this._wakeSet(false, t + " Hey JARVIS is off."); return false; };
+    if (!navigator.mediaDevices?.getUserMedia) return off("The microphone needs the https address of this page.");
+    let stream, mic;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (err) { return off("Microphone not available: " + (err?.message || err) + "."); }
+    if (gone()) { stream.getTracks().forEach((t) => t.stop()); return false; }
+    try {
+      mic = { stream, ...this._micPipe(stream, (pcm) => {
+        const run = this._wakeRun;
+        if (run && run.hid !== null && !run.over) {
+          this._micSend(conn, run.hid, pcm);
+          this._wakeLevel(conn, run, pcm);
+        }
+      }) };
+    } catch (err) {
+      stream.getTracks().forEach((t) => t.stop());
+      return off("Microphone not available: " + (err?.message || err) + ".");
+    }
+    mic.lost = () => { if (this._wakeMic === mic) this._wakeSet(false, `The microphone was lost, ${this._honorific()}. Hey JARVIS is off.`); };
+    stream.getAudioTracks().forEach((t) => t.addEventListener("ended", mic.lost));
+    if (mic.ctx.state === "suspended") {   // a page opened with the switch on: the browser waits for a first touch
+      mic.resume = () => { mic.ctx.resume?.()?.catch?.(() => {}); };
+      mic.resume();
+      window.addEventListener("pointerdown", mic.resume, true);
+    }
+    this._wakeMic = mic;
+    return true;
+  }
+
+  async _wakeStart(conn) {
+    const run = { t0: Date.now(), hid: null, unsub: null, over: false, hot: false };
+    this._wakeRun = run;
+    const gone = () => this._wakeRun !== run;
+    run.end = () => {
+      if (run.over) return;
+      run.over = true;
+      clearTimeout(run.dog);
+      clearTimeout(run.turn);
+      if (run.hid !== null) { try { conn.socket.send(new Uint8Array([run.hid])); } catch (e) {} }
+      run.hid = null;
+      if (run.unsub) { const u = run.unsub; run.unsub = null; Promise.resolve().then(u).catch(() => {}); }
+    };
+    const row = await this._chatPipelineRow();
+    if (gone()) return;
+    if (row && !row.wake_word_entity) { this._wakeSet(false, this._wakeNone()); return; }
+    if (!(await this._wakeOpen(conn, gone)) || gone()) return;
+    const onEvent = (ev) => {
+      if (run.over) return;
+      if (ev.type === "run-start") run.hid = ev.data?.runner_data?.stt_binary_handler_id ?? null;
+      else if (ev.type === "wake_word-end") {
+        if (!Object.keys(ev.data?.wake_word_output || {}).length) return;   // the audio ended and nothing was heard
+        run.hot = true;
+        run.hotAt = Date.now();
+        this._wakeMark(true);
+        this._wakeBeep();
+        run.dog = setTimeout(() => this._wakeAgain(run), this._wakeDog ?? 30000);   // no answer from speech-to-text
+      } else if (ev.type === "stt-vad-end") {
+        if (run.hid !== null) { try { conn.socket.send(new Uint8Array([run.hid])); } catch (e) {} }
+        run.hid = null;
+      } else if (ev.type === "stt-end") {
+        const text = (ev.data?.stt_output?.text || "").trim();
+        // Speech-to-text invents a short word such as "Okay." from silence: a lone filler word is not a command.
+        if (!text || /^(ok(ay)?|thank you|thanks|you|bye|yeah|hmm+|uh+|um+)[.!?]*$/i.test(text)) { this._wakeAgain(run); return; }
+        run.end();
+        this._wakeRun = null;
+        this._wakeFails = 0;
+        this._wakeWarned = false;
+        this._wakeMark(false);
+        this._chatSpoken(text);
+      } else if (ev.type === "error") this._wakeError(run, ev.data?.code, ev.data?.message);
+      else if (ev.type === "run-end") { run.hid = null; this._wakeAgain(run); }
+    };
+    try {
+      const unsub = await conn.subscribeMessage(onEvent, { type: "assist_pipeline/run", pipeline: row?.id, start_stage: "wake_word", end_stage: "stt",
+        input: { sample_rate: Math.round(this._wakeMic.ctx.sampleRate), timeout: 0, no_vad: true }, timeout: 300 }, { resubscribe: false });
+      if (run.over) { Promise.resolve().then(unsub).catch(() => {}); return; }
+      run.unsub = unsub;
+      // HA ends a run at its timeout, wherever the person is in a sentence. A fresh run before that keeps a command whole.
+      run.turn = setTimeout(() => {
+        if (run.over || run.hot) return;
+        run.end();
+        this._wakeRun = null;
+        this._wakeSync();
+      }, this._wakeTurn ?? 270000);
+    } catch (err) { if (!run.over) this._wakeError(run, err?.code, err?.message || String(err)); }
+  }
+
+  // A short soft tone when the wake word is heard (2026-11-07), made in the browser: no file, and it is over before the
+  // first 0.5 s of speech that the end-of-speech check skips, so speech-to-text does not hear it.
+  _wakeBeep() {
+    const ctx = this._wakeMic?.ctx;
+    if (!ctx || ctx.state !== "running") return;
+    try {
+      const osc = ctx.createOscillator(), gain = ctx.createGain(), t = ctx.currentTime;
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(880, t);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.18, t + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.15);
+    } catch (e) {}
+  }
+
+  // Home Assistant's own end-of-speech check stops after 0.7 s of quiet, so a pause after the wake word ended the command. The
+  // page decides instead: it skips the end of the wake word, waits for the person to start, and ends after a real pause. When
+  // nobody speaks, nothing is sent. Levels are 16 bit; the gate follows the room's own noise.
+  _wakeLevel(conn, run, pcm) {
+    let sum = 0;
+    for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+    const rms = Math.sqrt(sum / (pcm.length || 1)), now = Date.now();
+    if (!run.hot) {
+      const n = this._wakeNoise ?? rms;
+      if (rms < n * 4 + 200) this._wakeNoise = n * 0.9 + rms * 0.1;
+      return;
+    }
+    const since = now - run.hotAt;
+    if (since < (this._wakeSkip ?? 500)) return;
+    if (rms > Math.max(this._wakeGate ?? 700, (this._wakeNoise || 0) * 3)) { run.spoke = run.spoke || now; run.loud = now; }
+    const finished = run.spoke && now - run.loud > (this._wakeQuiet ?? 1300);
+    if (!finished && since < (run.spoke ? (this._wakeMax ?? 15000) : (this._wakeWait ?? 7000))) return;
+    if (!run.spoke) { this._wakeAgain(run); return; }
+    try { conn.socket.send(new Uint8Array([run.hid])); } catch (e) {}
+    run.hid = null;
+  }
+
+  _wakeError(run, code, message) {
+    run.hid = null;
+    if (code === "wake-engine-missing" || code === "wake-provider-missing") {
+      run.end();
+      this._wakeSet(false, this._wakeNone());
+      return;
+    }
+    const soft = ["wake-word-timeout", "timeout", "duplicate_wake_up_detected", "wake_word_detection_aborted", "stt-no-text-recognized"].includes(code);
+    if (!soft && !this._wakeWarned) {
+      this._wakeWarned = true;
+      this._chatMessages.push({ role: "error", text: `Hey JARVIS could not listen: ${message || code}. I will keep trying, ${this._honorific()}.` });
+      this._refreshChat();
+    }
+    this._wakeAgain(run, !soft);
+  }
+
+  // Listen again after a wait that grows while runs keep ending early. Ordinary endings stay within a few seconds.
+  _wakeAgain(run, hard) {
+    run.end();
+    if (this._wakeRun === run) this._wakeRun = null;
+    this._wakeMark(false);
+    if (Date.now() - run.t0 > 10000) this._wakeFails = 0;
+    const fails = this._wakeFails || 0;
+    this._wakeFails = fails + 1;
+    this._wakeLater(Math.min(hard ? 30000 : 4000, (this._wakeBase ?? 500) * 2 ** fails));
+  }
+
+  async _speakChat(text) {
+    if (!this._chatSpeak || !text || !this.isConnected) return;   // a reply that lands after leaving the panel stays silent
+    const gen = this._speakGen;
+    let preparing = true;
+    const ready = () => { if (preparing) { preparing = false; this._speakBusy--; } };
+    this._speakBusy = (this._speakBusy || 0) + 1;   // Hey JARVIS rests from here until the voice has finished
+    this._wakeSync();
+    try {
+      const pipeId = await this._chatPipeline();
+      let unsub = null, finished = false;
+      const drop = () => { const u = unsub; unsub = null; if (u) Promise.resolve().then(u).catch(() => {}); };
+      unsub = await this._hass.connection.subscribeMessage((ev) => {
+        if (ev.type === "tts-end") {
+          const url = ev.data?.tts_output?.url;
+          this._chatLastAudio = url;
+          if (url && this._chatSpeak && gen === this._speakGen) {
+            this._chatAudio?.pause();
+            this._chatAudio = new Audio(url);
+            this._chatAudio.play().catch((e) => console.warn("JARVIS chat: audio blocked", e));
+          }
+        }
+        if (ev.type === "run-end" || ev.type === "error") { finished = true; ready(); drop(); }
+      }, { type: "assist_pipeline/run", pipeline: pipeId, start_stage: "tts", end_stage: "tts", input: { text } });
+      if (finished) drop();
+    } catch (err) { ready(); console.warn("JARVIS chat: speech failed", err); }
+  }
+
+  _chatIcon(path) { return `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="${path}"/></svg>`; }
+
+  _ttsIcon() {
+    return this._chatIcon(this._chatSpeak
+      ? "M14,3.23V5.29C16.89,6.15 19,8.83 19,12C19,15.17 16.89,17.84 14,18.7V20.77C18,19.86 21,16.28 21,12C21,7.72 18,4.14 14,3.23M16.5,12C16.5,10.23 15.5,8.71 14,7.97V16C15.5,15.29 16.5,13.76 16.5,12M3,9V15H7L12,20V4L7,9H3Z"
+      : "M12,4L9.91,6.09L12,8.18M4.27,3L3,4.27L7.73,9H3V15H7L12,20V13.27L16.25,17.53C15.58,18.04 14.83,18.46 14,18.7V20.77C15.38,20.45 16.63,19.82 17.68,18.96L19.73,21L21,19.73L12,10.73M19,12C19,12.94 18.8,13.82 18.46,14.64L19.97,16.15C20.62,14.91 21,13.5 21,12C21,7.72 18,4.14 14,3.23V5.29C16.89,6.15 19,8.83 19,12M16.5,12C16.5,10.23 15.5,8.71 14,7.97V10.18L16.45,12.63C16.5,12.43 16.5,12.21 16.5,12Z");
+  }
+
+  _wakeIcon() {
+    return this._chatIcon("M17,20C16.71,20 16.44,19.94 16.24,19.85C15.53,19.5 15.03,18.97 14.53,17.47C14,15.91 13.06,15.18 12.14,14.47C11.35,13.86 10.53,13.23 9.82,11.94C9.29,11 9,9.93 9,9C9,6.2 11.2,4 14,4C16.8,4 19,6.2 19,9H21C21,5.07 17.93,2 14,2C10.07,2 7,5.07 7,9C7,10.26 7.38,11.65 8.07,12.9C9,14.55 10.05,15.38 10.92,16.05C11.73,16.67 12.31,17.12 12.63,18.1C13.23,19.92 14,20.94 15.36,21.65C15.86,21.88 16.43,22 17,22C19.21,22 21,20.21 21,18H19C19,19.1 18.1,20 17,20M7.64,2.64L6.22,1.22C4.23,3.21 3,5.96 3,9C3,12.04 4.23,14.79 6.22,16.78L7.63,15.37C6,13.74 5,11.5 5,9C5,6.5 6,4.26 7.64,2.64M11.5,9C11.5,10.38 12.62,11.5 14,11.5C15.38,11.5 16.5,10.38 16.5,9C16.5,7.62 15.38,6.5 14,6.5C12.62,6.5 11.5,7.62 11.5,9Z");
+  }
+
+  _micIcon() {
+    return this._chatIcon("M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z");
+  }
+
+  // Jarvis Home patch (2026-11-05): use the speech settings of the assistant that runs JARVIS.
+  async _chatPipelineRow() {
+    try {
+      const res = await this._hass.callWS({ type: "assist_pipeline/pipeline/list" });
+      const agent = this._jarvisAgentId();
+      const rows = res?.pipelines || [];
+      const all = rows.filter((x) => x.conversation_engine === agent);
+      return all.find((x) => x.id === res?.preferred_pipeline) || all[0] || rows.find((x) => x.id === res?.preferred_pipeline) || null;
+    } catch (err) { return null; }
+  }
+
+  async _chatPipeline() {
+    return (await this._chatPipelineRow())?.id;
+  }
+
+  _toggleSpeak() {
+    this._chatSpeak = !this._chatSpeak;
+    try { localStorage.setItem("jarvis_chat_speak", this._chatSpeak ? "1" : "0"); } catch (e) {}
+    const b = this.shadowRoot?.getElementById("chat-speak");
+    if (b) { b.classList.toggle("on", this._chatSpeak); b.innerHTML = this._ttsIcon(); }
+    if (!this._chatSpeak && this._chatAudio) { this._chatAudio.pause(); this._chatAudio = null; }
+  }
+
+  _stopChatAudio() {
+    this._speakGen = (this._speakGen || 0) + 1;   // speech still being prepared must not start either
+    if (this._chatAudio) { this._chatAudio.pause(); this._chatAudio = null; }
+  }
+
+  _clearChat() {
+    this._chatTag();
+    this._chatMessages.forEach((m) => this._chatRemoved.add(m.id));
+    this._chatMessages = [];
+    this._chatConvId = null;
+    this._chatReq = (this._chatReq || 0) + 1;   // a reply still on its way stays out of the cleared chat
+    this._chatBusy = false;
+    this._spokenCut();   // spoken words still waiting to be sent go too
+    this._stopChatAudio();
+    this._chatWipe = true;
+    this._saveChat();
+    this._refreshChat();
+  }
+
+  // Jarvis Home patch (2026-11-07): CLEAN deletes the history on every device of this login, so it asks first, on the page
+  // itself. The question text starts where CLEAN was, with CANCEL and YES after it, so a second tap on that spot hits no button
+  // and cannot confirm. The question closes by itself; a render keeps it.
+  _chatAskSet(on) {
+    this._chatAsk = on;
+    clearTimeout(this._chatAskT);
+    this._chatAskT = on ? setTimeout(() => this._chatAskSet(false), this._chatAskWait ?? 10000) : null;
+    const root = this.shadowRoot;
+    root?.getElementById("chat-clear")?.toggleAttribute("hidden", on);
+    root?.getElementById("chat-ask")?.toggleAttribute("hidden", !on);
+    if (on) root?.getElementById("chat-ask-no")?.focus();
+  }
+
+  async _sendChat(spoken) {
     if (this._chatBusy) return;
     const input = this.shadowRoot?.getElementById("chat-input");
-    const text = (input?.value || "").trim();
+    const text = (input?.value || spoken || "").trim();
     if (!text) return;
     if (input) input.value = "";
+    this._chatDraft = "";
     this._chatMessages.push({ role: "user", text });
+    const reqId = (this._chatReq = (this._chatReq || 0) + 1);
     this._chatBusy = true;
+    this._wakeSync();
+    this._startThink();
     this._refreshChat();
     try {
       const payload = {
@@ -2381,17 +3049,22 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
       if (agent) payload.agent_id = agent;
       if (this._chatConvId) payload.conversation_id = this._chatConvId;
       const res = await this._hass.callWS(payload);
+      if (reqId !== this._chatReq) return;  // cancelled with the red cross
       this._chatConvId = res?.conversation_id || this._chatConvId;
       const reply = res?.response?.speech?.plain?.speech
         || "(JARVIS returned no text.)";
       this._chatMessages.push({ role: "jarvis", text: reply });
+      this._speakChat(reply);
     } catch (err) {
+      if (reqId !== this._chatReq) return;
       this._chatMessages.push({
         role: "error",
         text: "Couldn't reach JARVIS — " + (err?.message || String(err)),
       });
     } finally {
+      if (reqId !== this._chatReq) return;
       this._chatBusy = false;
+      this._saveChat();
       this._refreshChat();
       this.shadowRoot?.getElementById("chat-input")?.focus();
     }
@@ -3848,6 +4521,8 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
   }
 
   _house3dFloor() {
+    // Jarvis Home patch (2026-11-04f): the owner's model has one floor; other styles keep their floors.
+    if (['my_apartment', 'appart_light'].includes(this._residenceStyle())) { this._currentFloor = 'all'; return 'all'; }
     const f = this._currentFloor || 'all';
     return f === 'bsmt' ? 'b' : f;
   }
@@ -3943,6 +4618,8 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
       modern:    { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
       townhouse: { roof: 'gable', pitch: 0.85, dormersFront: 0, dormersRear: 0 },
       apartment: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
+      my_apartment: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
+      appart_light: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
       cabin:     { roof: 'gable', pitch: 1.25, dormersFront: 2, dormersRear: 1 },
       semi_detached: { roof: 'gable', pitch: 0.9, dormersFront: 0, dormersRear: 0 },
       end_terrace:   { roof: 'gable', pitch: 0.9, dormersFront: 0, dormersRear: 0 },
@@ -3990,6 +4667,90 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
   _renderHouse3d() {
     const mount = this.shadowRoot?.querySelector('#res-iso');
     if (!mount || typeof JARVIS3D === 'undefined') return;
+    // Jarvis Home patch (2026-11-04b): ALL view = wireframe model of the owner's apartment (walls, doors, windows, balcony).
+    if (this._house3dFloor() === 'all' && ['my_apartment', 'appart_light'].includes(this._residenceStyle())) {
+      try {
+        const S = 0.02256, H = 2.6, SILL = 0.9, HEAD = 2.15, DH = 2.1, E = 0.25, I = 0.12;
+        const th = (this._house3dTheta != null ? this._house3dTheta : 35) * Math.PI / 180, co = Math.cos(th), si = Math.sin(th);
+        const CX = 207, CY = 330, B = [];
+        const seg = (a, b, t, y0, y1, k) => { const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]), z0 = Math.min(a[1], b[1]), z1 = Math.max(a[1], b[1]); const h = (z0 === z1); const tt = t / S / 2; B.push({ x0: (h ? x0 - tt : x0 - tt), x1: (h ? x1 + tt : x1 + tt), z0: (h ? z0 - tt : z0 - tt), z1: (h ? z1 + tt : z1 + tt), y0, y1, k }); };
+        const win = (a, b, t, ws, k) => { const h = a[1] === b[1], lo = h ? Math.min(a[0], b[0]) : Math.min(a[1], b[1]), hi = h ? Math.max(a[0], b[0]) : Math.max(a[1], b[1]); const pt = v => h ? [v, a[1]] : [a[0], v]; let cur = lo; ws.forEach(([w0, w1]) => { if (w0 > cur) seg(pt(cur), pt(w0), t, 0, H, k); seg(pt(w0), pt(w1), t, 0, SILL, k); seg(pt(w0), pt(w1), t, HEAD, H, k); seg(pt(w0), pt(w1), 0.03, SILL, HEAD, 'g'); cur = w1; }); if (cur < hi) seg(pt(cur), pt(hi), t, 0, H, k); };
+        const lin = (a, b, t, glass) => { seg(a, b, t, DH, H, 'i'); if (glass) seg(a, b, 0.03, 0.05, DH, 'g'); };
+        // exterior
+        seg([168, 62], [185, 62], E, 0, H, 'e'); win([230, 62], [410, 62], E, [[275, 365]], 'e'); seg([410, 62], [410, 598], E, 0, H, 'e');
+        win([168, 598], [410, 598], E, [[195, 335], [360, 400]], 'e'); seg([168, 537], [168, 598], E, 0, H, 'e');
+        win([5, 537], [115, 537], E, [[15, 105]], 'e'); seg([150, 537], [168, 537], E, 0, H, 'e');
+        seg([5, 350], [5, 537], E, 0, H, 'e'); seg([5, 350], [168, 350], E, 0, H, 'e'); seg([168, 62], [168, 350], E, 0, H, 'e');
+        lin([185, 62], [230, 62], E); lin([115, 537], [150, 537], E, true);
+        // interior
+        [[[168,112],[190,112]],[[235,112],[250,112]],[[250,62],[250,150]],[[250,185],[250,228]],[[250,262],[250,308]],[[250,342],[250,350]],
+         [[250,195],[410,195]],[[380,62],[380,195]],[[250,300],[410,300]],[[318,300],[318,348]],[[250,348],[410,348]],
+         [[168,350],[190,350]],[[225,350],[250,350]],[[168,350],[168,400]],[[168,490],[168,537]]].forEach(([a, b]) => seg(a, b, I, 0, H, 'i'));
+        lin([190,112],[235,112], I); lin([250,150],[250,185], I); lin([250,228],[250,262], I); lin([250,308],[250,342], I); lin([190,350],[225,350], I); lin([168,400],[168,490], I);
+        B.push({ x0: 318, x1: 410, z0: 300, z1: 348, y0: 0, y1: H, k: 's' });                     // shaft
+        seg([5, 598], [168, 598], 0.04, 0, 1.0, 'r'); seg([5, 537], [5, 598], 0.04, 0, 1.0, 'r'); // balcony railing
+        const floors = [['ENTRY',168,62,250,112],['HALL',168,112,250,350],['KITCHEN',250,62,410,195],['BATHROOM',250,195,410,300],['WC',250,300,318,348],
+                        ['BEDROOM',5,350,168,537],['LIVING ROOM',168,350,410,598],['BALCONY',5,537,168,598]];
+        const GHOST = this._residenceStyle && this._residenceStyle() === 'appart_light';
+        if (GHOST) { B.length = 0; floors.forEach(([n, x0, z0, x1, z1]) => B.push({ x0, x1, z0, z1, y0: 0, y1: n === 'BALCONY' ? 0.35 : 0.7, k: n === 'BALCONY' ? 'r' : 'e' })); }
+        const lit = this._house3dLit ? (this._house3dLit() || {}) : {};
+        // people first: a room with someone in it glows and counts as occupied (no motion sensors in this home).
+        // Room = where they last switched something (input_text.person_rooms JSON, set by the 'Person room from last
+        // action' automation); default: living room.
+        const hs = (this._hass && this._hass.states) || {};
+        let pmap = {}; try { pmap = JSON.parse((hs['input_text.person_rooms'] || {}).state || '{}'); } catch (_) { pmap = {}; }
+        const defRooms = {}, perRoom = {};
+        const people = Object.keys(hs).filter(id => id.startsWith('person.') && hs[id].state === 'home').sort().map(pid => {
+          const key = pid.split('.')[1], want = String(pmap[key] || defRooms[key] || 'LIVING ROOM').toUpperCase();
+          return { pid, key, room: (floors.find(r => r[0] === want) || floors.find(r => r[0] === 'LIVING ROOM')) };
+        }).filter(p => p.room);
+        const taken = new Set(people.map(p => p.room[0]));
+        // projection (plan units -> metres -> rotated iso)
+        const pr = (x, z, y) => { const X = (x - CX) * S, Z = (z - CY) * S, xr = X * co - Z * si, zr = X * si + Z * co; return [xr * 40, zr * 20 - y * 34, zr]; };
+        const polys = [];
+        const face = (pts, k) => { const P = pts.map(p => pr(p[0], p[1], p[2])); polys.push({ P, d: P.reduce((s, p) => s + p[2], 0) / P.length + (k === 'f' ? -100 : 0), k }); };
+        floors.forEach(([n, x0, z0, x1, z1]) => face([[x0, z0, 0], [x1, z0, 0], [x1, z1, 0], [x0, z1, 0]], taken.has(n) || lit[n.toLowerCase()] ? 'fl' : (n === 'BALCONY' ? 'fb' : 'f')));
+        polys.forEach(p => { if (p.k !== 'f') p.d -= 100; });
+        B.forEach(b => { const { x0, x1, z0, z1, y0, y1, k } = b;
+          if (!GHOST) face([[x0, z0, y1], [x1, z0, y1], [x1, z1, y1], [x0, z1, y1]], k);
+          face([[x0, z0, y0], [x1, z0, y0], [x1, z0, y1], [x0, z0, y1]], k);
+          face([[x0, z1, y0], [x1, z1, y0], [x1, z1, y1], [x0, z1, y1]], k); face([[x0, z0, y0], [x0, z1, y0], [x0, z1, y1], [x0, z0, y1]], k);
+          face([[x1, z0, y0], [x1, z1, y0], [x1, z1, y1], [x1, z0, y1]], k); });
+        polys.sort((a, b) => a.d - b.d);
+        const st = { e: ['rgba(0,242,254,0.025)', 'rgba(0,242,254,0.55)'], i: ['rgba(0,242,254,0.015)', 'rgba(0,242,254,0.35)'], g: ['rgba(120,220,255,0.12)', 'rgba(150,235,255,0.7)'],
+                     s: ['rgba(0,242,254,0.05)', 'rgba(0,242,254,0.3)'], r: ['rgba(0,245,160,0.12)', 'rgba(0,245,160,0.8)'],
+                     f: ['rgba(0,242,254,0.035)', 'rgba(0,242,254,0.22)'], fl: ['rgba(255,200,90,0.18)', 'rgba(255,200,90,0.6)'], fb: ['rgba(0,245,160,0.07)', 'rgba(0,245,160,0.45)'] };
+        // 'My apart low': simple copy of the apartment, one clean low outline per room.
+        if (GHOST) Object.assign(st, { e: ['rgba(120,225,255,0.05)', 'rgba(160,238,255,0.75)'], r: ['rgba(100,245,190,0.05)', 'rgba(120,255,205,0.75)'],
+          f: ['rgba(90,205,255,0.09)', 'rgba(160,238,255,0.75)'], fl: ['rgba(255,205,110,0.30)', 'rgba(255,215,130,0.9)'], fb: ['rgba(90,245,190,0.08)', 'rgba(120,255,205,0.75)'] });
+        let mnx = 1e9, mny = 1e9, mxx = -1e9, mxy = -1e9;
+        polys.forEach(p => p.P.forEach(q => { mnx = Math.min(mnx, q[0]); mny = Math.min(mny, q[1]); mxx = Math.max(mxx, q[0]); mxy = Math.max(mxy, q[1]); }));
+        const pad = 30, vb = [mnx - pad, mny - pad, (mxx - mnx) + 2 * pad, (mxy - mny) + 2 * pad].map(v => v.toFixed(1)).join(' ');
+        let svg = '<svg viewBox="' + vb + '" style="width:100%;height:100%;display:block" preserveAspectRatio="xMidYMid meet"><defs><filter id="jhglow"><feGaussianBlur stdDeviation="0.8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#jhglow)">';
+        polys.forEach(p => { const c = st[p.k] || st.i; svg += '<polygon points="' + p.P.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(' ') + '" fill="' + c[0] + '" stroke="' + c[1] + '" stroke-width="' + (GHOST ? 1 : 0.6) + '" stroke-linejoin="round"/>'; });
+        svg += '</g>';
+        floors.forEach(([n, x0, z0, x1, z1]) => { const q = pr((x0 + x1) / 2, (z0 + z1) / 2, 0.05); svg += '<text x="' + q[0].toFixed(1) + '" y="' + q[1].toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="9" letter-spacing="1.5" fill="' + (n === 'BALCONY' ? '#5fffc0' : '#7fe9ff') + '" opacity="0.85">' + n + '</text>'; });
+        // people markers (Jarvis Home 2026-11-04): every person.* that is home gets a marker with their HA map picture.
+        const esc = v => String(v).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+        people.forEach(({ pid, key, room: fl }, idx) => {
+          const st = hs[pid];
+          const n = perRoom[fl[0]] = (perRoom[fl[0]] || 0) + 1;
+          const q = pr((fl[1] + fl[3]) / 2, (fl[2] + fl[4]) / 2, 1.4), x = q[0] + (n - 1) * 34, y = q[1] - 6, R = 13, cid = 'jhpc' + idx;
+          const nm = st.attributes.friendly_name || key, pic = st.attributes.entity_picture;
+          svg += '<line x1="' + x.toFixed(1) + '" y1="' + (y + R).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + (q[1] + 34).toFixed(1) + '" stroke="#ffd166" stroke-width="1" stroke-dasharray="2 2" opacity="0.8"/>';
+          svg += '<defs><clipPath id="' + cid + '"><circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + R + '"/></clipPath></defs>';
+          svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + (R + 2) + '" fill="#06121a" stroke="#ffd166" stroke-width="1.6"/>';
+          if (pic) svg += '<image href="' + esc(pic) + '" x="' + (x - R).toFixed(1) + '" y="' + (y - R).toFixed(1) + '" width="' + (2 * R) + '" height="' + (2 * R) + '" clip-path="url(#' + cid + ')" preserveAspectRatio="xMidYMid slice"/>';
+          else svg += '<text x="' + x.toFixed(1) + '" y="' + (y + 4).toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="11" fill="#ffd166">' + esc(nm.slice(0, 1).toUpperCase()) + '</text>';
+          svg += '<text x="' + x.toFixed(1) + '" y="' + (y - R - 6).toFixed(1) + '" text-anchor="middle" font-family="monospace" font-size="8" letter-spacing="1" fill="#ffd166">' + esc(nm.toUpperCase()) + '</text>';
+        });
+        svg += '</svg>';
+        mount.innerHTML = svg;
+        const occEl = this.shadowRoot && this.shadowRoot.getElementById('res-occ');
+        if (occEl) occEl.textContent = taken.size + ' / ' + floors.length;
+        return;
+      } catch (e) { console.error('JARVIS apartment model', e); }
+    }
     const floor = this._house3dFloor();
     const spec = this._houseSpec();
     const plan = this._house3dPlan();
@@ -4065,6 +4826,9 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
       townhouse: { label: 'Townhouse',  roof: 'gable', pitch: 0.85 },
       apartment: { label: 'Apartment',  roof: 'flat',  pitch: 0 },
       cabin:     { label: 'Cabin',      roof: 'gable', pitch: 1.25 },
+      // Jarvis Home patch (2026-11-04e): the owner's own apartment model, added after the ready-made styles.
+      my_apartment: { label: 'My residence', roof: 'flat', pitch: 0 },
+      appart_light: { label: 'My Resid', roof: 'flat', pitch: 0 },
       semi_detached: { label: 'Semi-Detached (UK)', roof: 'gable', pitch: 0.9 },
       end_terrace:   { label: 'End-of-Terrace (UK)', roof: 'gable', pitch: 0.9 },
       terrace:       { label: 'Mid Terrace (UK)',   roof: 'gable', pitch: 0.85 },
@@ -5107,7 +5871,7 @@ dotLabel.textContent = lightBtn.classList.contains("adl")
             ${this._residenceStyleOptions(d)}
           </select>
         </div>
-        <div class="floor-tabs">
+        <div class="floor-tabs" style="${['my_apartment', 'appart_light'].includes(this._residenceStyle()) ? 'display:none' : ''}">
           <button class="floor-tab ${this._currentFloor === 'all' ? 'active' : ''}" data-floor="all">All</button>
           <button class="floor-tab ${this._currentFloor === '1f' ? 'active' : ''}" data-floor="1f">1st Floor</button>
           ${String(d.config?.home_stories ?? '1.5') !== '1' ? `<button class="floor-tab ${this._currentFloor === '2f' ? 'active' : ''}" data-floor="2f">2nd Floor</button>` : ''}
@@ -6299,15 +7063,20 @@ ${this._renderExcludedEntities(d)}
   <div class="chat-tab">
     <div class="panel chat-panel">
       <div class="head">
-        <span>Talk to JARVIS</span>
+        <span>Talk to JARVIS<button id="chat-clear" class="chat-clean" ${this._chatAsk ? 'hidden' : ''}>CLEAN</button><span id="chat-ask" class="chat-ask" ${this._chatAsk ? '' : 'hidden'}>Delete all messages on every device?<button id="chat-ask-no" class="chat-clean">CANCEL</button><button id="chat-ask-yes" class="chat-clean chat-yes">YES, DELETE ALL</button></span></span>
         <span class="side">${this._chatAgentLabel()}</span>
       </div>
       <div id="chat-log" class="chat-log">${this._renderChatMessages()}</div>
       <div class="chat-compose">
-        <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message — Enter to send, Shift+Enter for a new line" ${this._chatBusy ? 'disabled' : ''} autocomplete="off"></textarea>
+        <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message — Enter to send, Shift+Enter for a new line" ${this._chatBusy ? 'disabled' : ''} autocomplete="off">${this._esc(this._chatDraft)}</textarea>
+        <div class="chat-voice">
+          <button id="chat-speak" class="chat-tts ${this._chatSpeak ? 'on' : ''}" title="Spoken replies on or off" aria-label="Spoken replies">${this._ttsIcon()}</button>
+          <button id="chat-mic" class="chat-mic ${this._micStop ? 'on' : ''}" title="Hold to talk" aria-label="Hold to talk">${this._micIcon()}</button>
+          <button id="chat-wake" class="chat-wake ${this._wakeOn ? 'on' : ''}" aria-label="Hey JARVIS" aria-pressed="false">${this._wakeIcon()}</button>
+        </div>
         <button id="chat-send" class="chat-send" ${this._chatBusy ? 'disabled' : ''} title="Send">${this._chatBusy ? '…' : 'SEND'}</button>
       </div>
-      <div class="chat-hint">Same brain as voice &amp; the HA Assist box — it can answer questions and control the home. History clears on reload. <button id="chat-clear" class="chat-clear">clear</button></div>
+      <!-- chat-hint-removed -->
     </div>
   </div>
   ` : ''}
@@ -6438,6 +7207,10 @@ ${this._renderExcludedEntities(d)}
           <div class="cfg-row"><label>Custom directive <span class="mode-bind-sub">overrides preset</span></label><textarea class="cfg-field cfg-text" data-cfg-key="directive" rows="3" placeholder="(optional) a custom standing directive">${esc(c.directive || '')}</textarea></div>
           <div class="cfg-row"><label>Use Home Assistant LLM API</label>${tog('use_hass_api', c.use_hass_api !== false)}</div>
           <div class="cfg-row"><label>LLM web-search fallback</label>${tog('web_research_llm_fallback', !!c.web_research_llm_fallback)}</div>
+          <div class="cfg-row"><label>Check that actions really ran</label>${tog('jh_strict_actions', c.jh_strict_actions !== false)}</div>
+          <div class="cfg-row"><label>Block actions after reading an email</label>${tog('jh_mail_block', c.jh_mail_block !== false)}</div>
+          <div class="cfg-row"><label>Scheduled briefings use real facts only</label>${tog('jh_facts_only_briefings', c.jh_facts_only_briefings !== false)}</div>
+          <div class="cfg-row"><label>Camera Watch opens on</label><select class="cfg-field" data-cfg-key="camera_watch_default">${this._optsLabeled([['last', 'Last camera used'], ...(Array.isArray(c.cameras) ? c.cameras : []).map(x => [x.entity_id, x.name || x.entity_id])], String(c.camera_watch_default || ''))}</select></div>
         </div>
       </div>
 
@@ -6673,6 +7446,12 @@ ${this._renderExcludedEntities(d)}
     if (chatSend) chatSend.addEventListener("click", () => this._sendChat());
     const chatInput = this.shadowRoot.querySelector("#chat-input");
     if (chatInput) {
+      chatInput.addEventListener("input", () => { this._chatDraft = chatInput.value; if (this._wakeOn) this._wakeSync(); });
+      // Hey JARVIS rests only while a message is typed, so it looks again when the box gets or loses the focus or changes
+      ["focus", "blur", "input"].forEach((n) => chatInput.addEventListener(n, () => { if (this._wakeOn) setTimeout(() => this._wakeSync(), 0); }));
+      const wakeGrace = () => { if (this._wakeRest) this._wakeGrace = Date.now() + 1000; };   // a click in the bar ends no rest yet
+      chatInput.addEventListener("blur", (e) => { if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest(".chat-compose")) wakeGrace(); });
+      chatInput.closest(".chat-compose")?.addEventListener("pointerdown", (e) => { if (e.target.closest && e.target.closest("button")) wakeGrace(); }, true);
       chatInput.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this._sendChat(); }
       });
@@ -6682,7 +7461,45 @@ ${this._renderExcludedEntities(d)}
       }
     }
     const chatClear = this.shadowRoot.querySelector("#chat-clear");
-    if (chatClear) chatClear.addEventListener("click", () => this._clearChat());
+    if (chatClear) chatClear.addEventListener("click", () => this._chatAskSet(true));
+    this.shadowRoot.getElementById("chat-ask-no")?.addEventListener("click", () => this._chatAskSet(false));
+    this.shadowRoot.getElementById("chat-ask-yes")?.addEventListener("click", () => { this._chatAskSet(false); this._clearChat(); });
+    const chatLogEl = this.shadowRoot.getElementById("chat-log");
+    if (chatLogEl) {
+      chatLogEl.addEventListener("click", (e) => {
+        const del = e.target.closest(".chat-del");
+        if (del) this._deleteChatMessage(Number(del.dataset.i));
+      });
+      this._loadChat();
+      this._sizeChat();
+      requestAnimationFrame(() => this._sizeChat());
+      const micBtn = this.shadowRoot.getElementById("chat-mic");
+      if (micBtn) {
+        micBtn.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          try { micBtn.setPointerCapture(e.pointerId); } catch (err) {}
+          this._micHeld = true;
+          this._micPointer = e.pointerId;
+          if (!this._micStop) this._toggleMic();
+        });
+        micBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+      }
+      this.shadowRoot.getElementById("chat-speak")?.addEventListener("click", () => this._toggleSpeak());
+      this.shadowRoot.getElementById("chat-wake")?.addEventListener("click", () => this._wakeSet(!this._wakeOn));
+      this._wakeShow();
+      if (!this._chatResize) {
+        this._chatResize = () => this._sizeChat();
+        window.addEventListener("resize", this._chatResize);
+      }
+      if (!this._micRelease) {   // on the window: a full render may replace the button while it is held
+        this._micRelease = (e) => {
+          if (e.pointerId !== this._micPointer) return;
+          this._micHeld = false;
+          if (this._micStop) this._micStop();
+        };
+        ["pointerup", "pointercancel"].forEach((n) => window.addEventListener(n, this._micRelease));
+      }
+    }
 
     // Settings sub-navigation: switch section without a full re-render (cards
     // stay in the DOM; we just show the active section's cards).
@@ -8661,7 +9478,10 @@ ${this._renderExcludedEntities(d)}
       let stored = null;
       try { stored = window.localStorage.getItem("jarvis_active_cam"); } catch (_) {}
       const remembered = stored && this._cams.some(c => c.entity_id === stored);
-      this._activeCam = remembered ? stored : this._cams[0].entity_id;
+      // Jarvis Home patch (2026-11-04c): every page open starts on the camera chosen in Core settings.
+      // With no camera chosen there, the remembered one stays, as in the original.
+      const _jhCam = this._liveData?.config?.camera_watch_default;
+      this._activeCam = this._cams.some(c => c.entity_id === _jhCam) ? _jhCam : (remembered ? stored : this._cams[0].entity_id);
       this._manualCam = this._activeCam;
     }
     this._lastCamKey = "";  // a full render replaced the feed node — force re-attach
@@ -8745,7 +9565,9 @@ ${this._renderExcludedEntities(d)}
     if (key !== this._lastCamKey) {
       this._lastCamKey = key;
       this._camMode = "stream";
+      this._camWalk = (this._camWalk || 0) + 1;   // Jarvis Home: a new walk down the chain (round 4)
       if (this._camWsTimer) { clearInterval(this._camWsTimer); this._camWsTimer = null; }
+      feed.querySelectorAll(".cam-dark").forEach((b) => { if (b.dataset.cam !== entity) b.remove(); });   // Jarvis Home: it was about another camera
       feed.querySelector(".cam-none")?.remove();
       let img = feed.querySelector("img");
       if (!img) {
@@ -8757,7 +9579,7 @@ ${this._renderExcludedEntities(d)}
         // tile blank in an error loop.
         img.addEventListener("error", () => {
           if (this._camMode === "stream") this._camFallback(entity);
-          else if (this._camMode === "still") this._camJarvisFallback(entity);
+          else if (this._camMode === "still" && !this._camStillDarkRecent(img)) this._camJarvisFallback(entity);   // Jarvis Home (round 5)
         });
         // v7.94.0: a decoded frame proves the tier works only if it isn't
         // BLACK — Nest MJPEG happily decodes an all-black stream.
@@ -10570,7 +11392,9 @@ ${this._renderExcludedEntities(d)}
         const luma = this._frameLuma(tileImg);
         tileLine += `  decoded ${tileImg.naturalWidth}×${tileImg.naturalHeight}`;
         if (luma !== null) {
-          tileLine += luma <= 10
+          tileLine += luma <= 10 && this._camLook(tileImg) === "dark"
+            ? `  <span class="cam-diag-bad" style="color:#ffd166">lum ${luma.toFixed(1)} — very dark picture (too little light to see)</span>`
+            : luma <= 10
             ? `  <span class="cam-diag-bad">lum ${luma.toFixed(1)} — BLACK STREAM (decodes fine, shows nothing)</span>`
             : `  <span class="cam-diag-ok">lum ${luma.toFixed(1)}</span>`;
         }
@@ -10581,7 +11405,7 @@ ${this._renderExcludedEntities(d)}
         .map(([p, n]) => `${esc(p)}×${n}`).join("  ") || "none";
       const lines = [];
       lines.push(`<div class="cam-diag-line">${tileLine}</div>`);
-      lines.push(`<div class="cam-diag-line"><b>HA CAMERAS</b> ${plats}${/nest/.test(plats) ? "" : "  <span class='cam-diag-bad'>— NO nest-platform entities: the Google Nest integration isn't delivering cameras to HA. Fix that first (SDM credentials / integration setup); JARVIS can only consume what HA has.</span>"}</div>`);
+      lines.push(`<div class="cam-diag-line"><b>HA CAMERAS</b> ${plats}${plats === "none" ? "  <span class='cam-diag-bad'>— Home Assistant has no camera entities: add a camera integration first; JARVIS can only use the cameras Home Assistant has.</span>" : ""}</div>`);
       const p = res?.probe;
       if (p) {
         lines.push(`<div class="cam-diag-line"><b>${esc(p.entity_id)}</b>  state=${esc(p.state)}  platform=${esc(p.platform || "?")}${p.attrs?.frontend_stream_type ? "  stream=" + esc(p.attrs.frontend_stream_type) : ""}</div>`);
@@ -10620,25 +11444,287 @@ ${this._renderExcludedEntities(d)}
 
   _armCamWatchdog(entity, img, expectMode, ms) {
     if (this._camWatchdog) { clearTimeout(this._camWatchdog); }
+    this._camLoadHook(img);   // Jarvis Home (round 5): stills are judged once they have loaded, a retry shows what comes
     this._camWatchdog = setTimeout(() => {
       this._camWatchdog = null;
       if (this._activeCam !== entity || this._camMode !== expectMode) return;
+      if (expectMode === "still" && this._camStillWait(entity, img, ms)) return;   // Jarvis Home (round 5): judged once it is in
       // v7.94.0: pixels alone don't prove a working tier — a Nest MJPEG can
       // decode a steady BLACK stream (naturalWidth > 0, nothing visible),
       // which defeated the original watchdog. Escalate on no-pixels OR a
       // near-black frame; an unsampleable frame gets the benefit of the doubt.
       if (img && img.naturalWidth > 0) {
         const luma = this._frameLuma(img);
-        if (luma === null || luma > 10) return;   // real (or unverifiable) frame
+        if (luma === null || luma > 10) { this._camRetryShow(img); return; }   // real (or unverifiable) frame (round 5: a retry shows it)
+        if (this._camDarkNote(entity, img, expectMode)) return;   // Jarvis Home: a dark room seen before, the chain is not walked again
       }
       if (expectMode === "stream") this._camFallback(entity);
       else if (expectMode === "still") this._camJarvisFallback(entity);
     }, ms);
   }
 
+  // Jarvis Home patch (2026-11-07, round 3): a dark room is no broken camera. A tier that decodes a real picture that is only very
+  // dark (dim on average, yet with detail in it) is remembered per camera. The chain still tries the next tiers, as it must for a
+  // Nest stream that decodes pure black; when they give nothing better, the panel goes back to that dark picture, shows it with a
+  // small badge and does not stay on the JARVIS tier, so the picture brightens as soon as a light goes on. A frame with no detail
+  // at all, a camera that decodes nothing, and a WebRTC-only camera (Home Assistant lists no hls for it) escalate as before.
+  _camFrameLook(img) {
+    try {
+      if (!img || !img.naturalWidth || !img.naturalHeight) return null;
+      const w = Math.min(320, img.naturalWidth), h = Math.max(1, Math.round(w * img.naturalHeight / img.naturalWidth));
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, w, h);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      let sum = 0, top = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+        top = Math.max(top, d[i], d[i + 1], d[i + 2]);
+      }
+      return { luma: sum / (d.length / 4), top };
+    } catch (_) { return null; }
+  }
+
+  // "dark": a real but very dark picture, "bright": light enough, "black": nothing in it, null: no frame or it cannot be read
+  _camLook(img) {
+    const f = this._camFrameLook(img);
+    if (!f) return null;
+    return f.luma > 10 ? "bright" : f.top >= 8 ? "dark" : "black";
+  }
+
+  // Home Assistant's own camera capabilities, asked once per camera; while unknown the camera counts as not WebRTC-only
+  _camWebrtcOnly(src) {
+    const caps = this._camCaps || (this._camCaps = {});
+    if (!(src in caps) && this._hass && this._hass.callWS) {
+      caps[src] = null;
+      Promise.resolve().then(() => this._hass.callWS({ type: "camera/capabilities", entity_id: src }))
+        .then((r) => { caps[src] = r || {}; }, () => { caps[src] = {}; });
+    }
+    const t = (caps[src] && caps[src].frontend_stream_types) || [];
+    return t.includes("web_rtc") && !t.includes("hls");
+  }
+
+  // The watchdog found a dim frame: a dark but real one is remembered. True when this camera already went back to its dark
+  // picture once, so the chain is not walked again (a new stream token every few minutes arms the watchdog again).
+  _camDarkNote(entity, img, mode) {
+    const seen = this._camDarkSeen || (this._camDarkSeen = {});
+    // round 4: only a frame that is still live, and it is remembered for this walk down the chain alone
+    if (this._camLook(img) !== "dark" || !this._camFresh(img) || this._camWebrtcOnly(this._camSource(entity))) return false;
+    const s = seen[entity] || (seen[entity] = {});
+    if (s.walk !== this._camWalk || mode === "stream") s.mode = mode;   // the best tier that showed it in this walk
+    s.walk = this._camWalk;
+    return !!s.back && this._camDarkBack(entity, mode);
+  }
+
+  // The later tiers gave nothing better: the dark picture again, live, with the badge
+  _camDarkBack(entity, mode) {
+    const seen = this._camDarkSeen && this._camDarkSeen[entity];
+    // round 4: only when this walk down the chain saw the dark picture itself; one from an earlier walk proves nothing now
+    if (!seen || seen.walk !== this._camWalk || entity !== this._activeCam || this._camWebrtcOnly(this._camSource(entity))) return false;
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const img = feed && feed.querySelector("img");
+    if (!img) return false;
+    if (this._camPace(entity, () => this._camDarkBack(entity, mode))) return true;   // at most one tier switch a second
+    this._camWalk = (this._camWalk || 0) + 1;   // a new walk: after a later failure it comes back only for a new dark frame
+    seen.back = true;
+    mode = mode || seen.mode;
+    delete this._camModeByEntity[entity];   // never stuck on the JARVIS tier
+    if (this._camWsTimer) { clearInterval(this._camWsTimer); this._camWsTimer = null; }
+    if (this._camWatchdog) { clearTimeout(this._camWatchdog); this._camWatchdog = null; }
+    if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
+    feed.querySelector(".cam-none")?.remove();
+    img.style.display = "";
+    const src = this._camSource(entity), tok = this._camToken(src);
+    this._camMode = mode;
+    if (mode === "stream") {
+      const url = tok ? `/api/camera_proxy_stream/${src}?token=${encodeURIComponent(tok)}` : `/api/camera_proxy_stream/${src}`;
+      if (img.getAttribute("src") !== url) img.src = url;
+    } else {
+      const still = () => { img.src = `/api/camera_proxy/${src}?token=${encodeURIComponent(tok || "")}&_=${Date.now()}`; };
+      still();
+      this._camStillTimer = setInterval(() => { if (this._activeCam === entity) still(); }, 2000);
+    }
+    const strip = this.shadowRoot?.querySelector("#cam-strip");
+    if (strip) strip.innerHTML = `<span>SRC <b>${this._esc(this._camName(entity))}</b></span><span>${mode === "stream" ? "MJPEG" : "STILLS"}</span>`;
+    this._armCamWatchdog(entity, img, mode, mode === "stream" ? 6000 : 5000);   // round 4: a later failure still goes down the chain
+    this._camDarkWatch(entity);
+    return true;
+  }
+
+  // The badge follows the picture: shown while it is dark but real, gone once it is light enough or shows nothing at all
+  _camDarkWatch(entity) {
+    clearInterval(this._camDarkTimer);
+    const tick = () => {
+      const feed = this.shadowRoot?.getElementById("cam-feed");
+      let badge = feed && feed.querySelector(".cam-dark");
+      if (!this.isConnected || this._activeCam !== entity || !feed) {
+        clearInterval(this._camDarkTimer); this._camDarkTimer = null;
+        badge?.remove();
+        return;
+      }
+      const pic = feed.querySelector("img");
+      const held = this._camStillHeld(pic);   // round 5: while the next still loads, the last one that loaded is judged
+      const look = held ? held.look : pic && pic.style.display !== "none" ? this._camLook(pic) : null;
+      const dark = look === "dark" && (held ? held.fresh : this._camFresh(pic));   // round 4: only while new frames keep coming
+      // dark again after a light spell (the watchdog ended then): a new one, so a later freeze or failure still goes down the chain
+      if (look === "dark" && !this._camWatchdog && (this._camMode === "stream" || this._camMode === "still"))
+        this._armCamWatchdog(entity, pic, this._camMode, this._camMode === "stream" ? 6000 : 5000);
+      if (dark && !badge) {
+        badge = document.createElement("div");
+        badge.className = "cam-dark";
+        badge.dataset.cam = entity;
+        badge.textContent = "VERY DARK — too little light to see";   // round 4: only what is seen
+        feed.appendChild(badge);
+      } else if (!dark && badge) badge.remove();
+    };
+    this._camDarkTimer = setInterval(tick, 2000);
+    setTimeout(tick, 500);   // a stream that was attached again shows its first frame by then
+    tick();
+  }
+
+  // Jarvis Home patch (2026-11-07, round 4): the dark picture comes back only for the walk down the chain that saw it, and only
+  // while new frames keep coming, so a camera that was dark once and then errors, hangs or decodes pure black ends on NO FRAME as
+  // before. No tier switch happens more than once a second per camera: true here means the switch waits and then runs once, a
+  // second after the last one, unless the feed was attached again in between.
+  _camPace(entity, again) {
+    const last = this._camSwitchAt || (this._camSwitchAt = {});
+    const pend = this._camPaced || (this._camPaced = {});
+    if (pend[entity] && pend[entity].walk === this._camWalk) return true;   // one already waits for this walk: it goes first
+    if (pend[entity]) { clearTimeout(pend[entity].timer); delete pend[entity]; }
+    const wait = (last[entity] || 0) + 1000 - Date.now();
+    if (wait <= 0) { last[entity] = Date.now(); return false; }
+    const walk = this._camWalk;
+    pend[entity] = { walk, timer: setTimeout(() => {
+      delete pend[entity];
+      if (this.isConnected && this._activeCam === entity && this._camWalk === walk) again();
+    }, wait) };
+    return true;
+  }
+
+  // True while new frames keep coming: the picture changed within the last 5 s (its first look counts as new, it was decoded after
+  // the feed was attached). An MJPEG stream that ended or froze keeps its last frame without any event, so the pixels are compared.
+  _camFresh(img) {
+    try {
+      if (!img || !img.naturalWidth || !img.naturalHeight) return false;
+      const w = Math.min(1280, img.naturalWidth), h = Math.max(1, Math.round(w * img.naturalHeight / img.naturalWidth));
+      const c = this._camSigCanvas || (this._camSigCanvas = document.createElement("canvas"));
+      if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return false;
+      ctx.drawImage(img, 0, 0, w, h);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      let sig = 2166136261;
+      for (let i = 0; i < d.length; i += 4) sig = Math.imul(sig ^ (d[i] + 3 * d[i + 1] + 7 * d[i + 2]), 16777619);
+      const now = Date.now();
+      if (img._jhFrameSig !== sig) { img._jhFrameSig = sig; img._jhFrameAt = now; }
+      return now - img._jhFrameAt < 5000;
+    } catch (_) { return false; }
+  }
+
+  // Jarvis Home patch (2026-11-08, round 5): a still is judged only once it has loaded. The stills tier asks for the next still
+  // every 2 s, and one can take a second or more (a phone on mobile data, go2rtc waiting for a keyframe); while it loads the picture
+  // has no pixels to judge. The still watchdog waits for that still while the last one loaded within its window, and the badge goes
+  // by the last still that loaded. A still that fails (an error, or none loaded within the window) still goes down the chain.
+  _camLoadHook(img) {
+    if (!img || img._jhLoadHook) return;
+    img._jhLoadHook = true;
+    img.addEventListener("load", () => {
+      if (!img.naturalWidth) return;
+      if (this._camMode === "still") {
+        img._jhStillAt = Date.now();
+        img._jhStillLook = this._camLook(img);
+        if (img._jhStillLook === "dark") this._camFresh(img);   // new frames are timed by the stills that came in
+      }
+      this._camRetryShow(img);
+    });
+  }
+
+  // The last still that loaded, while the next one still loads and the last one is less than 5 s old; null otherwise
+  _camStillHeld(img) {
+    // a still that failed (complete, no pixels) is held over like one that loads, until the next one comes (round 5 follow-up)
+    if (this._camMode !== "still" || !img || (img.complete && img.naturalWidth) || img.style.display === "none") return null;
+    const now = Date.now();
+    if (!(now - (img._jhStillAt || 0) < 5000)) return null;
+    return { look: img._jhStillLook || null, fresh: now - (img._jhFrameAt || 0) < 5000 };
+  }
+
+  // The still watchdog fired while a still loads and the last one loaded within its window: this still is judged once it is in or
+  // has failed, or once the window since the last one that loaded has passed. True while it waits. The watchdog is armed again with
+  // 0 then: it judges at once, or waits for the next still if that one already loads.
+  _camStillWait(entity, img, ms) {
+    const win = ms || (img && img._jhStillWin) || 0, at = img && img._jhStillAt;
+    // a still that failed waits for the next one too, while the last one loaded within the window (round 5 follow-up)
+    if (!img || (img.complete && img.naturalWidth) || !at || !(Date.now() - at < win)) return false;
+    img._jhStillWin = win;
+    let timer = null;
+    const go = () => {
+      img.removeEventListener("load", go); img.removeEventListener("error", go);
+      if (this._camWatchdog !== timer) return;   // ended or replaced meanwhile
+      clearTimeout(timer); this._camWatchdog = null;
+      if (this._activeCam === entity && this._camMode === "still") this._armCamWatchdog(entity, img, "still", 0);
+    };
+    timer = setTimeout(go, at + win - Date.now() + 50);
+    this._camWatchdog = timer;
+    img.addEventListener("load", go); img.addEventListener("error", go);
+    return true;
+  }
+
+  // One still that fails while the last still, a dark one, loaded less than 5 s ago is no end: the next still comes within 2 s, and
+  // stills that keep failing still go down the chain (the watchdog, or the next error once 5 s have passed).
+  _camStillDarkRecent(img) {
+    return this._camMode === "still" && !!img && img._jhStillLook === "dark" && Date.now() - (img._jhStillAt || 0) < 5000;
+  }
+
+  // Jarvis Home patch (2026-11-08, round 5, the owner's rule): while the tile shows NO FRAME for a camera, the normal chain (stream,
+  // stills, then the JARVIS tier) is tried again about once a minute, one try at a time and never faster than one tier switch a
+  // second. NO FRAME stays up while it is tried; a camera that delivers frames again is shown (a dark picture by the dark path, with
+  // its badge). A camera that stays broken stays on NO FRAME, with about one walk down the chain a minute. A try that comes due after
+  // the tile was left, the panel was closed or another camera was picked does nothing.
+  _camRetryLater(entity, ms) {
+    if (this._camRetryTimer && this._camRetryCam === entity) return;   // one try at a time
+    clearTimeout(this._camRetryTimer);
+    this._camRetryCam = entity;
+    this._camRetryTimer = setTimeout(() => { this._camRetryTimer = null; this._camRetryNow(entity); }, ms);
+  }
+
+  _camRetryNow(entity) {
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const img = feed && feed.querySelector("img"), none = feed && feed.querySelector(".cam-none");
+    if (!this.isConnected || !img || !none || this._activeCam !== entity || this._camMode !== "jarvis"
+        || img.style.display !== "none" || !(none.textContent || "").startsWith("NO FRAME")) return;
+    if (this._camPace(entity, () => this._camRetryNow(entity))) return;   // at most one tier switch a second
+    const strip = this.shadowRoot.getElementById("cam-strip"), label = strip ? strip.innerHTML : "";
+    delete this._camModeByEntity[entity];   // the chain is walked as on a first attach
+    this._lastCamKey = "";
+    this._renderCameraFeed();
+    feed.appendChild(none);                 // NO FRAME stays up until a frame comes
+    img.style.display = "none";
+    if (strip) strip.innerHTML = label;
+    this._camRetryFor = entity;
+  }
+
+  // A light picture on the stream or stills tier while a try still shows NO FRAME: it is shown
+  _camRetryShow(img) {
+    const entity = this._activeCam;
+    if (!entity || entity !== this._camRetryFor || !img || !img.naturalWidth || img.style.display !== "none"
+        || (this._camMode !== "stream" && this._camMode !== "still")) return;
+    const luma = this._frameLuma(img);
+    if (luma !== null && luma <= 10) return;   // a dark picture comes back by the dark path, with its badge; black is no picture
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    if (!feed || !feed.contains(img)) return;
+    this._camRetryFor = null;
+    feed.querySelector(".cam-none")?.remove();
+    img.style.display = "";
+    const strip = this.shadowRoot.getElementById("cam-strip");
+    if (strip) strip.innerHTML = `<span>SRC <b>${this._esc(this._camName(entity))}</b></span><span>${this._camMode === "stream" ? "MJPEG" : "STILLS"}</span>`;
+  }
+
   _camFallback(entity) {
     // Nest/WebRTC cameras may not serve MJPEG — fall back to a refreshed still.
     if (entity !== this._activeCam) return;
+    if (this._camPace(entity, () => this._camFallback(entity))) return;   // Jarvis Home: at most one tier switch a second
     this._camMode = "still";
     const feed = this.shadowRoot?.getElementById("cam-feed");
     const img = feed && feed.querySelector("img");
@@ -10656,6 +11742,7 @@ ${this._renderExcludedEntities(d)}
     // Last tier: frames through JARVIS's backend registry (Nest event media,
     // stream-wake) over WS. Slower cadence — stream-wake isn't free.
     if (entity !== this._activeCam) return;
+    if (this._camPace(entity, () => this._camJarvisFallback(entity))) return;   // Jarvis Home: at most one tier switch a second
     this._camMode = "jarvis";
     this._camModeByEntity[entity] = "jarvis";
     if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
@@ -10666,15 +11753,20 @@ ${this._renderExcludedEntities(d)}
     const strip = this.shadowRoot?.querySelector("#cam-strip");
     if (strip) strip.innerHTML = `<span>SRC <b>${this._esc(this._camName(entity))}</b></span><span>JARVIS SNAPSHOT</span>`;
     const hint = (text) => {
+      if (this._activeCam !== entity || this._camMode !== "jarvis") return;   // Jarvis Home (round 5): a late answer changes nothing
+      if (this._camDarkBack(entity)) return;   // Jarvis Home: nothing better than the dark picture seen before, so that is shown
       let d = feed.querySelector(".cam-none");
       if (!d) { d = document.createElement("div"); d.className = "cam-none"; feed.appendChild(d); }
       d.textContent = text;
       img.style.display = "none";
+      feed.querySelectorAll(".cam-dark").forEach((b) => b.remove());   // Jarvis Home (round 5): no picture, so no badge on it
+      if (text.startsWith("NO FRAME")) this._camRetryLater(entity, 60000);   // Jarvis Home (round 5): tried again about once a minute
     };
     const shot = async () => {
       if (this._activeCam !== entity || this._camMode !== "jarvis") return;
       try {
         const res = await this._hass.callWS({ type: "jarvis/camera_snapshot", entity_id: entity });
+        if (this._activeCam !== entity || this._camMode !== "jarvis") return;   // Jarvis Home (round 5): a late answer changes nothing
         if (res?.image) {
           feed.querySelector(".cam-none")?.remove();
           img.style.display = "";
@@ -13044,6 +14136,9 @@ ${this._renderExcludedEntities(d)}
   .cam-strip { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 11px;
     letter-spacing: 0.05em; color: var(--cyan); padding: 9px 2px 0; margin-top: 10px; border-top: 1px solid var(--line); }
   .cam-strip b { color: var(--text); }
+  .cam-dark { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 6; max-width: 92%; box-sizing: border-box;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; color: #ffd166; text-align: center; pointer-events: none;
+    background: rgba(8,12,20,0.72); padding: 4px 10px; border: 1px solid rgba(255,209,102,0.45); }
   /* RESIDENCE OVERVIEW — architectural data-merge overlay */
   #house3d { filter: drop-shadow(0 0 12px rgba(0, 242, 254, 0.10)); }
   .res-banner { position: absolute; top: 10px; left: 13px; z-index: 8; pointer-events: none; }
@@ -13272,6 +14367,25 @@ ${this._renderExcludedEntities(d)}
     .log { max-height: 300px; }
   }
 
+  /* jh-phone-fit 2026-11-11 */
+  @media (max-width: 600px) {
+    .masthead { grid-template-columns: auto minmax(0, 1fr); }
+    .masthead .greeting { display: none; }
+    .masthead-right { grid-column: 1 / -1; justify-content: space-between; }
+    .brand { min-width: 0; justify-content: flex-end; gap: 10px; letter-spacing: 0.18em; white-space: nowrap; }
+    .brand > span { display: none; }   /* version and status badge: the lockdown switch still shows the state */
+    .chat-compose { flex-wrap: wrap; }
+    .chat-compose .chat-input { flex: 1 1 100%; }   /* full-width box, buttons on a second row */
+    .chat-compose .chat-input::placeholder { font-size: 11px; }
+    .chat-voice { flex: 1 1 auto; }
+    .chat-compose .chat-send { flex: 0 0 auto; margin-left: auto; }
+    .faces-card { min-width: 0; }
+    .faces-card-snap { justify-content: center; max-width: 100%; }
+    .faces-card-snap .faces-snap-cam { max-width: 100%; min-width: 0; }
+    .log-entry { grid-template-columns: auto 1fr; gap: 2px 10px; }
+    .log-entry .log-msg { grid-column: 1 / -1; }   /* time and category on one line, the message below */
+    .sug-ev, .sug-ev li { overflow-wrap: anywhere; }
+  }
   /* ───────────────── very small phones (≤380px) ───────────────── */
   @media (max-width: 380px) {
     .tab { padding: 10px 10px; letter-spacing: 0.05em; }
@@ -13367,9 +14481,8 @@ ${this._renderExcludedEntities(d)}
   .chat-tab { padding: 4px 0 16px; }
   .chat-panel { display: flex; flex-direction: column; }
   .chat-log {
-    flex: 1 1 auto;
-    min-height: 240px;
-    max-height: 56vh;
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
     padding: 12px 4px;
     display: flex;
@@ -13386,6 +14499,48 @@ ${this._renderExcludedEntities(d)}
     font-size: 13px; line-height: 1.5; word-wrap: break-word;
     white-space: pre-wrap;
   }
+  .chat-msg { position: relative; padding-right: 26px !important; }
+  .chat-del { position: absolute; top: 0; right: 0; width: 26px; height: 28px; background: none; border: 0; color: #ff4d4d;
+    cursor: pointer; font-size: 13px; line-height: 1; padding: 0; }   /* the whole corner is the target, the cross stays where it was */
+  .chat-del:hover { color: #ff1f1f; }
+  .chat-clean { margin-left: 12px; background: none; border: 1px solid var(--line-hot); color: var(--cyan);
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; padding: 2px 8px;
+    border-radius: var(--radius); cursor: pointer; }
+  .chat-clean:hover { background: var(--cyan-faint); }
+  .chat-ask { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: 12px; color: #ff4d4d;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; }
+  .chat-ask .chat-clean { margin-left: 0; }
+  .chat-ask .chat-yes { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-ask[hidden], .chat-clean[hidden] { display: none; }
+  .chat-think { display: inline-flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; }
+  .chat-spark { width: 16px; height: 16px; color: var(--cyan); animation: chatSpark 1.6s ease-in-out infinite; transform-origin: center; }
+  .chat-think-t { background: linear-gradient(90deg, var(--text-dim) 25%, var(--cyan) 50%, var(--text-dim) 75%);
+    background-size: 220% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: chatShimmer 1.8s linear infinite; }
+  .chat-think-s { color: var(--text-dim); font-size: 11px; opacity: 0.8; }
+  @keyframes chatSpark { 0%, 100% { transform: scale(0.8) rotate(0deg); opacity: 0.55; } 50% { transform: scale(1.1) rotate(90deg); opacity: 1; } }
+  @keyframes chatShimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+  .chat-clean.on, .chat-mic.on { background: var(--cyan-faint); }
+  .chat-mic { background: none; border: 1px solid var(--line-hot); color: var(--cyan); font-family: var(--font-mono);
+    font-size: 11px; letter-spacing: 0.08em; padding: 0 14px; border-radius: var(--radius); cursor: pointer; }
+  .chat-mic.on { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-mic { touch-action: none; user-select: none; -webkit-user-select: none; }
+  .chat-voice { display: flex; flex-direction: column; gap: 4px; }
+  .chat-voice button { flex: 1 1 0; min-height: 26px; }
+  .chat-tts { background: none; border: 1px solid var(--line-hot); color: var(--text-dim); font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.08em; padding: 0 10px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+  .chat-tts.on { color: var(--cyan); background: var(--cyan-faint); }
+  .chat-wake { background: none; border: 1px solid var(--line-hot); color: var(--text-dim); border-radius: var(--radius); cursor: pointer; }
+  .chat-wake.on { color: var(--cyan); background: var(--cyan-faint); border-color: var(--cyan); }
+  .chat-wake.hot { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-wake.on.rest { border-style: dashed; opacity: 0.55; }
+  /* chat-compose-even */
+  .chat-compose { align-items: stretch !important; }
+  /* chat-compose-oneline */
+  .chat-compose .chat-input { height: 40px; min-height: 40px; box-sizing: border-box; }
+  .chat-compose .chat-send { height: 40px; align-self: stretch; }
+  .chat-voice { flex: none; flex-direction: row !important; width: auto; height: 40px; gap: 8px !important; align-self: stretch; }
+  .chat-voice button { flex: none; width: 40px; height: 40px; min-height: 0; padding: 0; display: flex;
+    align-items: center; justify-content: center; }
   .chat-who {
     font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.08em;
     opacity: 0.7;

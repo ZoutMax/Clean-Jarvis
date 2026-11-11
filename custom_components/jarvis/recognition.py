@@ -60,7 +60,9 @@ CONFIDENCE_THRESHOLD = 60  # anything below this is considered uncertain
 # throughout: a capture failure never affects recognition. Cache:
 #   {norm_name: {"url": "/local/...", "path": str, "ts": epoch, "camera_entity": str}}
 _FACE_SNAPSHOTS: dict[str, dict] = {}
-FACE_SNAPSHOT_URL_BASE = "/local/jarvis/faces"
+# Jarvis Home patch (2026-11-06): not under www, which is served without a login. This is a tag, not a web path.
+FACE_SNAPSHOT_URL_BASE = "jarvis-private/faces"
+_face_snap_dir = ""   # set at the first capture, from the Home Assistant config folder
 _FACE_SNAP_THROTTLE = 300.0   # re-pin a given person at most this often (secs)
 _MAX_FACE_SNAPSHOTS = 60      # prune beyond this many files
 
@@ -239,7 +241,10 @@ def _persist_load() -> None:
             try:
                 path = snap.get("path")
                 # Only restore a pin whose frame still exists on disk.
-                if path and os.path.exists(path) and key not in _FACE_SNAPSHOTS:
+                if (path and os.path.exists(path) and key not in _FACE_SNAPSHOTS
+                        and str(snap.get("url", "")).startswith(FACE_SNAPSHOT_URL_BASE)):
+                    global _face_snap_dir
+                    _face_snap_dir = os.path.dirname(path)
                     _FACE_SNAPSHOTS[key] = {
                         "url": str(snap.get("url", "")),
                         "path": path,
@@ -252,9 +257,59 @@ def _persist_load() -> None:
         _LOGGER.debug("recognition cache restore failed: %s", exc)
 
 
+def _jh_faces_out_of_www() -> None:
+    """Jarvis Home patch (2026-11-07): the original JARVIS kept face photos in www/jarvis/faces, which Home Assistant serves at
+    /local with no login, under names anyone can guess. At startup they move into the private folder, every saved pin follows
+    its photo, and the public folder is removed once it is empty. Nothing is deleted. Runs on the executor; never raises."""
+    global _face_snap_dir
+    try:
+        old = config_path_str("www", "jarvis", "faces")
+        if not os.path.isdir(old):
+            return
+        import shutil
+        new = config_path_str("jarvis", "face_snaps")
+        os.makedirs(new, exist_ok=True)
+        moved = {}
+        for name in sorted(os.listdir(old)):
+            src = os.path.join(old, name)
+            if not os.path.isfile(src):
+                continue
+            stem, ext = os.path.splitext(name)
+            dst, n = os.path.join(new, name), 1
+            while os.path.exists(dst):   # a newer private photo has this name: keep both
+                dst, n = os.path.join(new, f"{stem}_www{n}{ext}"), n + 1
+            shutil.move(src, dst)
+            moved[name] = dst
+        if moved and os.path.exists(RECOG_CACHE_PATH):
+            with open(RECOG_CACHE_PATH) as f:
+                data = json.load(f)
+            snaps = data.get("snapshots") if isinstance(data, dict) else None
+            changed = False
+            for snap in (snaps.values() if isinstance(snaps, dict) else ()):
+                if not isinstance(snap, dict) or not str(snap.get("url", "")).startswith("/local/jarvis/faces/"):
+                    continue
+                base = os.path.basename(str(snap.get("path") or snap.get("url") or ""))
+                if base in moved:
+                    snap["url"] = f"{FACE_SNAPSHOT_URL_BASE}/{os.path.basename(moved[base])}"
+                    snap["path"] = moved[base]
+                    changed = True
+            if changed:
+                _persist_write(data)
+        _face_snap_dir = _face_snap_dir or new
+        try:
+            os.rmdir(old)
+        except OSError:
+            pass
+        if moved:
+            _LOGGER.info("JARVIS: moved %d face photo(s) out of the public www folder into %s", len(moved), new)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS: could not move old face photos out of the public www folder: %s", exc)
+
+
 def warm_start() -> None:
     """Restore the persisted Faces caches at integration startup (issue #331).
     Run on the executor — does a small one-time JSON read. Never raises."""
+    _jh_faces_out_of_www()
     _persist_load()
 
 
@@ -428,6 +483,25 @@ def face_snapshot_url(name: str) -> Optional[str]:
     return rec.get("url") if rec else None
 
 
+def inline_snapshots(rows: list) -> list:
+    """Jarvis Home patch (2026-11-06): face photos are private files, sent to the panel as data URLs. Runs on
+    the executor. A row with an old public URL or a missing file shows no photo."""
+    import base64
+    out = []
+    for row in rows or []:
+        row = dict(row)
+        url = str(row.get("snapshot_url") or "")
+        row["snapshot_url"] = None
+        if url.startswith((FACE_SNAPSHOT_URL_BASE + "/", "/local/jarvis/faces/")):   # an old row finds its moved photo
+            try:
+                with open(os.path.join(_face_snap_dir, os.path.basename(url)), "rb") as f:
+                    row["snapshot_url"] = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode("ascii")
+            except OSError:
+                pass
+        out.append(row)
+    return out
+
+
 def _store_face_snapshot(path: str, data: bytes) -> None:
     """Write the pinned frame and prune old files. Runs on the executor."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -486,7 +560,8 @@ async def capture_face_snapshot(hass, camera: str, name: str,
         except Exception:
             pass
         key = _face_norm(name)
-        snap_dir = config_path_str("www", "jarvis", "faces", hass=hass)
+        global _face_snap_dir
+        snap_dir = _face_snap_dir = config_path_str("jarvis", "face_snaps", hass=hass)
         path = os.path.join(snap_dir, f"{key}.jpg")
         await hass.async_add_executor_job(_store_face_snapshot, path, content)
         rec = {
@@ -741,7 +816,8 @@ async def capture_unknown_snapshot(hass, camera: str, image_b64: str) -> Optiona
             pass
         from .paths import config_path_str as _cps
         key = f"unknown_{_face_norm(entity_id.split('.', 1)[-1])}" or "unknown"
-        snap_dir = _cps("www", "jarvis", "faces", hass=hass)
+        global _face_snap_dir
+        snap_dir = _face_snap_dir = _cps("jarvis", "face_snaps", hass=hass)
         path = os.path.join(snap_dir, f"{key}.jpg")
         await hass.async_add_executor_job(_store_face_snapshot, path, content)
         url = f"{FACE_SNAPSHOT_URL_BASE}/{key}.jpg"

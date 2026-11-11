@@ -38,7 +38,7 @@ class _Conn:
         # Panel write actions now require an admin user (CWE-862 hardening);
         # default these test connections to admin so write-path tests exercise
         # the handler, and pass is_admin=False to assert the denial.
-        self.user = types.SimpleNamespace(is_admin=is_admin)
+        self.user = types.SimpleNamespace(is_admin=is_admin, id="user-1")
 
     def send_result(self, msg_id, payload):
         self.result = (msg_id, payload)
@@ -1119,8 +1119,8 @@ async def test_root_cause_and_camera_coverage_commands(fake_hass, monkeypatch):
     connection = _Conn()
     rca = _install_jc_module(monkeypatch, "rca", types.SimpleNamespace(
         DEFAULT_WINDOW_SECS=3600,
-        analyze=lambda entity_id, event_time, window: {
-            "entity_id": entity_id, "event_time": event_time, "window": window,
+        analyze=lambda entity_id, event_time, window, viewer=None: {
+            "entity_id": entity_id, "event_time": event_time, "window": window, "viewer": viewer,
         },
     ))
     del rca
@@ -1129,8 +1129,14 @@ async def test_root_cause_and_camera_coverage_commands(fake_hass, monkeypatch):
         {"id": 51, "entity_id": "light.office", "window_secs": 0},
     )
     assert connection.result == (51, {
-        "entity_id": "light.office", "event_time": None, "window": 3600,
+        "entity_id": "light.office", "event_time": None, "window": 3600, "viewer": None,
     })
+    limited = _Conn(is_admin=False)      # Clean Jarvis: a non-admin gets their own view of the timeline
+    await websocket.ws_root_cause(
+        fake_hass, limited,
+        {"id": 52, "entity_id": "light.office", "window_secs": 0},
+    )
+    assert limited.result[1]["viewer"] == "user-1"
 
     entry = types.SimpleNamespace(entry_id="coverage-entry", data={}, options={})
     monkeypatch.setattr(websocket, "_get_entry", lambda hass: entry)
@@ -1384,7 +1390,7 @@ async def test_suggestion_goal_memory_and_appliance_commands(fake_hass, monkeypa
     monkeypatch.setattr(websocket, "_get_goals", lambda: [{"id": 7}])
     await websocket.ws_goal_action(fake_hass, connection, {"id": 113, "action": "create", "outcome": "  save energy ", "interval_min": 30})
     assert connection.result == (113, {"ok": True, "goal": {"id": 7}, "goals": [{"id": 7}]})
-    assert goals_calls == [("", "save energy", {"check_interval_min": 30.0})]
+    assert goals_calls == [("", "save energy", {"check_interval_min": 30.0, "user_id": "user-1"})]
     await websocket.ws_goal_action(fake_hass, connection, {"id": 114, "action": "create", "outcome": "  "})
     assert connection.error == (114, "empty_outcome", "a goal needs an outcome to work toward")
     await websocket.ws_goal_action(fake_hass, connection, {"id": 115, "action": "delete", "goal_id": 8})
@@ -1395,7 +1401,7 @@ async def test_suggestion_goal_memory_and_appliance_commands(fake_hass, monkeypa
     assert connection.result == (117, {"ok": True, "goals": [{"id": 7}]})
 
     memory = _install_jc_module(monkeypatch, "memory", types.SimpleNamespace(
-        search_memory=lambda query, k: [{"query": query, "k": k}],
+        search_memory=lambda query, k, user_id=None: [{"query": query, "k": k}],
     ))
     del memory
     await websocket.ws_search_memory(fake_hass, connection, {"id": 118, "query": "past" , "k": 2})
@@ -1462,10 +1468,11 @@ def test_websocket_data_adapters_shape_and_filter_rows(monkeypatch):
     }
 
     goals = _install_jc_module(monkeypatch, "goals", types.SimpleNamespace(recent=lambda limit: [
-        {"id": 8, "title": "Goal", "steps": [{"status": "done"}, {"status": "active"}]},
+        {"id": 8, "title": "Goal", "steps": [{"status": "done"}, {"status": "active"}], "user_id": "user-1"},
     ]))
     del goals
     assert websocket._get_goals() == [{
+        "owner": "user-1",
         "id": 8, "title": "Goal", "outcome": "", "status": "active",
         "steps_done": 1, "steps_total": 2,
         "steps": [{"status": "done"}, {"status": "active"}],
@@ -1869,7 +1876,7 @@ async def test_camera_snapshot_rename_location_and_diagnostics(fake_hass, monkey
     ))
     del jarvis_config
     camera = _install_jc_module(monkeypatch, "camera", types.SimpleNamespace(
-        _get_best_image=lambda hass, entity_id: _resolved(b"jpeg-data"),
+        _get_best_image=lambda hass, entity_id, poll=False: _resolved(b"jpeg-data"),
         _downscale_jpeg=lambda image, width: image + b"-small",
         merge_camera_name=lambda names, entity_id, name: {entity_id: name} if name else {},
         probe_camera=lambda hass, entity_id: _resolved({"entity_id": entity_id, "verdict": "ok"}),
@@ -2077,7 +2084,7 @@ async def test_websocket_handler_error_paths(fake_hass, monkeypatch):
 
     _install_jc_module(monkeypatch, "rca", types.SimpleNamespace(
         DEFAULT_WINDOW_SECS=600,
-        analyze=lambda *args: (_ for _ in ()).throw(RuntimeError("rca failed")),
+        analyze=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rca failed")),
     ))
     await websocket.ws_root_cause(fake_hass, connection, {"id": 164, "entity_id": "light.a"})
     assert connection.error == (164, "root_cause_failed", "rca failed")
@@ -2095,7 +2102,7 @@ async def test_camera_diagnostic_and_snapshot_failure_branches(fake_hass, monkey
     connection = _Conn()
     camera = _install_jc_module(monkeypatch, "camera", types.SimpleNamespace(
         probe_camera=lambda hass, entity_id: _raise_async("probe failed"),
-        _get_best_image=lambda hass, entity_id: _raise_async("snapshot failed"),
+        _get_best_image=lambda hass, entity_id, poll=False: _raise_async("snapshot failed"),
     ))
     del camera
     monkeypatch.setattr(websocket, "jarvis_log", lambda *args: None)
@@ -2186,7 +2193,7 @@ async def test_more_endpoint_alternatives_and_http_errors(fake_hass, monkeypatch
     fake_hass.states.set("camera.empty", "idle")
     image_logs = []
     _install_jc_module(monkeypatch, "camera", types.SimpleNamespace(
-        _get_best_image=lambda hass, entity_id: _resolved(None),
+        _get_best_image=lambda hass, entity_id, poll=False: _resolved(None),
     ))
     monkeypatch.setattr(websocket, "_snap_log", lambda *args: image_logs.append(args))
     await websocket.ws_camera_snapshot(fake_hass, connection, {

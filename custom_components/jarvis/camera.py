@@ -936,7 +936,14 @@ def resolve_camera_source(hass: HomeAssistant, entity_id: str) -> str:
     return entity_id
 
 
-async def _get_best_image(hass: HomeAssistant, entity_id: str) -> Optional[bytes]:
+# Jarvis Home patch (2026-11-06): when a camera stayed blank after a stream wake. A panel poll then skips the wake
+# for a minute, and the warning is logged once per blank spell. Event captures always try the wake.
+import time as _jh_time
+_JH_BLANK: dict = {}
+_JH_BLANK_HOLD = 60.0
+
+
+async def _get_best_image(hass: HomeAssistant, entity_id: str, poll: bool = False) -> Optional[bytes]:
     """
     Try the best source for this camera type, fall back to standard snapshot.
     Returns raw JPEG bytes or None if nothing worked.
@@ -988,8 +995,11 @@ async def _get_best_image(hass: HomeAssistant, entity_id: str) -> Optional[bytes
 
     good = _usable(image, min_size=SMALL_SUSPECT_SIZE) if image else None
     if good:
+        _JH_BLANK.pop(entity_id, None)
         return good
     tiny_first = _usable(image) if image else None   # small-but-nonblank fallback
+    if poll and _jh_time.monotonic() - _JH_BLANK.get(entity_id, -_JH_BLANK_HOLD) < _JH_BLANK_HOLD:
+        return tiny_first
 
     # Blank, empty, tiny, or errored — wake the on-demand stream, try once more.
     _LOGGER.info(
@@ -1000,6 +1010,7 @@ async def _get_best_image(hass: HomeAssistant, entity_id: str) -> Optional[bytes
         image = await camera_get_image(hass, entity_id, timeout=15)
         good = _usable(image) if image else None
         if good and (not tiny_first or len(good) > len(tiny_first)):
+            _JH_BLANK.pop(entity_id, None)
             return good
         if tiny_first:
             _LOGGER.debug(
@@ -1009,13 +1020,19 @@ async def _get_best_image(hass: HomeAssistant, entity_id: str) -> Optional[bytes
         # Still unusable. Returning a black frame makes the vision model
         # hallucinate "obstructed", so signal a clean failure instead.
         size = len(image.content) if (image and image.content) else 0
-        _LOGGER.warning(
+        _jh_log = _LOGGER.debug if entity_id in _JH_BLANK else _LOGGER.warning
+        _JH_BLANK[entity_id] = _jh_time.monotonic()
+        _jh_log(
             "JARVIS: %s still blank/empty after stream wake (%d bytes) — "
             "on-demand WebRTC camera with no active stream?",
             entity_id, size,
         )
     except Exception as exc:
-        _LOGGER.error("JARVIS: snapshot retry failed for %s: %s", entity_id, exc)
+        # Jarvis Home patch (2026-11-07): an offline camera raises here. Hold it like a blank one, so panel polls stop waking
+        # it, and say so once per outage instead of an error on every poll.
+        _jh_log = _LOGGER.debug if entity_id in _JH_BLANK else _LOGGER.warning
+        _JH_BLANK[entity_id] = _jh_time.monotonic()
+        _jh_log("JARVIS: snapshot retry failed for %s: %s", entity_id, exc)
 
     return None
 

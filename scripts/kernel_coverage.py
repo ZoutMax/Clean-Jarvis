@@ -441,7 +441,7 @@ _NON_ACTUATOR_TOOLS: frozenset[str] = frozenset({
     "get_entity_state", "search_entities", "get_area_devices", "get_home_summary",
     "cognitive_status", "connectivity_status", "system_diagnostics",
     "security_audit",
-    "energy_status", "hazard_report", "activity_history", "weather_forecast",
+    "energy_status", "energy_usage", "hazard_report", "activity_history", "weather_forecast",
     "wellbeing_context", "root_cause", "web_research", "calendar_agenda",
     "read_email", "look_at_camera", "who_do_you_see", "where_last_seen",
     "usual_times", "search_documents", "ingest_documents",

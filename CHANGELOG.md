@@ -1,3 +1,23 @@
+## [1.0.6] — Clean Jarvis on JARVIS 9.95.0
+
+Clean Jarvis is the original JARVIS 9.95.0 with one patch on top. The assistant, its name and its settings stay as in the original. See CLEAN_JARVIS.md for the full list.
+
+- **Honest:** a cleaned personality, briefings from real facts only, and a device action is only claimed when a device tool really ran.
+- **Private:** chat history, memory, facts, follow-ups and goals are kept per person (reminders are shared by the household); non-admin logins cannot reach admin actions, mail or other people's data; face snapshots stay out of the public web folder. On the first start, face photos left in the public web folder by the original JARVIS are moved to a private folder, and older intrusion stills get an unguessable name.
+- **Voice control:** a Hey JARVIS switch in the Chat tab listens through the computer microphone on the web page. A pause after the wake word does not end the command, nothing is sent when nothing was said, and a lone "Okay." invented from silence is ignored.
+- **Clear commands:** punctuation from speech recognition never changes a command, sound-alike device names are found, and a vague name gets the question which device is meant.
+- **Day to day:** Chat tab with saved history, press-to-talk, read-aloud and cancel; settings such as a display backlight are not counted as lights.
+- **Energy used:** "how much electricity did we use this month?" is answered from Home Assistant's Energy dashboard (today, yesterday, this or last week, this or last month, this year), with the biggest users, also when asked as "power consumption", and JARVIS says what the total covers: the whole house with a grid meter, otherwise only the monitored devices.
+- **Power right now:** "what is the power consumption?" without a whole-house meter is answered at once with what the devices on the Energy dashboard draw right now, read live, the biggest of them, any that cannot be read, and that the house draws more. The biggest plug is no longer taken for a whole-house meter. An energy or power figure in a reply must come from a reading in that request: a figure repeated from an earlier answer is sent back once to be read again.
+- **Lamp effects and scenes by name:** "set the lamp to Blue sky" or "start Blue sky on the lamp" starts that lamp's own effect or scene at once, read from the lamp's effect list (so every effect a lamp offers works, without the AI). "Done" is only said when the lamp reports it; a lamp that does not confirm is said so.
+- **Phone layout:** on a phone the header shows the logo and name in full (the clock and lockdown switch on the line below), the chat box gets the whole width with its buttons below it, and the Faces, Logs and Suggestions tabs fit the screen. The desktop layout is unchanged.
+- **Voice extras:** a short beep when the wake word is heard; a spoken reply that ends very quickly no longer stops the listening.
+- **No action on a lone word:** a lone "Okay." or "Thanks" that answers no question of JARVIS (speech-to-text invents such words from silence) is not taken as a command, by voice, Assist or chat; after a question of JARVIS it still counts as the answer.
+- **Clearer questions:** when a switching command matches several devices, only devices that can be switched are offered (no sensors).
+- **Camera diagnostics:** any camera integration counts; the check no longer asks for Nest cameras.
+- **Camera tab in the dark:** a camera in an unlit room is shown with a "VERY DARK" notice instead of "NO FRAME". Slow or dropped pictures on a phone connection do not end the picture, and a camera that comes back after an outage reappears by itself within about a minute.
+- Based on JARVIS 9.95.0; the changes of the original are listed below. Existing JARVIS data and settings are kept.
+
 ## [9.95.0] — DB storage: flush learned source + external location (issue #491 b/c)
 
 The two follow-ups from #491, building on the 9.94.0 retention work. Both controls

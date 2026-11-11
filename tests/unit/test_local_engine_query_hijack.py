@@ -81,11 +81,17 @@ async def test_long_automation_message_not_hijacked_by_who_home(le):
 # ── genuine queries still answer ─────────────────────────────────────────────
 
 async def test_what_is_open_still_answers(le):
-    h = FakeHass()                      # nothing open
+    h = FakeHass()                      # no such devices at all
     result = await le.try_local(h, "what's open", "sir")
     assert result is not None and result.success
-    assert "closed and secured" in result.text.lower()
+    assert "no door, window or lock sensors" in result.text.lower()   # never an all-clear about nothing
+    assert "closed and secured" not in result.text.lower()
     assert h.service_calls == []        # a query never actuates
+
+    h.states.set("lock.front", "locked", friendly_name="Front")       # a real, closed device
+    result = await le.try_local(h, "what's open", "sir")
+    assert "closed and secured" in result.text.lower()
+    assert h.service_calls == []
 
 
 async def test_whos_home_still_answers(le):

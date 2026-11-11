@@ -1,0 +1,178 @@
+name: Upstream sync
+
+# Every Saturday: when the original JARVIS has a new release, build Clean Jarvis on it, run every check and publish
+# the new Clean Jarvis release. If the patch no longer fits or a check fails, nothing is published and an issue
+# says what needs attention. See CLEAN_JARVIS.md ("How Clean Jarvis follows JARVIS").
+on:
+  schedule:
+    - cron: "0 5 * * 6"          # Saturday 05:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only build and test, publish nothing"
+        type: boolean
+        default: true
+      force:
+        description: "Build even when JARVIS has no newer release (for a test run)"
+        type: boolean
+        default: false
+      upstream:
+        description: "Use this JARVIS release tag instead of the newest (optional)"
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Build Clean Jarvis on the newest JARVIS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read             # no secrets here: this job runs the original's code in the tests
+    outputs:
+      needed: ${{ steps.sync.outputs.needed }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+      version: ${{ steps.sync.outputs.version }}
+      commit: ${{ steps.sync.outputs.commit }}
+      head: ${{ steps.sync.outputs.head }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0             # the branch the run was started on (main for the Saturday run)
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+      - name: Build the candidate
+        id: sync
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          args=""
+          if [ "${{ inputs.force }}" = "true" ]; then args="$args --force"; fi
+          if [ -n "${{ inputs.upstream }}" ]; then args="$args --upstream ${{ inputs.upstream }}"; fi
+          python scripts/upstream_sync.py prepare --out "$RUNNER_TEMP/sync" $args
+      - name: Install test dependencies
+        if: steps.sync.outputs.needed == 'true'
+        run: python -m pip install --upgrade pip pytest pytest-asyncio pyyaml voluptuous numpy pillow
+      - name: Patch kit tests on the build
+        if: steps.sync.outputs.needed == 'true'
+        env:
+          JARVIS_VERSION: ${{ steps.sync.outputs.upstream }}
+          JARVIS_BUILT: ${{ steps.sync.outputs.built }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          # the clean release for the tests that patch a fresh copy (no download from GitHub needed)
+          git archive --format=zip --prefix="jarvis-aio-$JARVIS_VERSION/" -o "/tmp/jarvis-aio-$JARVIS_VERSION.zip" "refs/tags/upstream/$JARVIS_VERSION"
+          python -m pytest -q -p no:cacheprovider patches/tests
+      - name: Keep the candidate for the publish job
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate
+          path: |
+            ${{ runner.temp }}/sync/candidate.bundle
+            ${{ runner.temp }}/sync/info.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Check fully and publish
+    needs: prepare
+    if: needs.prepare.outputs.needed == 'true' && inputs.dry_run != true && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # releases and tags
+      actions: write             # start the Validate workflow on the candidate
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UP: ${{ needs.prepare.outputs.upstream }}
+      VER: ${{ needs.prepare.outputs.version }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      OLD_MAIN: ${{ needs.prepare.outputs.head }}
+    steps:
+      - name: Check that the release token is set
+        env:
+          T: ${{ secrets.CJ_RELEASE_TOKEN }}
+        run: |
+          if [ -z "$T" ]; then echo "::error::The repository secret CJ_RELEASE_TOKEN is missing (see CLEAN_JARVIS.md)."; exit 1; fi
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.CJ_RELEASE_TOKEN }}   # pushes that change workflow files need it
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+      - name: Load the candidate
+        run: |
+          git fetch --no-tags --quiet https://github.com/sam3gp8/jarvis-aio.git "+refs/tags/$UP:refs/tags/upstream/$UP"
+          git fetch --quiet "$RUNNER_TEMP/candidate/candidate.bundle" "refs/heads/cj-candidate:refs/heads/cj-candidate"
+          test "$(git rev-parse cj-candidate)" = "$COMMIT"
+          test "$(git rev-parse 'cj-candidate^')" = "$(git rev-parse "refs/tags/upstream/$UP^{commit}")"
+          test "$(git rev-parse origin/main)" = "$OLD_MAIN"
+          git log -1 --format='%an <%ae> | %s' cj-candidate
+      - name: Push the candidate to a check branch
+        run: git push --force origin "cj-candidate:refs/heads/auto/$VER"
+      - name: Run every check on the candidate
+        run: |
+          gh workflow run validate.yml --ref "auto/$VER"
+          id=""
+          for i in $(seq 1 30); do
+            sleep 10
+            id=$(gh run list --workflow validate.yml --branch "auto/$VER" --event workflow_dispatch --limit 1 --json databaseId -q '.[0].databaseId')
+            [ -n "$id" ] && break
+          done
+          [ -n "$id" ] || { echo "::error::the Validate run did not start"; exit 1; }
+          gh run watch "$id" --exit-status --interval 30 > /dev/null
+          gh run view "$id" --json jobs -q '.jobs[] | "\(.name): \(.conclusion)"'
+      - name: Publish on main
+        run: git push --force-with-lease="main:$OLD_MAIN" origin "cj-candidate:refs/heads/main"
+      - name: Wait for the release, then remove the older ones
+        run: |
+          for i in $(seq 1 60); do gh release view "$VER" > /dev/null 2>&1 && break; sleep 10; done
+          gh release view "$VER" --json name,tagName -q '"\(.name) (\(.tagName))"'
+          for t in $(gh release list --limit 100 --json tagName -q '.[].tagName'); do
+            if [ "$t" != "$VER" ]; then gh release delete "$t" --cleanup-tag --yes; fi
+          done
+      - name: Close earlier sync problems
+        run: |
+          for n in $(gh issue list --label upstream-sync --state open --json number -q '.[].number'); do
+            gh issue close "$n" --comment "Clean Jarvis $VER on JARVIS $UP is published, so this is solved."
+          done
+      - name: Remove the check branch
+        if: always()
+        run: git push origin --delete "auto/$VER" || true
+
+  report:
+    name: Open an issue when something needs attention
+    needs: [prepare, publish]
+    if: failure() && inputs.dry_run != true && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: candidate
+          path: info
+      - name: Open or update the issue
+        run: |
+          up="${{ needs.prepare.outputs.upstream }}"
+          run="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          detail=$(python3 -c "import json;d=json.load(open('info/info.json'));print(d.get('error') or 'A check failed; see the run.')" 2>/dev/null || echo "See the run.")
+          title="Weekly update: Clean Jarvis could not be built on JARVIS ${up:-(unknown)}"
+          body=$(printf 'The Saturday update stopped before publishing anything.\n\n```\n%s\n```\n\nRun: %s' "$detail" "$run")
+          gh label create upstream-sync --color D93F0B --description "Weekly JARVIS sync" 2>/dev/null || true
+          n=$(gh issue list --label upstream-sync --state open --search "$title in:title" --json number -q '.[0].number')
+          if [ -n "$n" ]; then gh issue comment "$n" --body "$body"; else gh issue create --title "$title" --body "$body" --label upstream-sync; fi

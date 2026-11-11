@@ -239,8 +239,10 @@ async def test_capture_face_snapshot_pins_and_caches(load, recog, fake_hass, tmp
 
     rec = await mod.capture_face_snapshot(fake_hass, "front_door", "Sam")
     assert rec is not None
-    assert rec["url"] == "/local/jarvis/faces/sam.jpg"
-    assert mod.face_snapshot_url("sam") == "/local/jarvis/faces/sam.jpg"
+    # Clean Jarvis: a private tag, not a path under the login-free /local web folder
+    assert rec["url"] == "jarvis-private/faces/sam.jpg"
+    assert mod.face_snapshot_url("sam") == "jarvis-private/faces/sam.jpg"
+    assert not rec["url"].startswith("/local/")
     # The file was actually written to the servable dir.
     assert os.path.exists(os.path.join(str(tmp_path), "sam.jpg"))
 

@@ -161,6 +161,19 @@ def gather(entity_id: str, event_time: Optional[str] = None,
     return ev
 
 
+# Jarvis Home patch (2026-11-06, round 3): the activity log and the commands table quote what a person asked for. viewer is a
+# limited login, None an admin or voice. A limited login sees follow-up and goal lines of its own only, and for a command
+# only who gave it, because its text can be a private request such as a reminder.
+_JH_PRIVATE_ACTIVITY = ("followup", "goal")
+
+
+def _jh_for_viewer(ev: dict, viewer: Optional[str]) -> dict:
+    if viewer is not None:
+        ev["actions"] = [a for a in ev.get("actions", []) if a.get("category") not in _JH_PRIVATE_ACTIVITY or a.get("user_id") == viewer]
+        ev["jh_limited"] = True
+    return ev
+
+
 # ── candidate causes ─────────────────────────────────────────────────────────
 
 def _secs_before(t0: datetime, ts) -> Optional[float]:
@@ -221,7 +234,8 @@ def candidates(ev: dict) -> list[dict]:
                 or (focal.get("domain") and str(focal["domain"]) in text):
             who = cmd.get("person") or "someone"
             out.append({"kind": "command", "confidence": 0.85,
-                        "cause": f"{who} asked: \"{cmd['text']}\" {int(secs)}s earlier",
+                        "cause": (f"{who} asked for this {int(secs)}s earlier" if ev.get("jh_limited")
+                                  else f"{who} asked: \"{cmd['text']}\" {int(secs)}s earlier"),
                         "evidence": "the request names this device, its room, or its type",
                         "timestamp": cmd["timestamp"]})
 
@@ -281,7 +295,8 @@ def _timeline(ev: dict) -> list[dict]:
                               f"{row.get('old_state')} → {row.get('new_state')}"})
     for cmd in ev["commands"]:
         items.append({"t": cmd["timestamp"], "src": "command",
-                      "text": f"{cmd.get('person', 'someone')}: \"{cmd['text']}\""})
+                      "text": (f"{cmd.get('person', 'someone')} gave a command" if ev.get("jh_limited")
+                               else f"{cmd.get('person', 'someone')}: \"{cmd['text']}\"")})
     for act in ev["actions"]:
         items.append({"t": act["timestamp"], "src": "jarvis",
                       "text": str(act.get("message", ""))[:140]})
@@ -294,10 +309,10 @@ def _timeline(ev: dict) -> list[dict]:
 def analyze(entity_id: str, event_time: Optional[str] = None,
             window_secs: int = DEFAULT_WINDOW_SECS,
             patterns_db: str = PATTERNS_DB,
-            activity_db: str = ACTIVITY_DB) -> dict:
+            activity_db: str = ACTIVITY_DB, *, viewer: Optional[str] = None) -> dict:
     """Full root-cause analysis for an entity's (latest or specified) change."""
     try:
-        ev = gather(entity_id, event_time, window_secs, patterns_db, activity_db)
+        ev = _jh_for_viewer(gather(entity_id, event_time, window_secs, patterns_db, activity_db), viewer)
         cands = candidates(ev)
         focal = ev.get("focal") or {}
         top = cands[0]

@@ -119,6 +119,7 @@ def store_memory(
     role: str = "user",
     device_id: str = "",
     conversation_id: str = "",
+    user_id: str = "",
 ) -> bool:
     """
     Store a conversation turn in long-term memory.
@@ -135,6 +136,7 @@ def store_memory(
         "role": role,
         "device_id": device_id or "",
         "conversation_id": conversation_id or "",
+        "user_id": user_id or "",  # Jarvis Home patch: per-user memory
         "timestamp": ts,
     }
 
@@ -180,6 +182,7 @@ def search_memory(
     query: str,
     k: int = 5,
     hours: Optional[int] = None,
+    user_id: Optional[str] = None,
 ) -> list[dict]:
     """
     Search long-term memory for relevant past conversations.
@@ -194,7 +197,7 @@ def search_memory(
     if _pgvector_available:
         try:
             from . import memory_pgvector
-            return memory_pgvector.search(query, k=k, hours=hours)
+            return memory_pgvector.search(query, k=k, hours=hours, user_id=user_id)
         except Exception as exc:
             _LOGGER.debug("pgvector search failed: %s", exc)
 
@@ -204,6 +207,8 @@ def search_memory(
             if hours:
                 cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
                 where = {"timestamp": {"$gte": cutoff}}
+            if user_id is not None:  # Jarvis Home patch: the backend itself keeps people apart
+                where = {"$and": [where, {"user_id": user_id}]} if where else {"user_id": user_id}
 
             results = _collection.query(
                 query_texts=[query],
@@ -233,9 +238,15 @@ def search_memory(
             conn = sqlite3.connect(_DB_PATH)
             conn.row_factory = sqlite3.Row
             # FTS5 MATCH query
-            query_clean = " OR ".join(query.split()[:8])  # limit query terms
+            # Jarvis Home patch: quoted words, so punctuation in a sentence is no FTS5 syntax error.
+            import re
+            words = re.findall(r"\w+", query)[:8]  # limit query terms
+            if not words:
+                conn.close()
+                return []
+            query_clean = " OR ".join('"' + w + '"' for w in words)
             sql = "SELECT content, metadata, rank FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?"
-            rows = conn.execute(sql, (query_clean, k)).fetchall()
+            rows = conn.execute(sql, (query_clean, k if user_id is None else 500)).fetchall()
             conn.close()
 
             memories = []
@@ -245,6 +256,10 @@ def search_memory(
                     meta = json.loads(row["metadata"])
                 except Exception:
                     pass
+                if user_id is not None and meta.get("user_id", "") != user_id:
+                    continue
+                if len(memories) >= k:
+                    break
                 memories.append({
                     "text": row["content"],
                     "role": meta.get("role", ""),
@@ -258,12 +273,12 @@ def search_memory(
     return []
 
 
-def get_conversation_context(query: str, k: int = 3) -> str:
+def get_conversation_context(query: str, k: int = 3, user_id: Optional[str] = None) -> str:
     """
     Format retrieved memories as a context string for the system prompt.
     Called from conversation.py before each LLM call.
     """
-    memories = search_memory(query, k=k)
+    memories = search_memory(query, k=k, user_id=user_id)
     if not memories:
         return ""
 

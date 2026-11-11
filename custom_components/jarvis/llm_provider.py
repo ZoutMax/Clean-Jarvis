@@ -640,7 +640,7 @@ def _warn_ollama_toolparse_once(model: str) -> None:
 # Ollama's 2048 default (JARVIS's system prompt + knowledge + history need the
 # room, and a too-small window silently truncates); and allow a generous
 # timeout since the first token can lag while a cold model loads.
-OLLAMA_KEEP_ALIVE = "30m"
+OLLAMA_KEEP_ALIVE = -1
 OLLAMA_NUM_CTX = 8192
 OLLAMA_TIMEOUT = 120.0  # seconds
 
@@ -701,7 +701,7 @@ class OllamaProvider(OpenAIProvider):
                 num_ctx = OLLAMA_NUM_CTX
         except Exception:
             num_ctx = OLLAMA_NUM_CTX
-        return {"keep_alive": OLLAMA_KEEP_ALIVE, "think": bool(thinking),
+        return {"keep_alive": OLLAMA_KEEP_ALIVE, "think": bool(thinking), **({} if thinking else {"reasoning_effort": "none"}),
                 "options": {"num_ctx": num_ctx}}
 
     def supports_thinking(self) -> bool:

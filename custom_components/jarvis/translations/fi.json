@@ -152,7 +152,11 @@
           "directive": "Mukautettu ohje (valinnainen, ohittaa esiasetuksen)",
           "llm_provider": "Conversation model provider",
           "use_hass_api": "Ota kodin ohjaus käyttöön (valot, ilmasto, lukot jne.)",
-          "web_research_llm_fallback": "Anna verkkotutkimuksen siirtyä LLM:n omaan verkkohakuun, kun oletustausta ei löydä mitään"
+          "web_research_llm_fallback": "Anna verkkotutkimuksen siirtyä LLM:n omaan verkkohakuun, kun oletustausta ei löydä mitään",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
         }
       },
       "core_model": {

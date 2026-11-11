@@ -57,6 +57,31 @@ _last_error: Optional[str] = None   # last connect/schema failure, for diagnosti
 _BUSY_TIMEOUT_S = 15.0
 
 
+_JH_USER_COLUMN = set()
+
+
+def _jh_user_column(conn) -> None:
+    """Jarvis Home patch (2026-11-06): each conversation row names the logged-in user, so a new chat is only
+    seeded with that person's own turns. Rows from before this patch stay ownerless and are never seeded."""
+    if str(DB_PATH) in _JH_USER_COLUMN:
+        return
+    if "user_id" not in {r[1] for r in conn.execute("PRAGMA table_info(conversations)")}:
+        try:
+            conn.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    # _JH_ACTIVITY_OWNER: a follow-up or goal line in the activity log belongs to the person who asked for it.
+    if "user_id" not in {r[1] for r in conn.execute("PRAGMA table_info(activity_log)")}:
+        try:
+            conn.execute("ALTER TABLE activity_log ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id)")
+    _JH_USER_COLUMN.add(str(DB_PATH))
+
+
 def _connect() -> sqlite3.Connection:
     global _last_error
     conn: sqlite3.Connection | None = None
@@ -77,6 +102,7 @@ def _connect() -> sqlite3.Connection:
             pass
         conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_S * 1000)}")
         conn.executescript(SCHEMA)
+        _jh_user_column(conn)
         conn.commit()
         _last_error = None
         return conn
@@ -108,16 +134,40 @@ def health() -> dict:
 
 # ── Conversation history ──────────────────────────────────────────────────────
 
-def save_message(role: str, content: str, device_id: str = "unknown") -> None:
+def save_message(role: str, content: str, device_id: str = "unknown", user_id: str = "") -> None:
     """Persist a single conversation turn."""
     try:
         with _connect() as conn:
             conn.execute(
-                "INSERT INTO conversations (timestamp, device_id, role, content) VALUES (?,?,?,?)",
-                (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), device_id, role, content),
+                "INSERT INTO conversations (timestamp, device_id, role, content, user_id) VALUES (?,?,?,?,?)",
+                (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), device_id, role, content, user_id or ""),
             )
     except Exception as exc:
         _LOGGER.warning("JARVIS DB write error: %s", exc)
+
+
+def get_thread_messages(hours: int = 48, limit: int = 12, user_id: str = "", device_id: str = "") -> list[dict]:
+    """Jarvis Home patch (2026-11-06): the newest turns of one person, oldest first. A logged-in user gets
+    their own rows; with no login only ownerless rows of the same conversation or device. Never all rows."""
+    if user_id:
+        where, who = "user_id = ?", user_id
+    elif device_id:
+        where, who = "user_id = '' AND device_id = ?", device_id
+    else:
+        return []
+    try:
+        since = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
+        with _connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM conversations WHERE timestamp > ? AND {where} "
+                "AND device_id NOT IN ('briefing', 'sentinel', 'camera', 'summary') "
+                "ORDER BY timestamp DESC, id DESC LIMIT ?",
+                (since, who, limit),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+    except Exception as exc:
+        _LOGGER.warning("JARVIS DB read error: %s", exc)
+        return []
 
 
 def get_recent_messages(
@@ -212,14 +262,15 @@ def save_activity(
     message: str = "",
     was_spoken: bool = False,
     source: str = "observer",
+    user_id: str = "",
 ) -> None:
     """Persist an activity log entry (observer event, sentinel alert, etc.)."""
     try:
         with _connect() as conn:
             conn.execute(
                 "INSERT INTO activity_log "
-                "(timestamp, entity_id, category, urgency, message, was_spoken, source) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(timestamp, entity_id, category, urgency, message, was_spoken, source, user_id) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
                     datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                     entity_id,
@@ -228,6 +279,7 @@ def save_activity(
                     message,
                     1 if was_spoken else 0,
                     source,
+                    user_id,
                 ),
             )
     except Exception as exc:

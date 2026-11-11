@@ -368,8 +368,8 @@ def _fallback_meter(hass, states=None) -> Optional[str]:
             except (ValueError, TypeError):
                 watts = 0.0
             candidates.append((eid, watts))
-        if candidates:
-            return max(candidates, key=lambda item: item[1])[0]
+        if len(candidates) == 1:   # Jarvis Home patch (2026-11-10): the biggest of several is one device, not the house
+            return candidates[0][0]
         return None
 
     candidates = []
@@ -391,8 +391,8 @@ def _fallback_meter(hass, states=None) -> Optional[str]:
         except (ValueError, TypeError):
             watts = 0.0
         candidates.append((eid, watts))
-    if candidates:
-        return max(candidates, key=lambda item: item[1])[0]
+    if len(candidates) == 1:   # Jarvis Home patch (2026-11-10): the biggest of several is one device, not the house
+        return candidates[0][0]
     return None
 
 
@@ -485,6 +485,59 @@ def power_status(hass, states=None) -> dict:
         "candidates": power_sensor_candidates(hass, states),
         "advice": advice,
     }
+
+
+# Jarvis Home patch (2026-11-10): what the devices on the Energy dashboard draw right now, read live.
+async def jh_devices_power_now(hass) -> Optional[dict]:
+    """The power the devices on the Energy dashboard draw right now. A device's power sensor is its power entry on the
+    dashboard, else the one power sensor on the same device as its energy sensor; a device without one is left out.
+    None when no device has a power sensor. Never raises."""
+    try:
+        from homeassistant.components.energy.data import async_get_manager
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        prefs = (await async_get_manager(hass)).data or {}
+        ents, devs = er.async_get(hass), dr.async_get(hass)
+        rows, unread = [], []
+        for item in prefs.get("device_consumption") or []:
+            entry = ents.async_get(item.get("stat_consumption") or "")
+            device_id = getattr(entry, "device_id", None)
+            power_id = item.get("stat_rate")
+            if not power_id and device_id:
+                same = [e.entity_id for e in list(ents.entities.values())
+                        if getattr(e, "device_id", None) == device_id and _jh_is_power(hass.states.get(e.entity_id))]
+                power_id = same[0] if len(same) == 1 else None
+            if not power_id:
+                continue   # this device only reports energy
+            state = hass.states.get(power_id)
+            device = devs.async_get(device_id) if device_id else None
+            name = (item.get("name") or getattr(device, "name_by_user", None) or getattr(device, "name", None)
+                    or (state.attributes.get("friendly_name") if state is not None else None) or power_id)
+            watts = _jh_watts(state)
+            if watts is None:
+                unread.append(name)
+            else:
+                rows.append({"name": name, "watts": round(watts, 1)})
+        if not rows and not unread:
+            return None
+        rows.sort(key=lambda r: -r["watts"])
+        return {"total_watts": round(sum(r["watts"] for r in rows)), "devices": rows, "unreadable": unread,
+                "covers": ("only the %d monitored devices on the Energy dashboard that measure power; there is no "
+                           "whole-house meter, so the household draws more" % (len(rows) + len(unread)))}
+    except Exception:
+        return None
+
+
+def _jh_is_power(state) -> bool:
+    return (state is not None and state.attributes.get("device_class") == "power"
+            and str(state.attributes.get("unit_of_measurement") or "").lower() in ("w", "kw"))
+
+
+def _jh_watts(state) -> Optional[float]:
+    try:
+        watts = float(state.state)
+    except (AttributeError, TypeError, ValueError):
+        return None   # unavailable, unknown or missing
+    return watts * 1000 if str(state.attributes.get("unit_of_measurement") or "").lower() == "kw" else watts
 
 
 def evaluate_for_proactive(hass) -> Optional[dict]:

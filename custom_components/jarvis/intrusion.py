@@ -335,7 +335,9 @@ async def capture_snapshot(hass, camera_entity: str,
             return None
         ts = int(time.time())
         slug = camera_entity.split(".", 1)[-1]
-        fname = f"{tag}_{slug}_{ts}.jpg"
+        import secrets
+        # Jarvis Home patch (2026-11-06): www is served with no login, so the name must not be guessable.
+        fname = f"{tag}_{slug}_{ts}_{secrets.token_urlsafe(16)}.jpg"
         path = os.path.join(SNAPSHOT_DIR, fname)
         await hass.async_add_executor_job(_store_snapshot, path, content)
         info = {
@@ -380,6 +382,38 @@ def _prune_old() -> None:
                 pass
     except Exception:
         pass
+
+
+def retoken_old_stills() -> None:
+    """Jarvis Home patch (2026-11-07): stills saved before the unguessable names (tag_camera_epoch.jpg) are still served from
+    www with no login. Each gets a random part as well, and the intrusion log points at the new name. Nothing is deleted.
+    Runs on the executor at startup; never raises."""
+    import re, secrets
+    try:
+        folder = config_path_str("www", "jarvis", "intrusion")
+        if not os.path.isdir(folder):
+            return
+        renamed = {}
+        for name in os.listdir(folder):
+            if not re.fullmatch(r".+_\d{9,11}\.jpg", name) or re.fullmatch(r".+_\d{9,11}_[A-Za-z0-9_-]{22}\.jpg", name):
+                continue
+            new = f"{name[:-4]}_{secrets.token_urlsafe(16)}.jpg"
+            os.replace(os.path.join(folder, name), os.path.join(folder, new))
+            renamed[name] = new
+        if not renamed:
+            return
+        for ev in _load_log():
+            if not isinstance(ev, dict):
+                continue
+            for key in ("snapshot_url", "snapshot_path"):
+                val = str(ev.get(key) or "")
+                base = val.replace("\\", "/").rsplit("/", 1)[-1]
+                if base in renamed:
+                    ev[key] = val[:len(val) - len(base)] + renamed[base]
+        _save_log()
+        _LOGGER.info("JARVIS: gave %d older intrusion still(s) an unguessable name", len(renamed))
+    except Exception as exc:
+        _LOGGER.warning("JARVIS: could not rename older intrusion stills: %s", exc)
 
 
 def last_snapshot() -> Optional[dict]:

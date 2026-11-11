@@ -92,7 +92,10 @@ def _build_summary(hass: HomeAssistant) -> str:
     # ── Lights ───────────────────────────────────────────────────────────
     lights_on = []
     lights_total = 0
+    from .local_engine import _jh_is_setting
     for state in wm.devices(domain="light"):
+        if _jh_is_setting(hass, state["entity_id"]):
+            continue
         lights_total += 1
         if state["state"] == "on":
             lights_on.append(state["attributes"].get("friendly_name", state["entity_id"]))

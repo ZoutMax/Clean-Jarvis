@@ -119,6 +119,7 @@ def init() -> bool:
                     "  ts timestamptz,"
                     f"  embedding vector({dim})"
                     ")")
+                cur.execute(f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS user_id text DEFAULT ''")
             conn.commit()
         finally:
             conn.close()
@@ -152,11 +153,11 @@ def store(doc_id: str, text: str, metadata: dict) -> bool:
             with conn.cursor() as cur:
                 cur.execute(
                     f"INSERT INTO {_TABLE} "
-                    "(id, content, role, device_id, conversation_id, ts, embedding) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s::vector) "
+                    "(id, content, role, device_id, conversation_id, user_id, ts, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector) "
                     "ON CONFLICT (id) DO NOTHING",
                     (doc_id, text, metadata.get("role", ""),
-                     metadata.get("device_id", ""), metadata.get("conversation_id", ""),
+                     metadata.get("device_id", ""), metadata.get("conversation_id", ""), metadata.get("user_id", ""),
                      metadata.get("timestamp") or None, _vec_literal(vec)))
             conn.commit()
         finally:
@@ -167,7 +168,7 @@ def store(doc_id: str, text: str, metadata: dict) -> bool:
         return False
 
 
-def search(query: str, k: int = 5, hours: Optional[int] = None) -> list[dict]:
+def search(query: str, k: int = 5, hours: Optional[int] = None, user_id: Optional[str] = None) -> list[dict]:
     """Nearest-neighbour search by cosine distance. [] on any failure."""
     if not _ready:
         return []
@@ -176,11 +177,14 @@ def search(query: str, k: int = 5, hours: Optional[int] = None) -> list[dict]:
         if not vec:
             return []
         params: list = [_vec_literal(vec)]
-        where = ""
+        filters = []
         if hours:
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-            where = "WHERE ts >= %s"
-            params.append(cutoff)
+            filters.append("ts >= %s")
+            params.append(datetime.now(timezone.utc) - timedelta(hours=hours))
+        if user_id is not None:  # Jarvis Home patch: None is the admin search, a string is one person
+            filters.append("COALESCE(user_id, '') = %s")
+            params.append(user_id)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
         params.append(_vec_literal(vec))
         params.append(int(k))
         sql = (f"SELECT content, role, ts, 1 - (embedding <=> %s::vector) AS score "

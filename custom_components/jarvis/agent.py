@@ -49,7 +49,8 @@ JARVIS_TOOLS = [
                 "Control a Home Assistant device. Turn lights/switches/fans "
                 "on or off, lock/unlock locks, open/close covers/garage doors, "
                 "set brightness, set climate temperature. Use the entity_id "
-                "from the home context or from get_entities results."
+                "from the home context or from get_entities results. If the result "
+                "has a warning, tell the user the action is not confirmed."
             ),
             "parameters": {
                 "type": "object",
@@ -874,9 +875,32 @@ JARVIS_TOOLS = [
                 "suggestions. Use when asked 'how much power are we using', "
                 "'what's running', 'are we over peak', or for energy-saving "
                 "advice. Reflects the current agency level (advisory / opt-in / "
-                "autonomous) and never sheds critical loads."
+                "autonomous) and never sheds critical loads. Without a whole-house "
+                "meter, devices_now gives what the monitored devices draw right now "
+                "and what that covers. For energy USED over a "
+                "period (today, this month) use energy_usage."
             ),
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "energy_usage",
+            "description": (
+                "Energy (kWh) used over a period, from Home Assistant's Energy "
+                "dashboard: the total and the biggest users. Use for 'how much "
+                "electricity did we use this month / today / last week'. The "
+                "result says what the total covers; say that plainly (for "
+                "example: only the monitored devices, when there is no "
+                "whole-house meter)."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "period": {"type": "string",
+                           "enum": ["today", "yesterday", "this_week", "last_week",
+                                    "this_month", "last_month", "this_year"],
+                           "description": "Which period; default this_month."},
+            }},
         },
     },
     {
@@ -1371,15 +1395,44 @@ async def _exec_control_device(hass: HomeAssistant, args: dict) -> str:
             return json.dumps({"error": f"Failed: {exec_detail}",
                                "entity_id": entity_id})
 
+        # Jarvis Home patch (2026-11-05): cloud devices report back late, so wait for the expected state.
+        _jh_want = _EXPECTED_STATES.get(action)
+        _jh_want = tuple(_jh_want) if isinstance(_jh_want, (tuple, list, set)) else ((_jh_want,) if _jh_want else ())
+        # Jarvis Home patch (2026-11-07): a lock still locking or a cover still opening has not landed, so keep waiting, and an
+        # action with no end state to check (brightness, temperature, volume, toggle) is never reported as confirmed.
+        def _jh_landed(st):
+            return bool(st) and _jh_reached(entity_id, _jh_want, st.state)
+        for _ in range(16):
+            if not _jh_want or _jh_landed(hass.states.get(entity_id)):
+                break
+            await asyncio.sleep(0.25)
         new_state = hass.states.get(entity_id)
-        return json.dumps({
-            "success": True,
+        _jh_now = str(new_state.state).lower() if new_state else "unknown"
+        if _jh_want:
+            _jh_ok = _jh_conf = _jh_landed(new_state)
+        else:
+            _jh_ok, _jh_conf = _jh_now not in ("unavailable", "unknown"), None
+        _jh_out = {
+            "success": _jh_ok,
             "entity_id": entity_id,
             "previous_state": prev_state,
             "new_state": new_state.state if new_state else "unknown",
+            "confirmed": _jh_conf,
             "action": action,
             "area": wm_area,
-        })
+        }
+        if not _jh_ok and not _jh_want:
+            _jh_out["warning"] = (f"The device is {_jh_now}, so the command changed nothing. Tell the user so plainly. "
+                                  "Do not say it is done.")
+        elif not _jh_ok and _jh_now in _TRANSITIONAL:
+            _jh_out.update(sent=True, in_progress=True, warning=(
+                f"The command was sent and the device is still {_jh_now}: it has not reached the end state yet. "
+                f"Tell the user it is {_jh_now} and not confirmed. Do not say it is done."))
+        elif not _jh_ok:
+            _jh_out["sent"] = True
+            _jh_out["warning"] = ("The command was sent but the device did not report the expected state. "
+                                  "Tell the user it is not confirmed. Do not say it is done.")
+        return json.dumps(_jh_out)
     except Exception as exc:
         return json.dumps({"error": f"Failed: {exc}", "entity_id": entity_id})
 
@@ -1407,7 +1460,8 @@ async def _exec_get_entity_state(hass: HomeAssistant, args: dict) -> str:
                 # When the state last changed / was last written — lets JARVIS
                 # answer "when did this turn on?" by reading history instead of
                 # (wrongly) acting on a question about the past.
-                "last_changed": state.last_changed.isoformat() if state.last_changed else None,
+                # Jarvis Home patch (2026-11-04d): local time, the model read UTC stamps out as if they were local.
+                "last_changed": state.last_changed.astimezone().isoformat() if state.last_changed else None,
                 "last_updated": state.last_updated.isoformat() if state.last_updated else None,
             })
         else:
@@ -1493,6 +1547,9 @@ async def _exec_search_entities(hass: HomeAssistant, args: dict) -> str:
                 fuzz = _fuzzy(query, fname)
                 if fuzz > 45:
                     score = fuzz * 0.7  # Scale down fuzzy scores
+                from .local_engine import _jh_sound
+                if len(_jh_sound(query)) >= 3 and _jh_sound(query) == _jh_sound(fname):
+                    score = 64   # Jarvis Home patch: sounds the same, just under every normal match
 
                 # Word-level fuzzy — check each query word
                 if not score and query_words:
@@ -1840,6 +1897,12 @@ async def _exec_execute_plan(hass: HomeAssistant, args: dict) -> str:
     from . import actuation
     from .kernel import plan as _kplan
 
+    # Jarvis Home patch: the service call carries the login, so Home Assistant applies that person's own rights too.
+    _jh_limited = await _jh_limited_caller(hass)
+    _jh_ctx = None
+    if _JH_CALLER.get():
+        from homeassistant.core import Context
+        _jh_ctx = Context(user_id=_JH_CALLER.get())
     results = []
     succeeded = 0
     for i, step in enumerate(steps):
@@ -1858,6 +1921,10 @@ async def _exec_execute_plan(hass: HomeAssistant, args: dict) -> str:
         if hass.states.get(entity_id) is None:
             results.append({"step": i + 1, "description": desc,
                             "ok": False, "error": f"entity '{entity_id}' not found"})
+            continue
+        if _jh_limited and _jh_plan_refused(domain, service, entity_id):
+            _LOGGER.warning("JARVIS: blocked plan step %s.%s for a non-admin login", domain, service)
+            results.append({"step": i + 1, "description": desc, "ok": False, "error": _JH_PLAN_REFUSED})
             continue
 
         # Authorization gate (v7.41.0): a protected step is confirmed before it
@@ -1882,7 +1949,8 @@ async def _exec_execute_plan(hass: HomeAssistant, args: dict) -> str:
             continue
 
         capability = f"{domain}.{service}"
-        svc_data = {"entity_id": entity_id, **extra}
+        # Jarvis Home patch: the step acts on the entity the checks above saw, never on a wider target in service_data.
+        svc_data = {**{k: v for k, v in extra.items() if k not in _JH_TARGET_KEYS}, "entity_id": entity_id}
         # MCU world_model parity: read the step target's pre-action context
         # through the WorldModel facade (the canonical context authority) and
         # area-tag the actuation event, the same read control_device/bulk do,
@@ -1898,7 +1966,7 @@ async def _exec_execute_plan(hass: HomeAssistant, args: dict) -> str:
                                 correlation_id=actuation.correlation_id())
 
         async def _run(_s, _d=domain, _svc=service, _data=svc_data):
-            await hass.services.async_call(_d, _svc, dict(_data), blocking=True)
+            await hass.services.async_call(_d, _svc, dict(_data), blocking=True, context=_jh_ctx)
             return True
 
         async def _check(_cond, _s, _eid=entity_id):
@@ -1934,11 +2002,20 @@ async def _exec_remember(hass: HomeAssistant, args: dict) -> str:
     if key not in ("alias", "preference", "routine"):
         return json.dumps({"error": f"Unknown category: {key}"})
 
-    data = await hass.async_add_executor_job(_load_learned)
-    if key not in data:
-        data[key] = {}
-    data[key][name] = value
-    await hass.async_add_executor_job(_save_learned, data)
+    # Jarvis Home patch (2026-11-07): the learned file and the household facts reach every person's prompt, an admin's too, so
+    # a limited login cannot write there: no household alias, and a routine is kept under that person's own subject.
+    _jh_limited = await _jh_limited_caller(hass)
+    if _jh_limited and key == "alias":
+        return json.dumps({"error": "Not allowed: a household alias needs an administrator login. Nothing was saved. "
+                                    "Tell the user so plainly."})
+    # Jarvis Home patch: the learned file goes into every prompt, so a logged-in person's preference stays in
+    # the knowledge store under their own subject.
+    if not (key == "preference" and _JH_CALLER.get()) and not _jh_limited:
+        data = await hass.async_add_executor_job(_load_learned)
+        if key not in data:
+            data[key] = {}
+        data[key][name] = value
+        await hass.async_add_executor_job(_save_learned, data)
 
     # v6.25.0: mirror preferences & routines into the curated knowledge store, so
     # spoken "remember that …" shows up in the Memory panel and injects into
@@ -1949,16 +2026,22 @@ async def _exec_remember(hass: HomeAssistant, args: dict) -> str:
             from . import knowledge
             if key == "preference":
                 from . import identity
-                k_subject = identity.resolve_subject(hass)  # this person, or "primary"
+                k_subject = (identity.subject_for_user(hass, _JH_CALLER.get() or "")
+                             or identity.resolve_subject(hass))  # this person, or "primary"
                 k_kind = "preference"
             else:
-                k_subject = knowledge.DEFAULT_SUBJECT
+                from . import identity
+                k_subject = identity.subject_for_user(hass, _jh_limited) if _jh_limited else knowledge.DEFAULT_SUBJECT
                 k_kind = "fact"
-            await hass.async_add_executor_job(
+            _jh_kept = await hass.async_add_executor_job(
                 lambda: knowledge.remember(name, value, subject=k_subject,
                                            kind=k_kind, source="stated"))
         except Exception as exc:
+            _jh_kept = None
             _LOGGER.debug("knowledge mirror failed: %s", exc)
+        if _jh_kept is None and ((key == "preference" and _JH_CALLER.get()) or _jh_limited):
+            # the knowledge store was the only place it went, so nothing was kept
+            return json.dumps({"error": "Could not store that, so nothing was saved. Tell the user so plainly."})
 
     _LOGGER.info("JARVIS learned: %s['%s'] = '%s'", key, name, value)
     return json.dumps({
@@ -2224,6 +2307,13 @@ async def _exec_cognitive_status(hass: HomeAssistant, args: dict) -> str:
                     _emit_self_model_parity(sm)   # Phase S parity (observe-only)
             except Exception:
                 pass
+        if await _jh_limited_caller(hass) is not None:
+            # Jarvis Home patch: other people's goals and the facts behind the beliefs are not for every login.
+            if isinstance(status.get("self_model"), dict):
+                status["self_model"]["commitments"] = [c for c in status["self_model"].get("commitments", [])
+                                                       if not str(c).startswith("goal:")]
+            if isinstance(status.get("beliefs"), dict):
+                status["beliefs"]["sample"] = []
         return json.dumps(status)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -2343,8 +2433,9 @@ async def _exec_root_cause(hass: HomeAssistant, args: dict) -> str:
         window = int(float(args.get("window_minutes") or 30) * 60)
     except (TypeError, ValueError):
         window = rca.DEFAULT_WINDOW_SECS
+    _jh_mine = await _jh_limited_caller(hass)
     result = await hass.async_add_executor_job(
-        lambda: rca.analyze(entity_id, event_time, window))
+        lambda: rca.analyze(entity_id, event_time, window, viewer=_jh_mine))
 
     ev = result.get("event") or {}
     lines = [f"Root cause analysis for {entity_id}:"]
@@ -2370,11 +2461,12 @@ async def _exec_root_cause(hass: HomeAssistant, args: dict) -> str:
 async def _exec_schedule_followup(hass: HomeAssistant, args: dict) -> str:
     """The agent queues work for its future self."""
     from . import followups
+    _jh_uid = _JH_CALLER.get() or ""
     res = await hass.async_add_executor_job(
         lambda: followups.schedule(
             args.get("instruction", ""),
             args.get("delay_minutes", 5),
-            context=args.get("context", "") or ""))
+            context=args.get("context", "") or "", user_id=_jh_uid))
     if "error" in res:
         return f"Couldn't schedule that follow-up: {res['error']}"
     return (f"Follow-up #{res['id']} scheduled for {res['due_ts']}: "
@@ -2388,11 +2480,15 @@ async def _exec_manage_followups(hass: HomeAssistant, args: dict) -> str:
         fid = args.get("followup_id")
         if fid is None:
             return "Which follow-up? Give me its id (use list first)."
+        _jh_mine = await _jh_limited_caller(hass)
         ok = await hass.async_add_executor_job(
-            lambda: followups.cancel(int(fid)))
+            lambda: followups.cancel(int(fid), user_id=_jh_mine))
         return (f"Follow-up #{fid} cancelled." if ok
                 else f"No pending follow-up #{fid} found.")
     rows = await hass.async_add_executor_job(followups.pending)
+    _jh_mine = await _jh_limited_caller(hass)
+    if _jh_mine is not None:
+        rows = [r for r in rows if r.get("user_id") == _jh_mine]
     if not rows:
         return "No follow-ups pending."
     lines = ["Pending follow-ups:"]
@@ -2410,6 +2506,26 @@ VERIFY_DELAY_SECS = 4.0
 _VERIFY_SLEEP = asyncio.sleep    # module-level seam so tests can fast-forward
 
 # action -> acceptable end states (transitional states get one extra wait)
+# Jarvis Home patch (2026-11-06): these devices have their own words for on, such as heat, idle or playing.
+_JH_OFF_WORDS = {"climate": ("off",), "water_heater": ("off",), "humidifier": ("off",), "media_player": ("off", "standby")}
+# Only these really show on or off. Scenes, scripts, buttons, vacuums, valves, mowers and the like have other states or none,
+# so a command to them cannot be checked this way: it counts as landed, as long as the device is there at all.
+_JH_ON_OFF = frozenset({"light", "switch", "fan", "input_boolean", "siren", "remote", "automation", "group"})
+
+
+def _jh_reached(entity_id: str, expected, state) -> bool:
+    domain = entity_id.split(".")[0]
+    off = _JH_OFF_WORDS.get(domain)
+    value = str(state).lower()
+    if off and tuple(expected) == ("on",):
+        return value not in off + ("unavailable", "unknown")
+    if off and tuple(expected) == ("off",):
+        return value in off
+    if tuple(expected) in (("on",), ("off",)) and (domain not in _JH_ON_OFF or (domain == "group" and value not in ("on", "off"))):
+        return value != "unavailable"   # a group of covers or locks shows open, closed or locked instead
+    return value in expected
+
+
 _EXPECTED_STATES = {
     "turn_on":  ("on",),
     "turn_off": ("off",),
@@ -2442,7 +2558,7 @@ def _state_ok(hass: HomeAssistant, entity_id: str, expected: tuple) -> Optional[
     s = str(st.state).lower()
     if s in _TRANSITIONAL:
         return None            # still moving — check again
-    return s in expected
+    return _jh_reached(entity_id, expected, s)
 
 
 async def _verify_control(hass: HomeAssistant, entity_id: str, action: str,
@@ -2504,13 +2620,14 @@ async def _verify_control(hass: HomeAssistant, entity_id: str, action: str,
 
 async def _exec_create_goal(hass: HomeAssistant, args: dict) -> str:
     from . import goals
+    _jh_uid = _JH_CALLER.get() or ""
     res = await hass.async_add_executor_job(
         lambda: goals.create(
             args.get("title", ""), args.get("outcome", ""),
             args.get("steps") or [],
             check_interval_min=args.get("check_interval_minutes")
             or goals.DEFAULT_INTERVAL_MIN,
-            deadline_minutes=args.get("deadline_minutes")))
+            deadline_minutes=args.get("deadline_minutes"), user_id=_jh_uid))
     if "error" in res:
         return f"Couldn't open that goal: {res['error']}"
     steps = "".join(f"\n  {s['n']}. {s['step']}" for s in res.get("steps", []))
@@ -2525,6 +2642,8 @@ async def _exec_update_goal(hass: HomeAssistant, args: dict) -> str:
     gid = args.get("goal_id")
     if gid is None:
         return "update_goal needs goal_id."
+    if await _jh_not_mine(hass, await hass.async_add_executor_job(lambda: goals.get(int(gid)))):
+        return f"Couldn't update goal #{gid}: no goal #{gid}"
     res = await hass.async_add_executor_job(
         lambda: goals.update(
             int(gid), step_updates=args.get("step_updates"),
@@ -2543,6 +2662,8 @@ async def _exec_manage_goals(hass: HomeAssistant, args: dict) -> str:
         gid = args.get("goal_id")
         if gid is None:
             return "Which goal? Give me its id (use list first)."
+        if await _jh_not_mine(hass, await hass.async_add_executor_job(lambda: goals.get(int(gid)))):
+            return f"No active goal #{gid} found."
         ok = await hass.async_add_executor_job(lambda: goals.cancel(int(gid)))
         return (f"Goal #{gid} cancelled." if ok
                 else f"No active goal #{gid} found.")
@@ -2551,7 +2672,7 @@ async def _exec_manage_goals(hass: HomeAssistant, args: dict) -> str:
         if gid is None:
             return "status needs goal_id."
         g = await hass.async_add_executor_job(lambda: goals.get(int(gid)))
-        if not g:
+        if not g or await _jh_not_mine(hass, g):
             return f"No goal #{gid}."
         lines = [f"Goal #{g['id']} [{g['status']}] {g['title']} — {g['outcome']}"]
         for s in g["steps"]:
@@ -2562,6 +2683,9 @@ async def _exec_manage_goals(hass: HomeAssistant, args: dict) -> str:
             lines.append(f"  Result: {g['last_result']}")
         return "\n".join(lines)
     rows = await hass.async_add_executor_job(goals.active)
+    _jh_mine = await _jh_limited_caller(hass)
+    if _jh_mine is not None:
+        rows = [g for g in rows if g.get("user_id") == _jh_mine]
     if not rows:
         return "No active goals."
     lines = ["Active goals:"]
@@ -2623,9 +2747,41 @@ async def _exec_calendar_agenda(hass: HomeAssistant, args: dict) -> str:
         return json.dumps({"error": str(exc)})
 
 
+# Jarvis Home patch (2026-11-05): email is written by strangers. Once read_email ran, only the
+# read-only tools below work for the rest of that request, so text in a mail can never drive the
+# home, store a memory, schedule anything or send data out. An allowlist, so new tools start blocked.
+import contextvars as _contextvars
+_MAIL_TAINT = _contextvars.ContextVar("jarvis_mail_taint", default=None)
+_MAIL_SAFE_TOOLS = frozenset({"read_email", "calendar_agenda", "weather_forecast", "get_home_summary",
+                              "get_entity_state", "search_entities", "get_area_devices", "energy_status",
+                              "energy_usage", "cognitive_status", "connectivity_status", "activity_history"})
+
+
+def _jh_opt(hass, key: str) -> bool:
+    """Jarvis Home patch (2026-11-05): on/off switches from the JARVIS Core settings, on by default."""
+    try:
+        from . import jarvis_config
+        from .directive_helper import get_entry
+        return bool(jarvis_config.runtime_get(hass, get_entry(hass), key, True))
+    except Exception:
+        return True
+
+
+def _mail_guard(tool_name: str) -> Optional[str]:
+    state = _MAIL_TAINT.get()
+    if not state or not state.get("read") or tool_name in _MAIL_SAFE_TOOLS:
+        return None
+    _LOGGER.warning("JARVIS: blocked tool %s after read_email in the same request", tool_name)
+    return json.dumps({"error": "Blocked for safety: email was read in this request, so no actions are allowed. "
+                                "Tell the user nothing was changed and to ask for the action in a new message."})
+
+
 async def _exec_read_email(hass: HomeAssistant, args: dict) -> str:
     """Mail Agent — read-only inbox access (v6.81.0)."""
     try:
+        _mail_state = _MAIL_TAINT.get()
+        if _mail_state is not None:
+            _mail_state["read"] = True
         from . import mail
         limit = int(args.get("limit", 5) or 5)
         unread_only = bool(args.get("unread_only", False))
@@ -2657,9 +2813,79 @@ async def _exec_energy_status(hass: HomeAssistant, args: dict) -> str:
         from . import energy
         states = {state.entity_id: state for state in hass.states.async_all()}
         res = await hass.async_add_executor_job(energy.power_status, None, states)
+        if res.get("watts") is None:   # Jarvis Home patch (2026-11-10): no whole-house meter - what the devices draw now
+            res["devices_now"] = await energy.jh_devices_power_now(hass)
         return json.dumps(res)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
+
+
+async def _exec_energy_usage(hass: HomeAssistant, args: dict) -> str:
+    """Jarvis Home patch (2026-11-08): energy used over a period, from Home Assistant's Energy dashboard (recorder statistics).
+    Says what the figure covers: without a grid meter on the dashboard it is only the monitored devices, never the house."""
+    try:
+        from datetime import timedelta
+        from homeassistant.util import dt as dt_util
+        from homeassistant.components.energy.data import async_get_manager
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.statistics import statistics_during_period
+        period = str(args.get("period") or "this_month").strip().lower().replace(" ", "_")
+        now = dt_util.now()
+        day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if period == "today":
+            start, end = day, now
+        elif period == "yesterday":
+            start, end = day - timedelta(days=1), day
+        elif period == "this_week":
+            start, end = day - timedelta(days=day.weekday()), now
+        elif period == "last_week":
+            end = day - timedelta(days=day.weekday())
+            start = end - timedelta(days=7)
+        elif period == "last_month":
+            end = day.replace(day=1)
+            start = (end - timedelta(days=1)).replace(day=1)
+        elif period == "this_year":
+            start, end = day.replace(month=1, day=1), now
+        else:
+            period, start, end = "this_month", day.replace(day=1), now
+        prefs = (await async_get_manager(hass)).data or {}
+        grid_ids = []
+        for source in prefs.get("energy_sources") or []:
+            if source.get("type") != "grid":
+                continue
+            for flow in source.get("flow_from") or []:
+                if flow.get("stat_energy_from"):
+                    grid_ids.append(flow["stat_energy_from"])
+            if source.get("stat_energy_from"):
+                grid_ids.append(source["stat_energy_from"])
+        devices = [(d["stat_consumption"], d.get("name")) for d in prefs.get("device_consumption") or []
+                   if d.get("stat_consumption")]
+        ids = set(grid_ids) | {sid for sid, _ in devices}
+        if not ids:
+            return json.dumps({"error": "the Energy dashboard has no energy sensors, so Home Assistant records no consumption"})
+        stats = await get_instance(hass).async_add_executor_job(
+            statistics_during_period, hass, dt_util.as_utc(start), dt_util.as_utc(end), ids, "hour", None, {"change"})
+        used = {sid: sum((row.get("change") or 0) for row in (stats or {}).get(sid, [])) for sid in ids}
+
+        def label(sid, name):
+            state = hass.states.get(sid)
+            return name or (state.attributes.get("friendly_name") if state else None) or sid
+
+        rows = sorted(({"name": label(sid, name), "kwh": round(used.get(sid, 0), 2)} for sid, name in devices),
+                      key=lambda r: -r["kwh"])
+        result = {"period": period, "from": start.isoformat(timespec="minutes"), "to": end.isoformat(timespec="minutes"),
+                  "unit": "kWh", "biggest_users": [r for r in rows if r["kwh"] > 0][:8]}
+        if grid_ids:
+            result.update(total_kwh=round(sum(used.get(s, 0) for s in grid_ids), 2),
+                          covers="the whole house (the grid meter on the Energy dashboard)",
+                          monitored_devices_kwh=round(sum(r["kwh"] for r in rows), 2))
+        else:
+            result.update(total_kwh=round(sum(r["kwh"] for r in rows), 2),
+                          covers=("only the %d monitored devices on the Energy dashboard; there is no whole-house meter, "
+                                  "so the household's real total is higher" % len(rows)))
+        return json.dumps(result)
+    except Exception as exc:
+        return json.dumps({"error": "energy usage could not be read: %s" % exc})
 
 
 async def _exec_hazard_report(hass: HomeAssistant, args: dict) -> str:
@@ -2980,6 +3206,9 @@ async def _exec_usual_times(hass: HomeAssistant, args: dict) -> str:
         rows = await hass.async_add_executor_job(cognition.presence_schedule, hass)
     except Exception as exc:
         return json.dumps({"error": str(exc), "learned": False})
+    _jh_mine = await _jh_limited_caller(hass)
+    if _jh_mine is not None:
+        rows = _jh_own_presence(hass, _jh_mine, rows)
     if who:
         rows = [r for r in rows
                 if who in str(r.get("entity_id", "")).lower()
@@ -3145,6 +3374,7 @@ _TOOL_MAP = {
     "system_diagnostics":  _exec_system_diagnostics,
     "set_mode":            _exec_set_mode,
     "energy_status":       _exec_energy_status,
+    "energy_usage":        _exec_energy_usage,
     "hazard_report":       _exec_hazard_report,
     "activity_history":    _exec_activity_history,
     "weather_forecast":    _exec_weather_forecast,
@@ -3177,6 +3407,9 @@ async def _execute_tool(
     user_input: Optional[Any] = None,
 ) -> str:
     """Execute a tool call — custom tools first, then HA LLM API fallback."""
+    _blocked = await _jh_denied(hass, tool_name, user_input) or _mail_guard(tool_name)
+    if _blocked:
+        return _blocked
     # Custom JARVIS tools
     if tool_name in _TOOL_MAP:
         try:
@@ -3595,7 +3828,7 @@ CAPABILITY_GROUPS: dict = {
     "home_state":  {"get_entity_state", "search_entities", "get_area_devices",
                     "get_home_summary", "activity_history"},
     "diagnostics": {"system_diagnostics", "cognitive_status", "connectivity_status",
-                    "energy_status", "activity_history", "get_entity_state", "root_cause"},
+                    "energy_status", "energy_usage", "activity_history", "get_entity_state", "root_cause"},
     "research":    {"web_research", "search_documents", "search_entities"},
     "environment": {"weather_forecast", "hazard_report"},
 }
@@ -3858,6 +4091,9 @@ async def _run_delegated(hass, args: dict, *, persona: str, provider_name: str,
                          api_key: str, model: str, base_url, config, depth: int) -> str:
     """Run one ephemeral sub-agent for a delegated objective. Returns a JSON
     string (result or error) for the parent's tool-result slot. Never raises."""
+    _blocked = _mail_guard("delegate_task")
+    if _blocked:
+        return _blocked
     objective = str(args.get("objective", "")).strip()
     capability = str(args.get("capability", "")).strip()
     profile = str(args.get("profile", "")).strip()
@@ -3941,6 +4177,8 @@ async def _run_delegated(hass, args: dict, *, persona: str, provider_name: str,
         else:
             import contextlib as _ctxlib
             _ctx = _ctxlib.nullcontext()
+        _jh_box = []
+        _jh_tok = _JH_SUB.set(_jh_box)
         with _ctx:
             result = await run_agent(
                 hass,
@@ -3950,7 +4188,8 @@ async def _run_delegated(hass, args: dict, *, persona: str, provider_name: str,
                 allowed_tools=allowed, max_iterations=turns, depth=depth + 1,
                 extra_directive=directive,
             )
-        out = {"objective": objective, "result": result}
+        _JH_SUB.reset(_jh_tok)
+        out = {"objective": objective, "result": result, "jh_tools": _jh_sub_report(_jh_box)}
         if profile:
             out["profile"] = label
         else:
@@ -4048,6 +4287,612 @@ def _emit_provider_failure_shadow(*, recovered: bool) -> None:
         pass
 
 
+# Jarvis Home patch (2026-11-05): the local model sometimes says it is doing something without calling
+# a tool (issue #413). Such a first reply is sent back once: call the tool, or say it cannot be done.
+import re as _re
+_PROMISE_NUDGE = ("This is a command for a device and you called no tool, so nothing has happened. Call search_entities or the right tool now "
+                  "and answer from its result. If no tool can do it or no such device exists, say so plainly.")
+# Jarvis Home patch (2026-11-10): an energy or power figure needs a reading in this request. Earlier answers in the chat are out
+# of date (1.0.3 repeated "64.01 kWh this month" from two days before, with no tool call). A figure the person said is fine.
+_JH_LIVE_NUDGE = ("You gave an energy or power figure without reading it in this request. Earlier answers in this chat are out of date. "
+                  "Call energy_status (the power right now) or energy_usage (energy used over a period) and answer from its result.")
+_JH_FIGURE_RE = _re.compile(r"(\d[\d.,]*)\s*(?:kwh|kilowatt[- ]hours?|kw|kilowatts?|w|watts?)\b", _re.I)
+
+
+def _jh_live_figure(text: str, said: str) -> bool:
+    """The reply gives an energy or power figure that the person did not say themselves."""
+    theirs = {m.group(1) for m in _JH_FIGURE_RE.finditer(said or "")}
+    return any(m.group(1) not in theirs for m in _JH_FIGURE_RE.finditer(text or ""))
+
+
+# Jarvis Home patch (2026-11-05): the floor plan is the true room list, read live from the JARVIS config.
+def _floor_rooms(hass) -> list:
+    try:
+        with open(hass.config.path("jarvis", "config.json"), encoding="utf-8") as fh:
+            raw = json.load(fh).get("floor_plan_rooms") or {}
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        names = []
+        for floor in raw.values():
+            for room in (floor.get("rooms") or []):
+                # Jarvis Home patch (2026-11-07): the panel's room list leaves out outdoor zones and stairs too, and case and
+                # spaces do not make another room
+                if (room.get("type") not in ("door", "outdoor", "stairs") and str(room.get("name") or "").strip()
+                        and room["name"].strip().casefold() not in [n.casefold() for n in names]):
+                    names.append(room["name"].strip())
+        return names
+    except Exception:
+        return []
+
+
+def _rooms_note(hass, rooms: list) -> str:
+    if not rooms:
+        return ""
+    from homeassistant.helpers import area_registry as _ar
+    _jh_rooms = {r.strip().casefold() for r in rooms}
+    labels = [a.name for a in _ar.async_get(hass).async_list_areas() if a.name.strip().casefold() not in _jh_rooms]
+    note = f"\n\nRooms in this home, from the floor plan ({len(rooms)}): {', '.join(rooms)}. This is the true room list."
+    if labels:
+        note += f" {', '.join(labels)} are Home Assistant labels, not rooms: never count or name them as rooms."
+    return note
+
+
+# Jarvis Home patch (2026-11-05): counts and heater states come from code, the model is unreliable at both.
+def _live_facts(hass) -> str:
+    from .local_engine import _jh_heaters, _jh_is_setting
+    lights = [s for s in hass.states.async_all("light") if not _jh_is_setting(hass, s.entity_id)]
+    on = [s.attributes.get("friendly_name", s.entity_id) for s in lights if s.state == "on"]
+    out = [f"Exact facts, use these numbers: {len(lights)} lights in total, {len(on)} on" + (f" ({', '.join(on)})." if on else ".")]
+    switches, climates = _jh_heaters(hass)
+    heat = [f"{s.attributes.get('friendly_name', s.entity_id)}: {s.state}" for s in switches]
+    for s in climates:
+        action = s.attributes.get("hvac_action")
+        detail = (f"{s.state}, {action}" if action else
+                  "powered on, heat level unknown, it may not be producing heat" if s.state in ("heat", "heat_cool", "auto") else s.state)
+        heat.append(f"{s.attributes.get('friendly_name', s.entity_id)}: {detail}")
+    if heat:
+        out.append("Heaters: " + "; ".join(heat) + ".")
+    return " ".join(out)
+
+
+_JH_OFFER_RE = _re.compile(r"^\W*(?:(?:and|also|so)\W+)?(?:sir\W+)?(?:how (?:may|can) i|what (?:else )?can i|would you like|shall i|do you want me|let me know|anything else|is there anything|feel free)", _re.I)
+
+
+def _jh_trim_offer(text: str, keep: bool = False) -> str:
+    """Jarvis Home patch: drop closing sentences that are only an offer of help, and keep everything else as
+    written. keep=True when a tool is waiting for confirmation, because then the closing question is the point."""
+    text = (text or "").strip()
+    while not keep:
+        last = None
+        for last in _re.finditer(r"(?<=[.!?])\s+", text):
+            pass
+        if last is None or not _JH_OFFER_RE.search(text[last.end():]):
+            break
+        text = text[:last.start()]
+    return text
+
+
+# Jarvis Home patch (2026-11-06): the login behind this request, shared with delegated sub-agents.
+_JH_CALLER = _contextvars.ContextVar("jarvis_caller", default=None)
+# What any logged-in household member may use: device control, questions, reminders. An allowlist, so a new tool
+# starts as admin only. Home Assistant's own Assist tools keep their own rules. Voice with no login is not limited.
+_JH_HOUSEHOLD_TOOLS = frozenset({
+    "control_device", "bulk_control", "execute_plan", "run_scene_or_script",
+    "get_entity_state", "search_entities", "get_area_devices", "get_home_summary",
+    "remember", "cognitive_status", "connectivity_status", "review_suggestions", "root_cause",
+    "schedule_followup", "manage_followups", "create_goal", "update_goal", "manage_goals",
+    "web_research", "delegate_task", "calendar_agenda", "weather_forecast", "energy_status", "energy_usage",
+    "hazard_report", "activity_history", "who_do_you_see", "where_last_seen", "usual_times",
+    "look_at_camera", "search_documents", "dismiss_intrusion", "acknowledge_alert"})
+
+
+async def _jh_denied(hass, tool_name: str, user_input) -> Optional[str]:
+    """Refuse an admin tool for a logged-in non-admin. Fails closed when the user cannot be read."""
+    if tool_name not in _TOOL_MAP or tool_name in _JH_HOUSEHOLD_TOOLS:
+        return None
+    uid = _JH_CALLER.get() or getattr(getattr(user_input, "context", None), "user_id", None)
+    if not uid:
+        return None
+    try:
+        user = await hass.auth.async_get_user(uid)
+    except Exception:
+        user = None
+    if user is not None and user.is_admin:
+        return None
+    _LOGGER.warning("JARVIS: blocked admin tool %s for a non-admin login", tool_name)
+    return json.dumps({"error": "Not allowed: this needs an administrator login. Nothing was read or changed. "
+                                "Tell the user so plainly."})
+
+
+# Jarvis Home patch (2026-11-06, round 3): what a reply may claim depends on what the tools really did in this request.
+# The rule set is small on purpose, after word lists for state claims kept replacing good answers:
+#  - A device command (local_engine.device_command) needs a device tool that worked behind its reply. A reply is judged by its
+#    first sentence: unless that is a question or states a failure it counts as a claim, in any wording, whatever follows it:
+#    one retry, then the honest fixed line.
+#  - Anything else is ordinary chat and is never retried or replaced, whatever it says. A false statement there is for the
+#    persona and the live facts to prevent. This check does not catch it.
+#  - Failures are kept per acting tool, so one success cannot hide another tool's failure. A failed read on a question
+#    gets the honest line instead of an answer with nothing behind it.
+#  - A tool waiting for confirmation has changed nothing, so a reply that says otherwise gets the honest waiting line.
+_JH_ACT_TOOLS = frozenset({
+    "control_device", "bulk_control", "execute_plan", "run_scene_or_script", "set_mode", "delegate_task",
+    "remember", "ignore_entity", "unignore_entity", "manage_autonomy", "approve_suggestion", "dismiss_suggestion",
+    "create_automation", "schedule_followup", "manage_followups", "create_goal", "update_goal", "manage_goals",
+    "dismiss_intrusion", "acknowledge_alert", "ingest_documents"})
+# Only these move a device, so only these can back a reply to a device command. Home Assistant's own tools count too (Hass*
+# actions, and scripts it exposes as tools), except the ones that keep a timer or a list or only talk.
+_JH_DEVICE_TOOLS = frozenset({"control_device", "bulk_control", "execute_plan", "run_scene_or_script"})
+# Jarvis Home patch (2026-11-07): whole words of the tool name, so a script called kitchen_playlist is still a device tool.
+_JH_NOT_DEVICE_WORDS = frozenset("timer timers list lists todo shopping calendar broadcast nevermind respond".split())
+
+
+def _jh_not_device(name: str) -> bool:
+    """Home Assistant tools that keep a timer or a list or only talk: HassStartTimer, HassListAddItem, HassBroadcast."""
+    words = _re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name).lower().replace("_", " ").replace("-", " ").split()
+    return any(w in _JH_NOT_DEVICE_WORDS for w in words)
+# Filled by delegate_task: the state of each sub-agent run, so the parent knows what its tools really did.
+_JH_SUB = _contextvars.ContextVar("jarvis_sub_agents", default=None)
+# These look things up in the world, not in this house: an answer from memory after one failed is still an answer.
+_JH_NOT_LIVE = frozenset({"web_research", "search_documents"})
+_JH_TOOL_WORDS = {"control_device": "the device", "bulk_control": "the group command", "execute_plan": "the plan",
+                  "run_scene_or_script": "the scene", "remember": "the note", "schedule_followup": "the follow-up",
+                  "create_goal": "the goal", "update_goal": "the goal"}
+_JH_CANNOT_RE = _re.compile(
+    r"\b(?:no such|not found|cannot|can['’]?t|could not|couldn['’]?t|unable|not able|not allowed|no device"
+    r"|does(?: not|n['’]?t) exist|(?:do not|don['’]?t) have|(?:did not|didn['’]?t) (?:work|go through|respond|change|confirm)"
+    r"|not confirmed|unconfirmed|(?:has not|hasn['’]?t) (?:confirmed|responded)|failed|nothing was changed|unavailable|offline"
+    r"|there(?: is|['’]s) no|i (?:see|find) no|niet gelukt|lukt niet|kan niet|kan geen|niet gevonden|mislukt|niet beschikbaar)\b", _re.I)
+# Figures of speech with a failure word in them. They say nothing about the action.
+_JH_IDIOM_RE = _re.compile(
+    r"\b(?:cannot|can['’]?t) (?:wait|complain|be too|help but|thank)\b|\bthere(?: is|['’]s) no (?:need|rush|problem|trouble|doubt|hurry)\b"
+    r"|\b(?:do not|don['’]?t) have to\b", _re.I)
+# A reply that waits for the person. "confirmed" is left out on purpose: that word claims the opposite.
+_JH_WAIT_RE = _re.compile(
+    r"\b(?:confirm|confirmation|bevestig\w*|bevestiging|bestätig\w*|approval|approve|go[- ]ahead|permission|toestemming|waiting|awaiting|wacht\w*"
+    r"|say yes|say the word)\b", _re.I)
+_JH_ALREADY_RE = _re.compile(r"\b(?:already|al|reeds|schon|bereits)\b", _re.I)
+_JH_TOOLS_NUDGE = ("A tool you called in this request changed nothing or reported a failure, so do not say it is done. "
+                   "Call the right tool now if one can do it, or say plainly what did not happen and why.")
+
+
+async def _jh_turn(hass, user_input) -> tuple:
+    """(is this a device command, is this a question), from the words the person really used."""
+    try:
+        from .local_engine import _load_learned_aliases, device_command, is_question
+        text = getattr(user_input, "text", "") or ""
+        aliases = await hass.async_add_executor_job(_load_learned_aliases, hass)
+        return device_command(hass, text, aliases), is_question(text)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: could not sort this turn: %s", exc)
+        return False, False
+
+
+def _jh_new_state() -> dict:
+    """changed: any acting tool worked. device: a device tool worked. waiting: what is waiting for confirmation.
+    step: which round of tool calls this is, because a call in the same round cannot be a correction of its neighbour."""
+    st = {"acted": False, "changed": False, "device": False, "waiting": [], "read": False, "read_failed": False, "bad": {}, "step": 0}
+    box = _JH_SUB.get()
+    if box is not None:
+        box.append(st)
+    return st
+
+
+def _jh_sub_report(box: list) -> dict:
+    """What the tools of a delegated run really did, for the parent's check."""
+    return {"changed": any(s["changed"] for s in box), "device": any(s["device"] for s in box),
+            "waiting": [w for s in box for w in s["waiting"]], "bad": {k: b for s in box for k, b in s["bad"].items()}}
+
+
+def _jh_label(name: str, args, data, hass) -> str:
+    """What to call this action in a reply: the device's own name when there is one."""
+    args = args if isinstance(args, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    eid = args.get("entity_id") or data.get("entity_id")
+    if isinstance(eid, str) and eid:
+        st = hass.states.get(eid) if hass is not None else None
+        return (st.attributes.get("friendly_name") if st else None) or eid
+    if isinstance(args.get("name"), str) and args["name"]:
+        return args["name"]
+    return _JH_TOOL_WORDS.get(name) or "the " + name.replace("_", " ")
+
+
+def _jh_target(args) -> str:
+    eid = args.get("entity_id") if isinstance(args, dict) else None
+    return eid if isinstance(eid, str) else ""
+
+
+def _jh_corrects(bad: dict, name: str, args, step: int) -> bool:
+    """Does this success, in a later round, put right that wrong id or tool name? Same tool and action, and the same kind of
+    device or the same device under another domain. The fan is not put right by a lamp that also had to go on."""
+    if not bad["soft"] or bad["step"] >= step:
+        return False
+    if bad["tool"] is None:
+        return True   # a tool name that does not exist
+    action = args.get("action") if isinstance(args, dict) else None
+    if bad["tool"] != name or bad["action"] != action:
+        return False
+    old, new = bad["target"], _jh_target(args)
+    return not old or not new or old.split(".")[0] == new.split(".")[0] or old.split(".")[-1] == new.split(".")[-1]
+
+
+def _jh_note_tool(st: dict, name: str, result, args=None, hass=None) -> None:
+    """Record what one finished tool call really means, per tool. Only a tool that can change something and did not
+    report a failure counts as changed. Hass* tools are Home Assistant's own actions, Get* its reads."""
+    st["acted"] = True
+    low = name.lower()
+    acting = name in _JH_ACT_TOOLS or (name not in _TOOL_MAP and not low.startswith("get")
+                                       and not low.startswith("hassget") and "_get_" not in low)
+    device = name in _JH_DEVICE_TOOLS or (acting and name not in _TOOL_MAP and not _jh_not_device(name))
+    raw = result if isinstance(result, str) else str(result)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        data = None
+    label = _jh_label(name, args, data, hass)
+    key = f"{name}:{label}"
+
+    def bad(kind, what=label, where=key, soft=False, tool=name):
+        st["bad"][where] = {"what": what, "kind": kind, "soft": soft, "tool": tool, "step": st["step"], "target": _jh_target(args),
+                            "action": args.get("action") if isinstance(args, dict) else None}
+
+    failed = False
+    if isinstance(data, dict):
+        sub = data.get("jh_tools")
+        if name == "delegate_task" and isinstance(sub, dict):
+            # A delegate is worth what its own tools did: a read-only run backs nothing.
+            st["changed"] = st["changed"] or bool(sub.get("changed"))
+            st["device"] = st["device"] or bool(sub.get("device"))
+            st["waiting"] += sub.get("waiting") or []
+            st["bad"].update(sub.get("bad") or {})
+            return
+        status = str(data.get("status", "")).lower()
+        if status in ("awaiting_confirmation", "needs_confirmation") or data.get("needs_confirmation"):
+            st["waiting"].append(label)
+            return
+        if data.get("confirmed") is False and data.get("sent"):
+            bad("unconfirmed")
+            if data.get("in_progress") and str(data.get("new_state") or "").lower() in _TRANSITIONAL:
+                # Jarvis Home patch (2026-11-07, round 2): the state that was read stays with it, so "is opening" can stand
+                st["bad"][key].update(kind="moving", state=str(data["new_state"]).lower())
+            return
+        intent = data.get("data") if isinstance(data.get("data"), dict) else {}
+        if name == "execute_plan" and data.get("failed"):
+            steps = [r for r in data.get("results") or [] if isinstance(r, dict) and not r.get("ok")]
+            for r in steps or [{}]:
+                bad("failed", str(r.get("description") or label)[:60], f"{key}:{r.get('step')}")
+            st["changed"] = st["changed"] or bool(data.get("succeeded"))
+            st["device"] = st["device"] or bool(data.get("succeeded"))
+            return
+        if name == "bulk_control" and data.get("count") and data.get("count") < (data.get("total") or 0):
+            bad("failed", f"{data['total'] - data['count']} of the {data['total']} devices")
+            st["changed"] = st["device"] = True
+            return
+        if intent.get("failed") and intent.get("success"):
+            # Home Assistant fills both lists when only some targets failed.
+            gone = [str(t.get("name") or t.get("id") or "a device") if isinstance(t, dict) else str(t) for t in intent["failed"]]
+            bad("failed", _jh_join(gone))
+            st["changed"] = True
+            st["device"] = st["device"] or device
+            return
+        failed = bool(data.get("error") or data.get("success") is False or data.get("response_type") == "error"
+                      or (name == "bulk_control" and not data.get("count"))
+                      or (name == "execute_plan" and not data.get("succeeded"))
+                      or bool(intent.get("failed")))
+    elif isinstance(data, list) and data and all(isinstance(x, dict) and x.get("error") for x in data):
+        failed = True   # Jarvis Home patch (2026-11-07): every entity asked for came back with an error, so nothing was read
+    else:
+        failed = raw.strip().lower().startswith(("error", "failed", "blocked", "unknown tool", "couldn't", "could not"))
+    if failed:
+        if acting:
+            # A wrong id or tool name stays a failure until a later call puts that same request right.
+            low_raw = raw.lower()
+            unknown = "unknown tool" in low_raw
+            bad("failed", soft=unknown or "not found" in low_raw, tool=None if unknown else name)
+        elif name not in _JH_NOT_LIVE:
+            st["read_failed"] = True
+    elif acting:
+        st["changed"] = True
+        st["device"] = st["device"] or device
+        st["bad"].pop(key, None)
+        for where, was in list(st["bad"].items()):
+            if _jh_corrects(was, name, args, st["step"]):
+                del st["bad"][where]
+    else:
+        st["read"] = True
+        st["read_failed"] = False
+
+
+def _jh_failures(st: dict) -> list:
+    return list(st["bad"].values())
+
+
+def _jh_join(words: list) -> str:
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def _jh_what_failed(st: dict, honorific: str) -> str:
+    """The line that names what did not work."""
+    gone = [b["what"] for b in _jh_failures(st) if b["kind"] == "failed"]
+    silent = [b["what"] for b in _jh_failures(st) if b["kind"] == "unconfirmed"]
+    parts = ([f"{_jh_join(gone)} did not go through"] if gone else []) + ([f"{_jh_join(silent)} has not confirmed it"] if silent else [])
+    parts += [f"{b['what']} is still {b['state']}" for b in _jh_failures(st) if b["kind"] == "moving"]   # round 2
+    line = " and ".join(parts)
+    return f"{line[:1].upper()}{line[1:]}, {honorific}."
+
+
+def _jh_first(text: str) -> str:
+    """The opening sentence: what a reply says first is what it says. A closing question or remark excuses nothing."""
+    return _re.split(r"(?<=[.!?;])\s+|\n+|\s+[-–—]+\s+", (text or "").strip(), maxsplit=1)[0].strip()
+
+
+# Jarvis Home patch (2026-11-07): "Done, sir, anything else?" is one sentence that ends in a question mark, and it still claims.
+_JH_CLOSING_RE = _re.compile(r"^\W*(?:(?:and|also|so|en|ook)\W+)?(?:(?:sir|meneer|mevrouw)\W+)?(?:how (?:may|can) i|what (?:else )?can i"
+                             r"|let me know|anything else|is there anything|feel free|(?:would you like|do you need|need) anything"
+                             # Jarvis Home patch (2026-11-07, round 2): Dutch closings
+                             r"|(?:verder |anders )?nog iets|kan ik (?:je |u )?(?:nog |verder )?(?:iets|ergens|mee helpen|helpen)"
+                             r"|laat (?:het )?(?:me|maar) weten)", _re.I)
+_JH_QOPEN_RE = _re.compile(r"^\W*(?:(?:very well|certainly|of course|right|ok(?:ay)?|sir|yes|no)\W+)*(?:shall|should|would|will|do|does|did"
+                           r"|can|could|may|is|are|was|were|which|what|how|where|when|who|why|zal|wil|moet|kan|welke|wat|hoe)\b", _re.I)
+_JH_CLAIM_RE = _re.compile(r"\b(?:done|switched|turned|set|locked|unlocked|opened|closed|dimmed|activated|started|stopped|changed"
+                           r"|(?:is|are)\s+(?:now\s+)?(?:on|off|open|closed|locked|unlocked)"
+                           # Jarvis Home patch (2026-11-07, round 2 + 3 + 4): Dutch claims, "is (nu) aan" too, but not "het is
+                           # aan u". An -ing word is read by _jh_ing_claims: "Before turning anything on" claims nothing.
+                           r"|(?:staat|staan|gaat|gaan|is|zijn)\s+(?:nu\s+)?(?:aan|uit|open|dicht)(?!\s+(?:u|jou|mij)\b)"
+                           r"|(?:aan|uit)gezet|(?:aan|uit)gedaan"
+                           r"|(?:in|uit)geschakeld|geopend|gesloten|vergrendeld|ontgrendeld|gedimd|gedaan|geregeld|op slot)\b", _re.I)
+_JH_QWORD_RE = _re.compile(r"\b(?:which|what|how|when|where|who|whom|whose|why|welke|welk|wat|hoeveel|hoe|wanneer|waar|wie"
+                           r"|waarom)\b", _re.I)
+# Jarvis Home patch (2026-11-07, round 3 + 4): an -ing device word claims ("Turning the heater on now", "the heater's turning on",
+# "I'll be switching it on", "I have begun turning it on"), unless the word just before it makes it none: "Before turning anything
+# on", "To avoid switching the wrong one", "Without changing anything", "At the current setting of 20", "instead of", "the setting".
+# An offer is no claim either ("I can try turning it on again", "I'd suggest switching"), nor is a "not" or "never" in the two words
+# before it ("I am not changing anything yet", "I won't be switching anything"). "I tried switching" is not let off: it says so.
+_JH_ING_WORDS = (r"(?:turning|switching|opening|closing|locking|unlocking|dimming|brightening|setting|starting|stopping|activating"
+                 r"|deactivating|arming|disarming|raising|lowering|adjusting|changing)\b")
+_JH_ING_RE = _re.compile(r"(?:\b([\w'’]+)\W+)?(?:\b([\w'’]+)\W+)?\b" + _JH_ING_WORDS, _re.I)
+_JH_ING_NOT = frozenset("before after without avoid about of by for from the current a an your its this "   # "your setting"
+                        "try suggest recommend consider".split())
+# round 5: "help with switching", "rather than switching", "instead of me switching" claim nothing; "going ahead with switching",
+# "proceeding with switching" and "no sooner said than switching" still claim, so these words count only after the word before them
+_JH_ING_PAIRS = frozenset({("help", "with"), ("helping", "with"), ("assist", "with"), ("assisting", "with"), ("rather", "than"),
+                           ("of", "me"), ("without", "me")})
+# Jarvis Home patch (2026-11-08, round 5): "setting" is a noun ("The thermostat setting is 20", "the highest setting") unless an
+# object or "to" follows it ("setting it / the heater / up", "Setting Living Room Heater to 21") or a pronoun or a form of be,
+# have or will comes just before it ("I am setting", "I'll be setting"). "Before I start changing anything" claims nothing: I or we
+# and start or begin, right after before, until, when, if, once, after or unless ("We start turning it on" still claims).
+_JH_SET_VERB_BEFORE = frozenset("am is are was were be been being i we you they he she i'm im we're you're they're he's she's it's "
+                                "that's i'll we'll you'll it'll they'll i've we've i'd we'd now just also still already".split())
+_JH_SET_OBJECT_RE = _re.compile(r"\W+(?:it|them|him|her|the|a|an|up|to|this|that|these|those|your|my|our|their|his|all|both|every"
+                                r"|each|everything|now)\b", _re.I)
+_JH_TO_RE = _re.compile(r"\bto\b", _re.I)
+# ... and only with a word before it and nothing, a form of be, "of" or "'s" after it ("The thermostat setting is 20", "the highest
+# setting"): a clipped "Setting heater at 21", "Setting 21 degrees" or "Setting things up" is a claim
+_JH_SET_NOUN_AFTER_RE = _re.compile(r"\W*$|\s+(?:is|was|are|were|of|has|had|stays|remains)\b|['’]s\b", _re.I)
+_JH_SUB_END_RE = _re.compile(r"\b(?:before|until|till|when|whenever|if|once|after|unless)\W*$", _re.I)
+# A clause that is only an address: "Set to which temperature, sir?"
+_JH_ADDRESS_RE = _re.compile(r"\W*(?:sir|madam|ma['’]am|meneer|mevrouw)\W*", _re.I)
+# A clause that only says please, or only lists choices: "Set to which temperature, sir, please?", "..., sir, 20 or 22?". The words
+# before a list of choices may be more choices: "..., sir, 20, 21 or 22?"
+_JH_PLEASE_RE = _re.compile(r"\W*(?:please|alstublieft|alsjeblieft|graag)\W*", _re.I)
+# Jarvis Home patch (2026-11-08, round 5): the edges never take a character a choice may hold, so a failed match cannot backtrack
+# over a long run of quotes, dots or hyphens (that took seconds), and a clause of more than 100 characters is no list of choices.
+_JH_CHOICES_RE = _re.compile(r"[^\w'’°%.-]*(?:[\w'’°%.-]+\s+){0,3}[\w'’°%.-]+\s+(?:or|of)\s+(?:[\w'’°%.-]+\s+){0,3}[\w'’°%.-]+"
+                             r"(?:\s+(?:please|sir|madam|meneer|mevrouw|alstublieft))?[^\w'’°%.-]*", _re.I)
+_JH_ITEM_RE = _re.compile(r"[^\w'’°%.-]*[\w'’°%.-]+(?:\s+[\w'’°%.-]+){0,2}[^\w'’°%.-]*")
+_JH_CHOICES_MAX = 100
+# A condition says nothing about the device now: "When it is on, sir, shall I set it to 21?", "If the door is open, ...?"
+# Jarvis Home patch (2026-11-08, round 5): only the state of the condition's own subject is let off, right after if, when or once:
+# a pronoun, an article and up to three words, or a name and up to two more words. "Once again the heater is on" and "As soon as
+# you asked the heater is on" still claim. _jh_problem lets a condition off only when no tool reported a failure.
+_JH_COND_WHO = (r"(?:it|they|this|that|these|those|both|all|everything|het|ze|die|dat|dit|deze|alles|beide"
+                r"|(?:the|a|an|my|your|our|its|their|this|that|these|those|any|all|both|every|each|de|het|een|mijn|uw|je|jouw|onze"
+                r"|ons|alle|elke|deze|dit)(?:\s+[\w'’-]+){1,3}?|(?-i:[A-Z][A-Za-z0-9])[\w'’-]*(?:\s+[\w'’-]+){0,2}?)")
+_JH_COND_STATE = r"\s+(?:is|are|staat|staan|zijn)\s+(?:now\s+|nu\s+)?(?:on|off|open|closed|locked|unlocked|aan|uit|dicht)\b"
+_JH_COND_RE = _re.compile(r"^\W*(?:(?:and|so|but|en|maar)\s+)?(?:if|when|whenever|once(?!\s+(?:again|more)\b)|as soon as|als|zodra"
+                          r"|wanneer|indien)\s+" + _JH_COND_WHO + _JH_COND_STATE
+                          + r"(?:\s+(?:and|or|en|of)\s+" + _JH_COND_WHO + _JH_COND_STATE + r")?", _re.I)
+# A short opening with what, how, when or where and then a comma is an exclamation or a lead-in, not the question: "Wat fijn,
+# meneer, de verwarming staat aan, ...?", "How lovely, the heater is on, ...?", "When you asked, I switched on the heater, ...?".
+_JH_LEADIN_RE = _re.compile(r"^\W*(?:(?:very well|certainly|of course|right|ok(?:ay)?|sir|yes|no)\W+)*(?:what|how|when|where|wat|hoe"
+                            r"|wanneer|waar)\b(?:\s+[\w'’]+){0,3}\s*[,:]", _re.I)
+
+
+def _jh_ing_claims(clause: str) -> bool:
+    """An -ing device word in this clause says it is happening, unless the word before it says otherwise."""
+    last_to = max((t.start() for t in _JH_TO_RE.finditer(clause)), default=-1)   # round 5: "Setting Living Room Heater to 21"
+    for m in _JH_ING_RE.finditer(clause):
+        near = [(w or "").lower().replace("’", "'") for w in m.groups()]   # two words back, one word back
+        if (near[1] or near[0]) in _JH_ING_NOT or any(w in ("not", "never") or w.endswith("n't") for w in near):
+            continue
+        if (near[0], near[1]) in _JH_ING_PAIRS:
+            continue   # round 5: "help with switching", "rather than switching"
+        if (near[0] in ("i", "we") and near[1] in ("start", "begin")
+                and _JH_SUB_END_RE.search(clause, max(0, m.start() - 12), m.start())):   # round 5: "Before I start changing"
+            continue
+        if (m.group(0).lower().endswith("setting") and (near[1] or near[0]) and (near[1] or near[0]) not in _JH_SET_VERB_BEFORE
+                and not _JH_SET_OBJECT_RE.match(clause, m.end()) and last_to < m.end()
+                and _JH_SET_NOUN_AFTER_RE.match(clause, m.end())):
+            continue   # round 5: "setting" is a noun here
+        return True
+    return False
+
+
+def _jh_asks(first: str) -> bool:
+    """A real question: it ends in a question mark and opens as a question, or what comes before the question claims
+    nothing and the question is more than a closing offer of help."""
+    return _jh_asks_if(first, True)
+
+
+def _jh_asks_if(first: str, cond: bool) -> bool:
+    """_jh_asks. Jarvis Home patch (2026-11-08, round 5): a condition may claim nothing only when cond is true, that is when
+    no tool reported a failure: after a failed tool "Once the heater is on, sir, shall I set it to 21?" is no honest question."""
+    if not first.endswith("?"):
+        return False
+    if (_JH_QOPEN_RE.match(first) and not _JH_LEADIN_RE.match(first)   # round 3: "Wat fijn, ..." opens no question
+            and not _JH_COND_RE.match(first)):   # round 5: nor does a condition ("When the lights are on, ...")
+        return True
+    parts = _re.split(r"[,:]\s*", first)
+    if len(parts) < 2:
+        return True
+    # Jarvis Home patch (2026-11-07, round 2 + 3 + 4): a clause that opens with a question word is the question, so a claim word
+    # inside it claims nothing ("Set to which temperature, sir?"), but only when it is the last clause or only an address, "please"
+    # or a list of choices follows it ("..., sir, 20 or 22?"). One in the middle is a relative clause: "The heater, which was off,
+    # is now on, sir, shall I set it to 21?" still claims.
+    end, listing = len(parts), False
+    while end > 1:
+        tail = parts[end - 1]
+        short = len(tail) <= _JH_CHOICES_MAX   # round 5: a long clause is no list of choices
+        if short and _JH_CHOICES_RE.fullmatch(tail):
+            listing = True
+        elif not (_JH_ADDRESS_RE.fullmatch(tail) or _JH_PLEASE_RE.fullmatch(tail)
+                  or (listing and short and _JH_ITEM_RE.fullmatch(tail) and not _JH_CLAIM_RE.search(tail))):
+            break
+        end -= 1
+    ask = end - 1 if _JH_QWORD_RE.search(" ".join(parts[end - 1].split()[:3])) else len(parts) - 1
+    # round 4 + 5: a condition claims nothing about its own subject, and only while no tool reported a failure
+    said = [_JH_COND_RE.sub(" ", p, count=1) if cond else p for p in parts[:ask]]
+    return not (_JH_CLOSING_RE.search(parts[-1]) or _JH_CLAIM_RE.search(" ".join(said)) or any(_JH_CLAIM_RE.search(p) for p in said)
+                or any(_jh_ing_claims(p) for p in said))
+
+
+# Jarvis Home patch (2026-11-07, round 2): only for a device that was read while still moving: what says it has got there.
+# "is opening" does not, "is open" does.
+_JH_ARRIVED_RE = _re.compile(r"\b(?:done|finished|complete|opened|closed|shut|locked|unlocked|secured"
+                             r"|(?:is|are|now)\s+(?:now\s+)?(?:fully\s+)?(?:open|closed|shut|locked|unlocked|secure)"
+                             r"|geopend|gesloten|dicht|vergrendeld|ontgrendeld|op slot)\b", _re.I)
+
+
+def _jh_moving_ok(first: str, st: dict) -> bool:
+    """Every failure is a device still on its way (opening, locking), and the reply names that state and no end state."""
+    bad = _jh_failures(st)
+    if not bad or any(b["kind"] != "moving" for b in bad) or _JH_ARRIVED_RE.search(first):
+        return False
+    return all(_re.search(r"\b" + _re.escape(b["state"]) + r"\b", first, _re.I) for b in bad)
+
+
+def _jh_moving_line(st: dict, honorific: str) -> str:
+    """The line for devices that were still moving when they were read: the name and the state that was read."""
+    moving = [f"{b['what']} is still {b['state']}" for b in _jh_failures(st) if b["kind"] == "moving"]
+    line = _jh_join(moving)
+    return f"{line[:1].upper()}{line[1:]}, {honorific}; {'it has' if len(moving) == 1 else 'they have'} not confirmed yet."
+
+
+def _jh_problem(text: str, st: dict, cmd: bool, asked: bool = False) -> Optional[str]:
+    """What is wrong with this reply: "failed", "waiting", "read", "empty", or None when it can stand."""
+    first = _jh_first(text)
+    if (_jh_asks_if(first, not any(b["kind"] == "failed" for b in _jh_failures(st)))   # round 5: not after a failed tool
+            or _JH_CANNOT_RE.search(_JH_IDIOM_RE.sub(" ", first))):
+        return None   # it asks, or it already says what went wrong
+    if _jh_failures(st):
+        if not _jh_moving_ok(first, st):
+            return "failed"
+        if not st["waiting"]:
+            return None   # Jarvis Home patch (2026-11-07, round 2): it says the device is still on its way, as was read
+    if st["waiting"]:
+        return None if _JH_WAIT_RE.search(first) else "waiting"
+    if asked and st["read_failed"]:
+        return "read"
+    if cmd and not st["device"] and not (st["read"] and _JH_ALREADY_RE.search(first)):
+        return "empty"
+    return None
+
+
+def _jh_nudge(text: str, st: dict, cmd: bool) -> Optional[str]:
+    """The message that sends a reply to a device command back once, or None. Ordinary chat is never sent back."""
+    if not cmd or _jh_problem(text, st, cmd) not in ("failed", "empty"):
+        return None
+    return _JH_TOOLS_NUDGE if st["acted"] else _PROMISE_NUDGE
+
+
+def _jh_final(text: str, st: dict, cmd: bool, honorific: str, asked: bool = False) -> str:
+    """Last check, when no retry is left."""
+    problem = _jh_problem(text, st, cmd, asked)
+    if problem is None:
+        return text
+    if problem == "read":
+        return f"I could not read that, {honorific}."
+    waits = _jh_join(list(dict.fromkeys(st["waiting"]))) if st["waiting"] else ""
+    waits = f"{waits[:1].upper()}{waits[1:]} is waiting for your confirmation, {honorific}." if waits else ""
+    if problem == "waiting" and _jh_failures(st):
+        # Jarvis Home patch (2026-11-07, round 3): a failure gets here only when it is a device still on its way (opening, locking).
+        # It was sent and it moves, so "Nothing has been changed yet" would be false: the moving one and the waiting one are named.
+        return f"Only part of that went through, {honorific}. {_jh_what_failed(st, honorific)} {waits}"
+    if problem == "waiting":
+        return f"Only part of that went through, {honorific}. {waits}" if st["changed"] else f"{waits} Nothing has been changed yet."
+    if problem == "failed":
+        note = f"{_jh_what_failed(st, honorific)} {waits}".rstrip()
+        if not cmd:
+            return f"{text.rstrip()} {note}"   # the reply stands, what failed is added to it
+        if st["changed"] or waits:
+            return f"Only part of that went through, {honorific}. {note}"
+        kinds = {b["kind"] for b in _jh_failures(st)}
+        if kinds == {"moving"}:
+            return _jh_moving_line(st, honorific)
+        if kinds == {"unconfirmed"}:
+            return f"The command was sent, {honorific}, but the device has not confirmed it."
+        if kinds != {"failed"}:
+            return note
+    elif st["changed"]:
+        return f"That did not reach any device, {honorific}."   # something else ran, a reminder for one
+    return f"That did not go through, {honorific}. Nothing was changed."
+
+
+# Jarvis Home patch (2026-11-06): what a logged-in non-admin may do through execute_plan. It takes any domain and service from
+# the model, so without this a plan could reach admin services. An allowlist of ordinary device verbs on the device's own domain.
+_JH_PLAN_SERVICES = frozenset({
+    "turn_on", "turn_off", "toggle", "lock", "unlock", "open", "open_cover", "close_cover", "stop_cover", "set_cover_position",
+    "media_play", "media_pause", "media_stop", "media_play_pause", "media_next_track", "media_previous_track",
+    "volume_up", "volume_down", "volume_set", "volume_mute", "set_temperature", "set_hvac_mode", "set_fan_mode", "set_preset_mode",
+    "set_percentage", "oscillate", "set_direction", "set_humidity", "start", "pause", "stop", "return_to_base", "locate",
+    "open_valve", "close_valve", "start_mowing", "dock",
+    "press", "select_option", "select_next", "select_previous", "set_value", "select_source", "play_media", "send_command"})
+# homeassistant.turn_on/off/toggle pass the call on to the device's own domain, so these are the same as asking that domain.
+_JH_PLAN_GENERIC = frozenset({"media_player", "climate", "scene", "script"})
+_JH_PLAN_REFUSED = ("Not allowed for this login: a plan may only use normal device actions on the device's own domain, "
+                    "and this step is not one of them. Nothing was changed.")
+_JH_TARGET_KEYS = frozenset({"entity_id", "area_id", "device_id", "floor_id", "label_id", "target"})
+
+
+async def _jh_limited_caller(hass) -> Optional[str]:
+    """The login behind this request when that login is limited. None for an admin, and for voice with no login."""
+    uid = _JH_CALLER.get()
+    if not uid:
+        return None
+    try:
+        user = await hass.auth.async_get_user(uid)
+    except Exception:
+        user = None
+    return None if user is not None and user.is_admin else uid
+
+
+def _jh_plan_refused(domain: str, service: str, entity_id: str) -> bool:
+    target = str(entity_id).split(".")[0]
+    if domain == "homeassistant":
+        return service not in ("turn_on", "turn_off", "toggle") or target not in _JH_ON_OFF | _JH_PLAN_GENERIC
+    if domain == "script" and target == "script" and service == str(entity_id).split(".", 1)[-1] and service != "reload":
+        return False   # script.<name> is that script's own run service
+    return domain != target or service not in _JH_PLAN_SERVICES
+
+
+def _jh_own_presence(hass, uid: str, rows: list) -> list:
+    """Only the routines of the person linked to this login: the person entity and its own trackers."""
+    own = set()
+    for st in hass.states.async_all("person"):
+        if st.attributes.get("user_id") == uid:
+            own.add(st.entity_id)
+            own.update(st.attributes.get("device_trackers") or [])
+    return [r for r in rows if r.get("entity_id") in own]
+
+
+async def _jh_not_mine(hass, row: Optional[dict]) -> bool:
+    """A limited login may only touch its own follow-ups and goals. An ownerless row is not theirs."""
+    mine = await _jh_limited_caller(hass)
+    if mine is None:
+        return False
+    owner = (row or {}).get("user_id")
+    return not row or ("?" if owner is None else owner) != mine   # "?" is how an old row with no owner runs
+
+
 def _no_action_note(served_by: str, n_tools: int) -> str:
     """One-line diagnostic for a turn that ended with NO tool call at all — the
     "narrated an action but called nothing" signature (issue #413). Names the
@@ -4093,11 +4938,15 @@ async def _run_agent_json(
              if t.get("function", {}).get("name")}
 
     acted = {"v": False}
+    _jh_st = _jh_new_state()  # Jarvis Home patch: same checks as the native loop
 
     def _make_handler(tool_name: str):
         async def _handler(args: dict) -> str:
             acted["v"] = True
-            return await _execute_tool(hass, tool_name, args, hass_api, user_input)
+            _jh_st["step"] += 1   # this protocol runs one tool per round
+            _jh_res = await _execute_tool(hass, tool_name, args, hass_api, user_input)
+            _jh_note_tool(_jh_st, tool_name, _jh_res, args, hass)
+            return _jh_res
         return _handler
 
     handlers = {name: _make_handler(name) for name in names}
@@ -4121,6 +4970,9 @@ async def _run_agent_json(
         temperature=0.3, native=False)
 
     text = (res.get("text") or "").strip()
+    if text and _jh_opt(hass, "jh_strict_actions"):
+        _cmd, _asked = await _jh_turn(hass, user_input)
+        text = _jh_final(text, _jh_st, _cmd, (config or {}).get("honorific", "sir"), _asked)
     _emit_conversational_shadow(acted=acted["v"], answered=bool(text))
     if not text:
         try:
@@ -4132,7 +4984,7 @@ async def _run_agent_json(
                 (res.get("last_raw") or "")[:160]))
         except Exception:
             pass
-    return text if text else _empty_reply_fallback(config)
+    return _jh_trim_offer(text, _jh_st["waiting"]) if text else _empty_reply_fallback(config)
 
 
 async def run_agent(
@@ -4152,6 +5004,7 @@ async def run_agent(
     max_iterations: Optional[int] = None,
     depth: int = 0,
     extra_directive: Optional[str] = None,
+    jh_owner: str = "",
 ) -> str:
     """
     Run the JARVIS agentic LLM loop (v5.7.07).
@@ -4162,6 +5015,9 @@ async def run_agent(
       - Home context injection
       - Persistent learning
     """
+    if depth == 0:
+        _JH_CALLER.set(getattr(getattr(user_input, "context", None), "user_id", None) or jh_owner or None)
+        _MAIL_TAINT.set({"read": False} if _jh_opt(hass, "jh_mail_block") else None)
     from .llm_provider import create_provider
 
     # Build system prompt with home context
@@ -4169,6 +5025,7 @@ async def run_agent(
     # file read goes to the executor.
     _learned = await hass.async_add_executor_job(_load_learned)
     home_context = _build_home_context(hass, _learned)
+    home_context += _rooms_note(hass, await hass.async_add_executor_job(_floor_rooms, hass))
     # v6.87.0: composite the live situational signals (presence, weather,
     # calendar, energy, recent activity) into one picture so judgments are
     # grounded in what is happening now, not just the static device inventory.
@@ -4231,20 +5088,29 @@ async def run_agent(
     # DE+RU household. Falls back to the global language when there's no request.
     req_lang = getattr(user_input, "language", None) if user_input else None
 
+    # Jarvis Home patch (2026-11-03): per-message recall (memory/knowledge) that conversation.py
+    # appends to the persona is moved into the live block, keeping the system prompt static.
+    persona, _rsep, _recall = persona.partition("\n\n## Current context (live data)\n")
+    _recall = ("## Current context (live data)\n" + _recall) if _rsep else ""
     system_prompt = (
         f"{persona}\n\n"
         f"{profile_block}"
         f"{_language_directive(hass, req_lang)}"
         f"## Current home state\n{home_context}\n\n"
-        f"{situation_block}"
-        f"{awareness_block}"
-        f"{cog_status}\n\n"
+        f"\n"
         f"## Tools\n"
         f"You have tools to control devices, query states, search entities, "
         f"manage areas, activate scenes, learn user preferences, look things "
         f"up on the web, read the household calendars, look at cameras to "
         f"answer visual questions, and search the household's own manuals and "
         f"receipts.\n\n"
+        f"## Honesty about this house\n"
+        f"Only describe Home Assistant menus, options, integrations or devices that you have "
+        f"actually seen through your tools. Never invent settings, menu names or setup steps. "
+        f"If a device is not in Home Assistant, say so plainly instead of guessing how to add it. "
+        f"Nothing runs in the background: a check or action happens only by calling a tool in this reply. "
+        f"Never promise a later report, and never state the result of something you did not run. "
+        f"To change a lamp colour use the HassLightSet tool. Never say a lamp has no colour without checking it.\n\n"
         f"## How you reason\n"
         f"Discipline, in order: (1) INVESTIGATE before concluding — read actual "
         f"state with your tools rather than assuming; the house is the source of "
@@ -4278,6 +5144,13 @@ async def run_agent(
         f"weather_forecast and answer with when the weather is expected. NEVER "
         f"answer it with the current clock time. Give the clock only when the "
         f"user actually asks for the current time ('what time is it?').\n\n"
+        f"### Energy USED is not the power right now\n"
+        f"For electricity or energy USED over a period - 'how much did we use "
+        f"this month / today / last week', 'our consumption so far' - call "
+        f"energy_usage and give its total and biggest users, saying what the "
+        f"total covers. Home Assistant does keep this (the Energy dashboard): "
+        f"never say it only tracks the current power. energy_status is only the "
+        f"power drawn right now.\n\n"
         f"## Critical rules\n"
         f"1. ALWAYS use search_entities first if you're unsure of an entity_id. "
         f"Never guess entity_ids — search for them.\n"
@@ -4343,6 +5216,15 @@ async def run_agent(
     )
 
     full_messages = [{"role": "system", "content": system_prompt}] + messages
+    # Jarvis Home patch (2026-11-03): live context moved from the system prompt to the latest user
+    # message, so the static prompt prefix stays identical between turns and the KV cache is reused.
+    _live = (_live_facts(hass) + "\n\n" + _recall + "\n\n" + situation_block + awareness_block + cog_status).strip()
+    if _live:
+        for _i in range(len(full_messages) - 1, 0, -1):
+            _m = full_messages[_i]
+            if _m.get("role") == "user" and isinstance(_m.get("content"), str):
+                full_messages[_i] = {**_m, "content": _m["content"] + "\n\n[Live home context - for reference, not part of the request]\n" + _live}
+                break
 
     # Summarize if needed
     full_messages = await _maybe_summarize(
@@ -4390,6 +5272,10 @@ async def run_agent(
     llm_run_state: dict[str, Any] = {}
     slim_retried = False   # one-shot 413 recovery (drop HA tools + home-state)
     _acted = False         # Phase AE shadow: did this turn execute a tool action?
+    _nudged = False        # Jarvis Home patch: one retry for a reply that promised an action
+    _jh_st = _jh_new_state()  # Jarvis Home patch: what the tools of this request really did
+    _cmd, _asked = await _jh_turn(hass, user_input)
+    _strict = _jh_opt(hass, "jh_strict_actions")
     # The model that actually served this turn — starts as the primary, and is
     # updated if the reasoning-tier fallback takes over, so the #413 diagnostic
     # names the real responder rather than the configured primary.
@@ -4575,6 +5461,25 @@ async def run_agent(
             # A model (notably a small local one) can return no tool call AND empty
             # content — synthesising nothing. Never hand the UI a blank turn; fall
             # back to a graceful line so the user sees a reply, not "(no text)".
+            _jh_hon = (config or {}).get("honorific", "sir")
+            if _strict and not _nudged and tools and text:
+                _jh_back = _jh_nudge(text, _jh_st, _cmd)
+                if _jh_back:
+                    _nudged = True
+                    _LOGGER.warning("JARVIS: reply to a device command not backed by a tool result, sent back once")
+                    working.append({"role": "assistant", "content": text})
+                    working.append({"role": "user", "content": _jh_back})
+                    continue
+            # Jarvis Home patch (2026-11-10): an energy or power figure with no reading behind it in this request
+            if (_strict and not _nudged and tools and text and not _jh_st["step"]
+                    and _jh_live_figure(text, getattr(user_input, "text", "") or "")):
+                _nudged = True
+                _LOGGER.warning("JARVIS: energy or power figure with no reading behind it, sent back once")
+                working.append({"role": "assistant", "content": text})
+                working.append({"role": "user", "content": _JH_LIVE_NUDGE})
+                continue
+            if _strict and text:
+                text = _jh_final(text, _jh_st, _cmd, _jh_hon, _asked)
             _has_text = bool(text and text.strip())
             _emit_conversational_shadow(acted=_acted, answered=_has_text)
             # Make the "narrated but didn't act" case (issue #413) visible: when a
@@ -4587,7 +5492,7 @@ async def run_agent(
                     jarvis_log("AGENT", _no_action_note(_served_by, len(tools or [])))
                 except Exception:
                     pass
-            return text.strip() if _has_text else _empty_reply_fallback(config)
+            return _jh_trim_offer(text, _jh_st["waiting"]) if _has_text else _empty_reply_fallback(config)
 
         _LOGGER.info(
             "Agent iteration %d: %d tool call(s): %s",
@@ -4630,6 +5535,7 @@ async def run_agent(
                 ],
             })
 
+        _jh_st["step"] += 1
         # Execute tools
         for call in tool_calls:
             if call["name"] == "delegate_task":
@@ -4644,6 +5550,7 @@ async def run_agent(
                     hass, call["name"], call["args"], hass_api, user_input,
                 )
             _acted = True   # Phase AE shadow: the turn took a tool action
+            _jh_note_tool(_jh_st, call["name"], result_str, call.get("args"), hass)
             working.append({
                 "role": "tool",
                 "tool_call_id": call.get("id", ""),
@@ -4663,12 +5570,12 @@ async def run_agent(
             ),
         )
         _final = (result.get("text", "") or "").strip()
+        if _strict and _final:
+            _final = _jh_final(_final, _jh_st, _cmd, (config or {}).get("honorific", "sir"), _asked)
         _emit_conversational_shadow(acted=_acted, answered=bool(_final))
         return _final if _final else _empty_reply_fallback(config)
     except Exception:
-        try:
-            from . import persona
-            hon = (config.get("honorific", "sir") if isinstance(config, dict) else "sir")
-            return persona.completed(hon)
-        except Exception:
-            return "I've completed the requested actions, sir."
+        hon = (config.get("honorific", "sir") if isinstance(config, dict) else "sir")
+        if _jh_st["changed"]:
+            return f"Part of that ran, {hon}, but I could not confirm all of it."
+        return f"That did not go through, {hon}. Nothing was changed."

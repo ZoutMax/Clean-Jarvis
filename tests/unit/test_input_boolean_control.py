@@ -30,12 +30,17 @@ async def test_control_device_turns_off_input_boolean(agent, fake_hass):
     map keys off the entity's own domain, so no special-casing is needed)."""
     fake_hass.states.set("input_boolean.luces_automaticas", "on",
                          friendly_name="Luces Automaticas")
+    async def flip(domain, service, data=None, blocking=False, **kw):
+        fake_hass.service_calls.append((domain, service, dict(data or {})))
+        fake_hass.states.set("input_boolean.luces_automaticas", "off")   # a real helper flips at once
+    fake_hass.services.async_call = flip
     out = await agent._exec_control_device(
         fake_hass, {"entity_id": "input_boolean.luces_automaticas",
                     "action": "turn_off"})
     await fake_hass.drain()
     res = json.loads(out)
     assert res.get("success") is True, res
+    assert res["new_state"] == "off"
     assert _calls(fake_hass, "input_boolean", "turn_off"), fake_hass.service_calls
 
 

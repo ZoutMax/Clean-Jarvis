@@ -304,6 +304,19 @@ setTimeout(async () => {
       el._setupCameras();
       return el._activeCam === "camera.back";
     })()],
+    ["a camera chosen in Core settings wins over the remembered one", (() => {
+      const cfg = el._liveData.config, before = cfg.camera_watch_default;
+      cfg.camera_watch_default = "camera.front";
+      el._activeCam = null; el._manualCam = null;
+      el._setupCameras();
+      const won = el._activeCam === "camera.front";
+      cfg.camera_watch_default = "camera.gone";     // removed camera: back to the remembered one
+      el._activeCam = null; el._manualCam = null;
+      el._setupCameras();
+      const fellBack = el._activeCam === "camera.back";
+      cfg.camera_watch_default = before;
+      return won && fellBack;
+    })()],
     ["an unknown stored camera falls back to the first (#231)", (() => {
       try { window.localStorage.setItem("jarvis_active_cam", "camera.gone"); } catch (_) {}
       el._activeCam = null; el._manualCam = null;
@@ -511,7 +524,8 @@ setTimeout(async () => {
       && /camera_proxy\/camera\.front/.test(camImg.src)],
   );
   camImg.dispatchEvent(new window.Event("error"));       // stills failed too
-  await new Promise(r => setTimeout(r, 20));             // let the WS shot resolve
+  // Clean Jarvis: a camera switches tier at most once a second (no request loop), so the JARVIS tier follows after that second
+  await new Promise(r => setTimeout(r, 1100));           // let the paced switch and the WS shot resolve
   checks.push(
     ["cam error #2 escalates to JARVIS snapshot tier", el._camMode === "jarvis"],
     ["JARVIS tier renders the WS frame as a data URL", /^data:image\/jpeg;base64,/.test(camImg.src)],
@@ -522,12 +536,12 @@ setTimeout(async () => {
   el._camMode = "stream";
   delete el._camModeByEntity["camera.front"];
   el._armCamWatchdog("camera.front", camImg, "stream", 5);
-  await new Promise(r => setTimeout(r, 25));
+  await new Promise(r => setTimeout(r, 1100));           // Clean Jarvis: at most one tier switch a second
   checks.push(
     ["hung stream (no pixels, no error) watchdogs into stills", el._camMode === "still"],
   );
   el._armCamWatchdog("camera.front", camImg, "still", 5);
-  await new Promise(r => setTimeout(r, 25));
+  await new Promise(r => setTimeout(r, 1100));           // Clean Jarvis: at most one tier switch a second
   checks.push(
     ["hung stills watchdog into JARVIS tier", el._camMode === "jarvis"],
   );
@@ -539,6 +553,7 @@ setTimeout(async () => {
     return realCallWS(m);
   };
   el._camWsTimer && clearInterval(el._camWsTimer); el._camWsTimer = null;
+  await new Promise(r => setTimeout(r, 1100));           // Clean Jarvis: at most one tier switch a second
   el._camJarvisFallback("camera.front");
   await new Promise(r => setTimeout(r, 20));
   hass.callWS = realCallWS;
