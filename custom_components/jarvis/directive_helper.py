@@ -1,0 +1,106 @@
+"""
+JARVIS — Prime directive injection helper.
+
+Used by every module that builds an LLM system prompt to ensure the
+unrelenting directive is prepended BEFORE the persona or task-specific
+instructions.
+
+This is the mechanism that makes the directive truly unrelenting: it runs
+at every LLM call, not just conversation turns.
+"""
+from __future__ import annotations
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .const import (
+    CONF_DIRECTIVE,
+    CONF_DIRECTIVE_PRESET,
+    DEFAULT_DIRECTIVE_PRESET,
+    DOMAIN,
+    JARVIS_PERSONA,
+    get_directive,
+)
+from .language import language_task_directive
+
+
+def resolve_directive(entry: ConfigEntry | None) -> str:
+    """Get the directive text based on this config entry."""
+    if entry is None:
+        return get_directive(DEFAULT_DIRECTIVE_PRESET, "")
+    from . import jarvis_config
+    preset = jarvis_config.runtime_get(None, entry, CONF_DIRECTIVE_PRESET,
+                                       DEFAULT_DIRECTIVE_PRESET)
+    custom = jarvis_config.runtime_get(None, entry, CONF_DIRECTIVE, "")
+    return get_directive(preset, custom)
+
+
+def get_entry(hass: HomeAssistant) -> ConfigEntry | None:
+    """Best-effort lookup of the JARVIS config entry (singleton)."""
+    try:
+        entries = hass.config_entries.async_entries(DOMAIN)
+        return entries[0] if entries else None
+    except Exception:
+        return None
+
+
+def build_system_prompt(
+    hass: HomeAssistant,
+    honorific: str,
+    task_context: str = "",
+) -> str:
+    """
+    Build a full system prompt for a task. Structure:
+      1. PRIME DIRECTIVE (always first, always present)
+      2. JARVIS persona (character + style)
+      3. Task-specific context/instructions
+
+    honorific is substituted into all {honorific} placeholders.
+    task_context is the additional task-specific instruction (camera prompt,
+    briefing instructions, sentinel prompt, etc.).
+    """
+    entry = get_entry(hass)
+    directive = resolve_directive(entry)
+    persona = JARVIS_PERSONA
+
+    combined = f"{directive}\n\n---\n\n{persona}"
+
+    # Capability honesty (#247): proactive messages (briefings, arrival greetings,
+    # camera notes, …) must not offer to perform a physical action JARVIS has no
+    # way to carry out. Offer an action only when a matching Home Assistant
+    # actuator exists; a door/window reported by a sensor is read-only — report it
+    # is open, but never offer to close, open, lock or unlock something with no
+    # actuator behind it. When in doubt, state the fact and suggest the person act.
+    combined = (
+        f"{combined}\n\n---\n\n"
+        "CAPABILITY HONESTY: Only offer to perform a physical action (close, open, "
+        "lock, unlock, turn on/off, arm, disarm, …) when Home Assistant actually "
+        "has a device/service to do it. A door, window or garage shown only by a "
+        "sensor is read-only: you may report it is open, but must NOT offer to "
+        "close, open, lock or unlock it — you have no actuator for it. Never offer "
+        "control you do not have. Equally, do NOT announce that you are unable to "
+        "act: for a read-only opening, simply state it is open and stop — never add "
+        "a 'but I can't close/lock it' or 'I'm unable to' note. That disclaimer is "
+        "noise, especially in a recurring briefing, so omit it entirely (#247)."
+    )
+
+    if task_context:
+        combined = f"{combined}\n\n---\n\n{task_context.strip()}"
+
+    # Steer every task prompt (briefings, camera analysis, sentinel, proactive
+    # notices, …) to the household's configured language. These are all
+    # MACHINE-authored prompts — their own instruction text is English, and there
+    # is no user "writing" to reply to — so we use the FORCED task directive
+    # (``language_task_directive``), not the conversational one with its
+    # "reply in the user's language" escape clause. A weak local model reading an
+    # English instruction block + that escape clause would otherwise conclude the
+    # user wrote in English and answer in English (issue #140 for camera, #307 for
+    # briefings/announces). The conversation path keeps the escape-clause directive
+    # (``agent.run_agent``), which is correct there. Empty for English installs, so
+    # they are unaffected; honours both JARVIS's output_language setting and HA's
+    # global language (see ``language.configured_language``).
+    language = language_task_directive(hass)
+    if language:
+        combined = f"{combined}\n\n---\n\n{language.strip()}"
+
+    return combined.replace("{honorific}", honorific)

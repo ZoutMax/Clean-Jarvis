@@ -1,0 +1,450 @@
+"""
+JARVIS — Morning / on-demand briefing.
+
+Gathers context from around the house and produces a Jarvis-style spoken
+briefing. Respects the time (good morning / good afternoon / good evening)
+and includes:
+  - Time + weather (if weather.* entity exists)
+  - Who's home (if person.* entities exist)
+  - Overnight sentinel events (last N hours)
+  - Open doors/windows right now
+  - Calendar events today (if calendar.* entity exists)
+  - Unusual energy usage
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.util import dt as dt_util
+
+from .const import JARVIS_PERSONA
+from .database import get_recent_messages, save_message
+from .directive_helper import build_system_prompt
+from .presence import get_presence_summary
+from .tts_helper import async_announce
+
+_LOGGER = logging.getLogger(__name__)
+
+BRIEFING_MODEL = "openai/gpt-oss-120b"
+
+
+def _time_greeting() -> str:
+    try:   # jh-r23-tz (step 165, review round 23 #8): Home Assistant's time zone
+        from .const import jh_ha_zone as jh_ha_zone
+    except ImportError:   # a stubbed const (tests): the process clock
+        import datetime as _jh_dt23
+        jh_ha_zone = (lambda: None)
+    hour = datetime.now(jh_ha_zone()).hour
+    if hour < 12:
+        return "Good morning"
+    if hour < 17:
+        return "Good afternoon"
+    if hour < 22:
+        return "Good evening"
+    return "Still awake"
+
+
+def _greeting_instruction(hass, honorific: str) -> str:
+    """The briefing task's opening clause.
+
+    English homes pin the exact greeting ("Good evening, {honorific}."). On a
+    non-English home, forcing that literal English string fought the language
+    directive that build_system_prompt now appends (v7.99.5) — on reasoning-tier
+    models the model burned its token budget reconciling "open in English" vs
+    "answer in <language>" and truncated to just the greeting (issue #79). So
+    ask for the configured-language equivalent instead, preserving the
+    time-of-day greeting while letting it be spoken in the household language."""
+    from .language import language_name
+    greeting = _time_greeting()
+    lname = language_name(hass)
+    if not lname:
+        return f"Begin with '{greeting}, {honorific}.' "
+    return (
+        f"Open by greeting {honorific} with the {lname} equivalent of "
+        f"'{greeting}', then continue in {lname}. "
+    )
+
+
+def _gather_weather(hass: HomeAssistant) -> str:
+    """Return a single-line weather summary from the first weather.* entity."""
+    for state in hass.states.async_all("weather"):
+        attrs = state.attributes
+        temp = attrs.get("temperature")
+        cond = state.state
+        unit = attrs.get("temperature_unit", "°")
+        forecast = attrs.get("forecast") or []
+        high = low = None
+        if forecast:
+            today = forecast[0]
+            high = today.get("temperature")
+            low  = today.get("templow")
+        parts = [f"{cond}"]
+        if temp is not None:
+            parts.append(f"currently {temp}{unit}")
+        if high is not None and low is not None:
+            parts.append(f"high {high}{unit}, low {low}{unit}")
+        return ", ".join(parts)
+    return ""
+
+
+def _jh_workday_calendar(hass, entity_id: str) -> bool:
+    """Jarvis Home patch (2026-11-07): the Workday integration's calendar marks working days and holds no events to read out.
+    Known by the integration that made it, never by a word in an event title, so "Workday deadline" in a real calendar stays."""
+    try:
+        from homeassistant.helpers import entity_registry as er
+        return getattr(er.async_get(hass).async_get(entity_id), "platform", None) == "workday"
+    except Exception:
+        return False
+
+
+def _gather_open_things(hass: HomeAssistant, plain: bool = False) -> list[str]:
+    """Doors, windows, locks that are currently open/unlocked.
+
+    Each item is annotated with whether JARVIS can actually *act* on it, so the
+    briefing LLM never offers control it does not have (#247): a door/window
+    reported by a `binary_sensor` is read-only — JARVIS can report it is open but
+    has no service to close it; a `cover` (motorised window/garage) can be closed;
+    a `lock` can be locked. A `cover`/`lock` entity with the SAME friendly name as
+    a sensor means the sensor is in fact controllable, so we don't mislabel it.
+    """
+    # Names that DO have a controllable actuator behind them.
+    controllable_names = set()
+    for state in hass.states.async_all("cover"):
+        controllable_names.add(state.attributes.get("friendly_name", state.entity_id))
+    for state in hass.states.async_all("lock"):
+        controllable_names.add(state.attributes.get("friendly_name", state.entity_id))
+
+    items = []
+    for state in hass.states.async_all("binary_sensor"):
+        dc = state.attributes.get("device_class")
+        if dc in ("door", "window", "garage_door") and state.state == "on":
+            name = state.attributes.get("friendly_name", state.entity_id)
+            if name in controllable_names or plain:   # Jarvis Home patch (2026-11-07): plain facts carry no note for a model
+                items.append(f"{name} is open")
+            else:
+                # Read-only sensor: tag it so the briefing LLM neither offers to
+                # close it NOR narrates that it can't (#247 follow-up — the stray
+                # "I'm unable to lock it" every briefing is noise). The tag is a
+                # directive, not prose to relay.
+                items.append(
+                    f"{name} is open [read-only sensor: report as open only; "
+                    f"do not offer to close it and do not say you cannot]")
+    for state in hass.states.async_all("lock"):
+        if state.state == "unlocked":
+            name = state.attributes.get("friendly_name", state.entity_id)
+            items.append(f"{name} is unlocked")
+    return items
+
+
+def _gather_calendar(hass: HomeAssistant) -> list[str]:
+    """Today's calendar events, if a calendar.* entity exists with a next event."""
+    events = []
+    for state in hass.states.async_all("calendar"):
+        if state.state != "on":
+            continue
+        msg = state.attributes.get("message")
+        start = state.attributes.get("start_time")
+        if msg and start and not _jh_workday_calendar(hass, state.entity_id):
+            events.append(f"{msg} at {start[11:16]}")
+    return events
+
+
+def _gather_energy_anomalies(hass: HomeAssistant) -> list[str]:
+    """Look for *power sensors showing unexpectedly high draw."""
+    anomalies = []
+    for state in hass.states.async_all("sensor"):
+        if state.attributes.get("device_class") != "power":
+            continue
+        try:
+            val = float(state.state)
+        except (ValueError, TypeError):
+            continue
+        if val > 500:  # arbitrary "that's a lot" threshold
+            name = state.attributes.get("friendly_name", state.entity_id)
+            unit = state.attributes.get("unit_of_measurement", "W")
+            anomalies.append(f"{name} is drawing {val:.0f}{unit}")
+    return anomalies
+
+
+def _gather_overnight_events(hass: HomeAssistant, hours: int = 12) -> list[str]:
+    """Sentinel events from the database in the last N hours."""
+    import sqlite3
+    from pathlib import Path
+    from .paths import config_path
+    from .sqlite_utils import ClosingConnection
+    db = config_path("jarvis", "conversations.db", hass=hass)
+    events = []
+    try:
+        if not db.exists():
+            return []
+        since = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
+        with sqlite3.connect(str(db), factory=ClosingConnection) as conn:
+            rows = conn.execute(
+                "SELECT timestamp, detail FROM sentinel_events WHERE timestamp > ? "
+                "ORDER BY timestamp DESC LIMIT 10",
+                (since,),
+            ).fetchall()
+        for ts, detail in rows:
+            try:   # Jarvis Home patch (2026-11-07): stored in UTC, spoken in the home's local time
+                d = datetime.fromisoformat(str(ts))
+                d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+                loc = dt_util.as_local(d)
+                ts = (loc if isinstance(loc, datetime) else d.astimezone()).isoformat()
+            except Exception:
+                pass
+            events.append(f"{ts[11:16]}: {detail}")
+    except Exception as exc:
+        _LOGGER.debug("JARVIS briefing: could not read sentinel events: %s", exc)
+    return events
+
+
+def _speakable(text: str) -> str:
+    """Jarvis Home patch (2026-11-05): make the facts sound right when read aloud."""
+    import re
+    text = text.replace("\u00b0C", " degrees").replace("clear-night", "clear night").replace("partlycloudy", "partly cloudy")
+    text = re.sub(r"(\d)W\b", r"\1 watts", text)
+    return text.replace(" Power is drawing", " is drawing")
+
+
+def _jh_facts_only_on(hass) -> bool:
+    """Jarvis Home patch (2026-11-05): the Core switch for facts-only briefings. If it cannot be read, stay with facts."""
+    try:
+        from . import jarvis_config
+        from .directive_helper import get_entry
+        return bool(jarvis_config.runtime_get(hass, get_entry(hass), "jh_facts_only_briefings", True))
+    except Exception:
+        return True
+
+
+def _facts_home(hass, people: bool = False, energy: bool = True) -> list[str]:
+    """Jarvis Home patch: real facts for spoken briefings, straight from HA states. Heaters come from
+    local_engine._jh_heaters, and a heater line is only spoken when heater data exists."""
+    def name(s):
+        return s.attributes.get("friendly_name", s.entity_id)
+    lines = []
+    if people:
+        from .local_engine import jh_residents   # jh-residents (step 158, C2): not_resident persons are no residents
+        home = [name(s) for s in jh_residents(hass, hass.states.async_all("person")) if s.state == "home"]
+        if home:
+            lines.append(f"At home: {', '.join(home)}.")
+    if not energy:
+        return lines
+    from .local_engine import _jh_heaters
+    switches, climates = _jh_heaters(hass)
+    from .local_engine import _jh_heating   # Jarvis Home patch (2026-11-15): a manual heater heats by its plug's power
+    on = [name(s) for s in switches if _jh_heating(hass, s)]
+    for s in climates:
+        action = s.attributes.get("hvac_action")
+        if action == "heating":
+            on.append(name(s))
+        elif not action and s.state in ("heat", "heat_cool", "auto"):
+            on.append(name(s) + " (powered on, heat level unknown)")
+    dark = [name(s) for s in switches + climates if s.state in ("unavailable", "unknown")]
+    if on:
+        lines.append(f"Heaters on: {', '.join(on)}.")
+    elif (switches or climates) and not dark:
+        lines.append("No heaters are on.")
+    if dark:
+        lines.append(f"Not reporting: {', '.join(dark)}.")
+    used = []
+    for s in hass.states.async_all("sensor"):
+        scale = {"Wh": 0.001, "kWh": 1.0, "MWh": 1000.0}.get(s.attributes.get("unit_of_measurement"))
+        label = f"{s.entity_id} {name(s)}".lower()
+        try:   # review round 8 (jh-r8-daily): a daily meter in any language
+            from .local_engine import jh_is_daily_meter as _jh_idm
+            _jh_daily = _jh_idm(hass, s)
+        except Exception:
+            _jh_daily = s.attributes.get("meter_period") == "daily"
+        if scale is None or not (_jh_daily or "today" in label or "daily" in label):
+            continue
+        try:
+            kwh = float(s.state) * scale
+        except (TypeError, ValueError):
+            continue
+        if kwh >= 0.1:
+            used.append(f"{name(s).replace(' energy today', '').replace(' Energy today', '')} {kwh:.1f} kilowatt hours")
+    if used:
+        lines.append(f"Energy today: {', '.join(used)}.")
+    return lines
+
+
+def _plain_briefing(greeting: str, honorific: str, context_lines: list[str]) -> str:
+    """A deterministic briefing read straight from the gathered facts, used when
+    the language model returns nothing so the briefing still happens instead of
+    silently skipping."""
+    facts = [ln.strip() for ln in (context_lines or []) if ln and ln.strip()]
+    if not facts:
+        return f"{greeting}, {honorific}. Nothing notable to report."
+    return f"{greeting}, {honorific}. " + " ".join(facts)
+
+
+async def async_briefing(
+    hass: HomeAssistant,
+    call: ServiceCall,
+    groq_client,
+    honorific: str,
+    tts_entity: str | None,
+    speakers: list[str],
+) -> dict:
+    """
+    Service: jarvis.briefing
+    Gather context and deliver a Jarvis-voiced briefing.
+    """
+    announce = call.data.get("announce", True)
+    include_weather  = call.data.get("include_weather", True)
+    include_calendar = call.data.get("include_calendar", True)
+    include_presence = call.data.get("include_presence", True)
+    include_events   = call.data.get("include_events", True)
+    include_energy   = call.data.get("include_energy", True)
+    overnight_hours  = int(call.data.get("hours", 12))
+
+    # Gather everything
+    try:   # jh-r23-tz
+        from .const import jh_local_now as _jh_ln23
+    except ImportError:   # a stubbed const (tests): the process clock
+        import datetime as _jh_dt23
+        _jh_ln23 = _jh_dt23.datetime.now
+    _jh_n23 = _jh_ln23()
+    context_lines = [f"It is {_jh_n23.strftime('%A %B')} {_jh_n23.day}, {_jh_n23.hour % 12 or 12}:{_jh_n23.minute:02d} "
+                     f"{'AM' if _jh_n23.hour < 12 else 'PM'}."]
+
+    if include_weather:
+        weather = _gather_weather(hass)
+        if weather:
+            context_lines.append(f"Weather: {weather}.")
+
+    if include_presence:
+        presence = get_presence_summary(hass)
+        if presence["people"]:
+            home = [p["name"] for p in presence["people"] if p["state"] == "home"]
+            away = [p["name"] for p in presence["people"] if p["state"] != "home"]
+            if home:
+                context_lines.append(f"At home: {', '.join(home)}.")
+            if away:
+                context_lines.append(f"Away: {', '.join(away)}.")
+            try:   # Jarvis Home patch (2026-11-14): pronouns, so the briefing never guesses a gender
+                from .presence import jh_pronoun_line
+                if jh_pronoun_line(hass):
+                    context_lines.append(jh_pronoun_line(hass))
+            except Exception:
+                pass
+
+    if include_events:
+        events = await hass.async_add_executor_job(
+            _gather_overnight_events, hass, overnight_hours
+        )
+        if events:
+            context_lines.append(
+                f"Events in the last {overnight_hours} hours:\n- " + "\n- ".join(events)
+            )
+
+    open_things = _gather_open_things(hass, plain=_jh_facts_only_on(hass))
+    if open_things:
+        context_lines.append(f"Currently open/unlocked: {', '.join(open_things)}.")
+
+    if include_calendar:
+        cal_events = _gather_calendar(hass)
+        if cal_events:
+            context_lines.append(f"Calendar: {', '.join(cal_events)}.")
+
+    if include_energy:
+        energy = _gather_energy_anomalies(hass)
+        if energy:
+            context_lines.append(f"High power draw: {', '.join(energy)}.")
+
+    # Active natural hazards near home (v6.78.0) — earthquakes, severe weather
+    # warnings, wildfires. Read-only scan; silent when nothing is active.
+    if call.data.get("include_hazards", True):
+        try:
+            from . import hazard_monitor
+            hz = await hazard_monitor.scan_now(hass)
+            if hz.get("ok"):
+                bits = []
+                for q in hz.get("earthquakes", []) or []:
+                    mag = q.get("mag")
+                    magtxt = f"magnitude {mag:.1f}" if isinstance(mag, (int, float)) else "an earthquake"
+                    bits.append(f"{magtxt} quake {q.get('dist_km')} km away ({q.get('place')})")
+                for w in hz.get("weather", []) or []:
+                    bits.append(f"{w.get('severity')} weather alert: {w.get('event')}"
+                                + (f" for {w.get('area')}" if w.get("area") else ""))
+                for d in hz.get("disasters", []) or []:
+                    bits.append(f"{d.get('category')}: {d.get('title')} "
+                                f"{d.get('dist_km')} km away")
+                if bits:
+                    context_lines.append("Active hazards nearby: " + "; ".join(bits) + ".")
+        except Exception:
+            pass
+
+    _jh_facts_only = _jh_facts_only_on(hass)
+
+    # Camera detection summary from proactive briefing system
+    try:
+        from .proactive_briefing import get_snapshot_summary
+        snap_summary = get_snapshot_summary(hours=overnight_hours)
+        if snap_summary and not _jh_facts_only:  # Jarvis Home patch: AI text, never read aloud as fact
+            context_lines.append(snap_summary)
+    except Exception:
+        pass
+
+    context_lines.extend(_facts_home(hass, energy=include_energy))
+    context = "\n".join(context_lines)
+
+    # Ask Groq to compose the briefing
+    greeting = _time_greeting()
+    task = (
+        f"You are delivering a spoken briefing to {honorific}. "
+        f"{_greeting_instruction(hass, honorific)}Then concisely cover the important items. "
+        f"Under 120 words. Be efficient — do not list trivia. "
+        f"If nothing is noteworthy, say so briefly. "
+        f"Your prime directive should inform what you surface — protect, steward, "
+        f"anticipate. Lead with anything that affects their safety or wellbeing."
+    )
+    system = build_system_prompt(hass, honorific, task)
+
+    # Jarvis Home patch (2026-11-05): no AI text. A small model invented locks, garages and actions.
+    if _jh_facts_only:
+        briefing_text = _speakable(_plain_briefing(greeting, honorific, context_lines))
+    else:
+        try:
+            result = await hass.async_add_executor_job(lambda: groq_client.chat(
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": f"Context:\n{context}"}],
+                max_tokens=1500, temperature=0.6))
+            briefing_text = (result.get("text") or "").strip()
+        except Exception as exc:
+            _LOGGER.error("JARVIS briefing error: %s", exc)
+            briefing_text = ""
+
+    # The model sometimes returns an empty completion (a local-model hiccup, or
+    # an unusual prompt). Rather than silently skip the announce, read the facts
+    # already gathered — a plain briefing beats no briefing.
+    if not briefing_text:
+        _LOGGER.warning("JARVIS briefing: empty model output — reading gathered facts instead")
+        briefing_text = _speakable(_plain_briefing(greeting, honorific, context_lines))
+
+    await hass.async_add_executor_job(
+        save_message, "assistant", f"[Briefing] {briefing_text}", "briefing"
+    )
+
+    announced = False
+    if announce:
+        _LOGGER.info(
+            "JARVIS briefing announce: tts=%s, speakers=%s, text_len=%d, first_50=%s",
+            tts_entity, speakers, len(briefing_text or ""),
+            (briefing_text or "")[:50],
+        )
+        if not briefing_text:
+            _LOGGER.warning("JARVIS briefing: empty text, skipping announce")
+        elif not tts_entity:
+            _LOGGER.warning("JARVIS briefing: no TTS entity resolved")
+        elif not speakers:
+            _LOGGER.warning(
+                "JARVIS briefing: no announcement speakers configured — choose "
+                "them in Settings \u2192 Announcement Speakers")
+        else:
+            await async_announce(hass, briefing_text, tts_entity, speakers)
+            announced = True
+
+    return {"success": True, "briefing": briefing_text, "context": context,
+            "announced": announced}

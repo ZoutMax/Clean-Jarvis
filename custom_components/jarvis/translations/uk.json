@@ -1,0 +1,293 @@
+{
+  "config": {
+    "step": {
+      "provider_menu": {
+        "title": "JARVIS — Додати постачальника",
+        "description": "{note}",
+        "menu_options": {
+          "groq": "Groq",
+          "openai": "OpenAI",
+          "anthropic": "Anthropic",
+          "gemini": "Gemini",
+          "custom": "Власний (сумісний з OpenAI)",
+          "ollama": "Ollama (локальний)",
+          "finish": "Завершити налаштування"
+        }
+      },
+      "groq": {
+        "title": "JARVIS — Groq",
+        "data": {
+          "api_key": "Ключ API Groq"
+        }
+      },
+      "openai": {
+        "title": "JARVIS — OpenAI",
+        "data": {
+          "api_key": "Ключ API OpenAI"
+        }
+      },
+      "anthropic": {
+        "title": "JARVIS — Anthropic",
+        "data": {
+          "api_key": "Ключ API Anthropic"
+        }
+      },
+      "gemini": {
+        "title": "JARVIS — Gemini",
+        "data": {
+          "api_key": "Ключ API Gemini"
+        }
+      },
+      "custom": {
+        "title": "JARVIS — Власний постачальник",
+        "data": {
+          "api_key": "Ключ API (необов'язково, якщо кінцева точка вимагає)",
+          "custom_base_url": "Базова URL-адреса API (сумісна з OpenAI)"
+        }
+      },
+      "ollama": {
+        "title": "JARVIS — Ollama",
+        "data": {
+          "ollama_base_url": "Базова URL-адреса"
+        }
+      },
+      "finish": {
+        "title": "JARVIS — Завершити налаштування",
+        "description": "{note}",
+        "data": {
+          "llm_provider": "Постачальник Головного агента",
+          "honorific": "Звертатися до мене"
+        }
+      },
+      "finish_model": {
+        "title": "JARVIS — Conversation Model",
+        "data": {
+          "model": "Conversation model"
+        }
+      }
+    },
+    "error": {
+      "need_llm": "Введіть або хмарний API-ключ, або URL-адресу локальної LLM.",
+      "cannot_connect": "Не вдалося зв’язатися з LLM. Перевірте правильність URL/кінцевої точки та роботу сервера (напр., Ollama).",
+      "invalid_auth": "API-ключ відхилено. Перевірте ключ і спробуйте ще раз.",
+      "unknown": "Не вдалося перевірити підключення до LLM. Перевірте налаштування та спробуйте ще раз.",
+      "no_models": "Для цього постачальника немає доступних моделей. Перевірте кінцеву адресу постачальника й спробуйте ще раз.",
+      "no_providers": "Не налаштовано жодного постачальника LLM. Спочатку додайте ключ постачальника або кінцеву адресу в розділі LLM."
+    },
+    "abort": {
+      "already_configured": "JARVIS уже налаштовано.",
+      "import_failed": "Знайдено конфігурацію JARVIS, але немає придатної LLM (немає API-ключа та локальної кінцевої точки)."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "JARVIS — Налаштування",
+        "menu_options": {
+          "llm": "LLM — керування ключами постачальників",
+          "core": "Ядро — особистість, директива, модель діалогу",
+          "routing": "Маршрутизація — зони спалень, група мовлення, служба сповіщень",
+          "observer": "Спостерігач — проактивна обізнаність (використовує налаштованих постачальників LLM)",
+          "identity": "Особистість — розпізнавання окремих людей",
+          "email": "Ел. пошта — скринька лише для читання (пароль через secrets.yaml)",
+          "agents": "Agents — specialised sub-agents (FRIDAY/HOMER), autonomy toggles"
+        }
+      },
+      "llm": {
+        "title": "JARVIS — LLM",
+        "description": "{note}",
+        "menu_options": {
+          "groq": "Groq",
+          "openai": "OpenAI",
+          "anthropic": "Anthropic",
+          "gemini": "Gemini",
+          "custom": "Власний (сумісний з OpenAI)",
+          "ollama": "Ollama (локальний)",
+          "back": "Назад до меню налаштування"
+        }
+      },
+      "groq": {
+        "title": "JARVIS — Groq",
+        "data": {
+          "api_key": "Ключ API Groq"
+        }
+      },
+      "openai": {
+        "title": "JARVIS — OpenAI",
+        "data": {
+          "api_key": "Ключ API OpenAI"
+        }
+      },
+      "anthropic": {
+        "title": "JARVIS — Anthropic",
+        "data": {
+          "api_key": "Ключ API Anthropic"
+        }
+      },
+      "gemini": {
+        "title": "JARVIS — Gemini",
+        "data": {
+          "api_key": "Ключ API Gemini"
+        }
+      },
+      "custom": {
+        "title": "JARVIS — Власний постачальник",
+        "data": {
+          "api_key": "Ключ API (необов'язково, якщо кінцева точка вимагає)",
+          "custom_base_url": "Базова URL-адреса API (сумісна з OpenAI)"
+        }
+      },
+      "ollama": {
+        "title": "JARVIS — Ollama",
+        "data": {
+          "ollama_base_url": "Базова URL-адреса"
+        }
+      },
+      "core": {
+        "title": "JARVIS — Ядро",
+        "description": "Особистість, директива та модель діалогу.",
+        "data": {
+          "honorific": "Звертатися до мене",
+          "directive_preset": "Пресет директиви",
+          "directive": "Власна директива (необов’язково, перевизначає пресет)",
+          "llm_provider": "Conversation model provider",
+          "use_hass_api": "Увімкнути керування домом (світло, клімат, замки тощо)",
+          "web_research_llm_fallback": "Дозволити веб-дослідженню переходити до власного веб-пошуку LLM, коли типовий бекенд нічого не знаходить",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
+        }
+      },
+      "core_model": {
+        "title": "JARVIS — Conversation Model",
+        "data": {
+          "model": "Conversation model"
+        }
+      },
+      "routing": {
+        "title": "JARVIS — Маршрутизація",
+        "description": "виберіть, які зони HA є спальнями (для виявлення сну), яку групу media_player використовувати для мовлення та службу сповіщень вашого телефону.",
+        "data": {
+          "bedroom_areas": "Зони спалень (для виявлення сну в тихі години)",
+          "broadcast_group": "Група динаміків для мовлення (зазвичай ваша домашня група Cast)",
+          "notify_service": "Служба сповіщень телефону (напр., notify.mobile_app_yourphone)"
+        },
+        "data_description": {
+          "bedroom_areas": "Будь-який датчик присутності в цих зонах вмикає режим сну в тихі години.",
+          "broadcast_group": "Використовується для критичних і дуже термінових оголошень.",
+          "notify_service": "Використовується, коли вас немає вдома або ви спите."
+        }
+      },
+      "observer": {
+        "title": "JARVIS — Режим спостерігача",
+        "description": "проактивна обізнаність. JARVIS стежить за вашим домом і озивається, коли щось варте уваги.",
+        "menu_options": {
+          "classifier": "Classifier (Tier 1 — cheap)",
+          "reasoning": "Reasoning (Tier 2 — main)",
+          "review": "Review (Tier 3 — periodic)",
+          "observer_settings": "Observer settings",
+          "back": "Назад до меню налаштування"
+        }
+      },
+      "classifier": {
+        "title": "JARVIS — Classifier Provider",
+        "data": {
+          "classifier_provider": "Classifier model provider"
+        }
+      },
+      "classifier_model": {
+        "title": "JARVIS — Classifier Model",
+        "data": {
+          "classifier_model": "Classifier model"
+        }
+      },
+      "reasoning": {
+        "title": "JARVIS — Reasoning Provider",
+        "data": {
+          "reasoning_provider": "Reasoning model provider"
+        }
+      },
+      "reasoning_model": {
+        "title": "JARVIS — Reasoning Model",
+        "data": {
+          "reasoning_model": "Reasoning model"
+        }
+      },
+      "review": {
+        "title": "JARVIS — Review Provider",
+        "data": {
+          "review_provider": "Review model provider"
+        }
+      },
+      "review_model": {
+        "title": "JARVIS — Review Model",
+        "data": {
+          "review_model": "Review model"
+        }
+      },
+      "observer_settings": {
+        "title": "JARVIS — Observer Settings",
+        "data": {
+          "observer_enabled": "Enable observer mode",
+          "observer_quiet_start": "Quiet hours start (HH:MM)",
+          "observer_quiet_end": "Quiet hours end (HH:MM)"
+        }
+      },
+      "identity": {
+        "title": "JARVIS — Особистість",
+        "description": "розпізнавання окремих людей, щоб JARVIS підлаштовувався під того, хто говорить. Працює без спеціального обладнання, використовуючи присутність і (якщо налаштовано) розпізнавання облич із камери. Голосовий відбиток найточніший, але потребує локального GPU, тому типово вимкнений.",
+        "data": {
+          "identity_enabled": "Розпізнавати, хто говорить",
+          "identity_voice_fingerprint": "Голосовий відбиток (потребує локального GPU)",
+          "identity_min_confidence": "Мінімальна впевненість перед прив’язкою до людини",
+          "voice_recognition_source": "Джерело розпізнавання голосу (сутність зі служби розпізнавання мовця, напр. binary_sensor.*_voice)",
+          "voice_recognition_auto_enroll": "Автоматично позначати голоси для реєстрації, коли люди говорять"
+        },
+        "data_description": {
+          "identity_enabled": "Використовує, хто вдома, + нещодавнє розпізнавання облич із камери. GPU не потрібен.",
+          "identity_voice_fingerprint": "Залиште вимкненим, якщо не маєте GPU-сервера з моделлю ідентифікації голосу.",
+          "identity_min_confidence": "Вище = обережніше; за невпевненості залишається нейтральним."
+        }
+      },
+      "email": {
+        "title": "JARVIS — Ел. пошта",
+        "description": "Доступ до скриньки лише для читання. Пароль IMAP зчитується з файлу secrets.yaml Home Assistant — додайте його там під наведеним нижче ключем (типово jarvis_imap_password); у конфігурації панелі він ніколи не зберігається.",
+        "data": {
+          "imap_enabled": "Увімкнути читання пошти",
+          "imap_host": "Хост IMAP (напр., imap.gmail.com)",
+          "imap_port": "Порт IMAP (SSL: 993)",
+          "imap_user": "Ім’я користувача IMAP / адреса ел. пошти",
+          "imap_folder": "Папка скриньки (типово INBOX)",
+          "imap_ssl": "Використовувати SSL (рекомендовано)",
+          "imap_secret_key": "Ключ у secrets.yaml, що містить пароль"
+        }
+      },
+      "agents": {
+        "title": "JARVIS — Agents",
+        "description": "Specialised sub-agents and autonomy.\n\n⚠️ FRIDAY (background automator) can CONTROL DEVICES, run scenes, and run scripts on its own — unlike every other sub-agent, which is read-only. Leave it OFF unless you understand that it can actuate your home autonomously. To enable it you must also tick the acknowledgement box.",
+        "data": {
+          "friday_automator": "Enable FRIDAY automator (can control devices) — advanced",
+          "friday_confirm": "I understand FRIDAY can actuate my home; enable it",
+          "proximity_volume": "Dampen TTS volume when I'm close to the speaker (needs mmWave distance sensors)",
+          "host_telemetry": "Monitor host hardware (CPU temp, memory pressure, NVMe I/O)"
+        }
+      }
+    },
+    "error": {
+      "need_llm": "Введіть або хмарний API-ключ, або URL-адресу локальної LLM.",
+      "cannot_connect": "Не вдалося зв’язатися з LLM. Перевірте правильність URL/кінцевої точки та роботу сервера (напр., Ollama).",
+      "invalid_auth": "API-ключ відхилено. Перевірте ключ і спробуйте ще раз.",
+      "unknown": "Не вдалося перевірити підключення до LLM. Перевірте налаштування та спробуйте ще раз.",
+      "no_models": "Для цього постачальника немає доступних моделей. Перевірте кінцеву адресу постачальника й спробуйте ще раз.",
+      "no_providers": "Не налаштовано жодного постачальника LLM. Спочатку додайте ключ постачальника або кінцеву адресу в розділі LLM.",
+      "friday_confirm_required": "You enabled FRIDAY but didn't tick the acknowledgement box. FRIDAY can actuate your home, so it stays off until you confirm."
+    }
+  },
+  "issues": {
+    "llm_unavailable": {
+      "title": "Бекенд міркувань JARVIS недоступний",
+      "description": "JARVIS не зміг зв’язатися зі своєю моделлю міркувань, тому працює в обмеженому режимі — керування пристроями, стан і сцени досі працюють. Причина: {detail}\n\nВідкрийте панель JARVIS → Налаштування та перевірте постачальника, модель і API-ключ. Якщо постачальник вилучив модель, виберіть її знову зі списку. Це сповіщення зникне автоматично, щойно міркування знову запрацюють."
+    }
+  }
+}

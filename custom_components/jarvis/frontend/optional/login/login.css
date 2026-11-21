@@ -1,0 +1,158 @@
+/* Clean Jarvis optional login screen (login_screen.py) for Home Assistant's own login page (/auth/authorize).
+   Every rule only applies once login.js has set html.jl-skin, so if the script does not run, Home Assistant's page
+   stays exactly as it was. Home Assistant's login form itself is untouched: only its colours, fonts and the card around
+   it change. No fonts or files from other sites: the font lists fall back to the device's own fonts. */
+
+/* brand tokens + Home Assistant's own colour variables (dark look, also when the device is in light mode) */
+html.jl-skin:root{
+  --jl-c:#5fd4ff;--jl-c2:#2bb7f0;--jl-c3:#a8ecff;--jl-txt:#dbeefa;--jl-mut:#a9cde0;
+  --jl-ok:#3ef0a1;--jl-warn:#ffb547;--jl-bad:#ff4d5e;
+  --primary-color:#2bb7f0;--accent-color:#5fd4ff;
+  --primary-text-color:#f2fbff;--secondary-text-color:#a9cde0;--ha-color-text-secondary:#a9cde0;
+  --primary-background-color:#01030a;--card-background-color:transparent;--ha-card-background:transparent;
+  --divider-color:rgba(95,212,255,.25);
+  --ha-color-form-background:rgba(2,10,18,.78);--ha-color-form-background-hover:rgba(4,18,30,.85);
+  color-scheme:dark;
+  background:#01030a;height:100%;
+}
+html.jl-skin body{background:transparent;min-height:100%;height:auto;box-sizing:border-box;margin:0;
+  display:flex;flex-wrap:nowrap;flex-direction:row;align-items:center;justify-content:center;
+  gap:clamp(40px,6vw,96px);padding:24px;color:var(--jl-txt);overflow-x:hidden}
+html.jl-skin #particles{display:none!important}           /* Home Assistant's own constellation background */
+
+/* ---------- background layers (behind everything, never clickable) ---------- */
+#jl-bg{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;background:#01030a}
+#jl-bg .jl-photo{position:absolute;inset:-6%;background-size:cover;background-position:center;opacity:0;transition:opacity 4s ease;will-change:transform,opacity}
+#jl-bg .jl-photo.on{opacity:1}
+#jl-bg .jl-a{animation:jl-fly1 70s ease-in-out infinite alternate}
+#jl-bg .jl-b{animation:jl-fly2 80s ease-in-out infinite alternate}
+@keyframes jl-fly1{from{transform:scale(1.05) translate(0,0) rotate(0)}to{transform:scale(1.28) translate(-4%,3%) rotate(1.5deg)}}
+@keyframes jl-fly2{from{transform:scale(1.25) translate(2%,-3%) rotate(-1deg)}to{transform:scale(1.05) translate(-2%,2%) rotate(1deg)}}
+#jl-bg video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:saturate(1.2) brightness(.9);animation:jl-vfloat 60s ease-in-out infinite alternate}
+@keyframes jl-vfloat{from{transform:scale(1.04) rotate(0)}to{transform:scale(1.14) rotate(2deg)}}
+#jl-bg canvas{position:absolute;inset:0;width:100%;height:100%}
+#jl-bg .jl-shade{position:absolute;inset:0;background:radial-gradient(ellipse at 50% 50%,rgba(1,3,10,.15) 30%,rgba(1,3,10,.7) 100%)}
+#jl-bg .jl-corner{position:absolute;width:120px;height:80px;border:1px solid rgba(95,212,255,.4)}
+#jl-bg .jl-tl{top:40px;left:40px;border-right:0;border-bottom:0}#jl-bg .jl-tr{top:40px;right:40px;border-left:0;border-bottom:0}
+#jl-bg .jl-bl{bottom:40px;left:40px;border-right:0;border-top:0}#jl-bg .jl-br{bottom:40px;right:40px;border-left:0;border-top:0}
+
+/* ---------- HUD: live status (top left) and name (top right) ---------- */
+.jl-hud{position:fixed;z-index:2;top:64px;font-family:Orbitron,Inter,sans-serif;font-size:12px;letter-spacing:.18em;color:#bfe6f7;
+  text-shadow:0 0 8px rgba(0,0,0,.9);display:flex;flex-direction:column;gap:10px;pointer-events:none}
+#jl-status{left:72px}
+#jl-hudr{right:72px;text-align:right}
+#jl-hudr .jl-name{color:var(--jl-c)}
+.jl-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:10px;vertical-align:middle;animation:jl-blink 1.6s ease-in-out infinite}
+.jl-dot.ok{background:var(--jl-ok);box-shadow:0 0 10px var(--jl-ok)}
+.jl-dot.warn{background:var(--jl-warn);box-shadow:0 0 10px var(--jl-warn)}
+.jl-dot.bad{background:var(--jl-bad);box-shadow:0 0 10px var(--jl-bad)}
+.jl-st-warn{color:var(--jl-warn)}.jl-st-bad{color:var(--jl-bad)}
+@keyframes jl-blink{50%{opacity:.3}}
+
+/* ---------- the JARVIS core (the real logo, rings turning; the J flashes red on every key press) ---------- */
+#jl-core{position:relative;z-index:1;flex:none;width:clamp(240px,28vw,420px);aspect-ratio:1;filter:drop-shadow(0 0 30px rgba(51,214,255,.35));pointer-events:none}
+#jl-core svg{position:absolute;inset:0;width:100%;height:100%}
+#jl-core .jl-r1{animation:jl-spin 18s linear infinite;transform-origin:256px 256px}
+#jl-core .jl-r2{animation:jl-spinr 11s linear infinite;transform-origin:256px 256px}
+#jl-core .jl-r3{animation:jl-spin 30s linear infinite;transform-origin:256px 256px}
+#jl-core .jl-pulse{animation:jl-pulse 3.2s ease-in-out infinite;transform-origin:256px 256px}
+@keyframes jl-spin{to{transform:rotate(360deg)}}@keyframes jl-spinr{to{transform:rotate(-360deg)}}
+@keyframes jl-pulse{0%,100%{opacity:.6}50%{opacity:1}}
+#jl-core .jl-j{transition:stroke .45s ease}
+#jl-core .jl-rings{transition:stroke .45s ease}
+#jl-core.key .jl-j{stroke:#ff3b4e;transition:none}
+#jl-core.key .jl-rings{stroke:#ff6a78;transition:none}
+#jl-core .jl-scan{position:absolute;left:10%;right:10%;top:14%;height:2px;background:linear-gradient(90deg,transparent,var(--jl-c),transparent);box-shadow:0 0 16px var(--jl-c);animation:jl-scan 5s ease-in-out infinite}
+@keyframes jl-scan{0%{transform:translateY(-40px);opacity:0}15%,85%{opacity:.7}100%{transform:translateY(320%);opacity:0}}
+@media (min-width:901px){#jl-core .jl-scan{animation-name:jl-scan-big}}
+@keyframes jl-scan-big{0%{transform:translateY(-40px);opacity:0}15%,85%{opacity:.7}100%{transform:translateY(min(320px,22vw));opacity:0}}
+
+/* ---------- the glass card around Home Assistant's own login form ---------- */
+html.jl-skin body>.content{position:relative;z-index:2;flex:none;width:400px;max-width:100%;margin:0;box-sizing:border-box;
+  padding:40px 40px 28px;border-radius:20px;animation:jl-fade .9s ease-out both}
+/* the glass itself sits on a pseudo layer, so the card never becomes the containing block for pop-ups inside it */
+html.jl-skin body>.content::before{content:"";position:absolute;inset:0;z-index:-1;border-radius:inherit;pointer-events:none;
+  background:rgba(6,18,32,.62);border:1px solid rgba(95,212,255,.4);
+  box-shadow:0 0 0 1px rgba(95,212,255,.08) inset,0 30px 80px rgba(0,0,0,.6),0 0 60px rgba(43,183,240,.18);
+  -webkit-backdrop-filter:blur(16px) saturate(1.2);backdrop-filter:blur(16px) saturate(1.2)}
+@keyframes jl-fade{from{opacity:0}}
+html.jl-skin body>.content>.header{display:none}           /* the JARVIS core is the logo here */
+html.jl-skin ha-authorize .card-content{background:transparent;border:0;box-shadow:none;padding:0;color:var(--jl-txt)}
+html.jl-skin ha-authorize ha-auth-flow form{max-width:none;text-align:left}
+html.jl-skin ha-authorize .action{max-width:none}
+
+/* heading: kicker above, Home Assistant's own (translated) title, typed greeting below */
+html.jl-skin ha-authorize h1{display:flex;flex-direction:column;gap:6px;margin:0 0 4px;text-align:left;
+  font-family:Orbitron,Inter,sans-serif;font-size:30px;font-weight:700;line-height:1.15;color:#f2fbff}
+html.jl-skin ha-authorize h1::before{content:"IDENTIFY YOURSELF";font-size:13px;font-weight:500;letter-spacing:.3em;color:var(--jl-c)}
+html.jl-skin ha-authorize h1::after{content:var(--jl-typed,"");min-height:1.25em;font-family:Inter,system-ui,sans-serif;font-size:14px;
+  font-weight:400;letter-spacing:0;color:var(--jl-mut)}
+
+/* text fields (username, password, MFA code) */
+html.jl-skin ha-auth-textfield .base{height:52px;background:rgba(2,10,18,.78);border:1px solid rgba(95,212,255,.35);border-radius:10px;
+  transition:border-color .2s,box-shadow .2s,background-color .2s}
+html.jl-skin ha-auth-textfield .base::after{display:none}
+html.jl-skin ha-auth-textfield .base:focus-within{border-color:var(--jl-c);box-shadow:0 0 0 3px rgba(95,212,255,.25)}
+html.jl-skin ha-auth-textfield .base.invalid:not(.disabled){border-color:var(--jl-bad)}
+html.jl-skin ha-auth-textfield input{color:#f2fbff;caret-color:var(--jl-c);font-family:Inter,system-ui,sans-serif;font-size:16px}
+html.jl-skin ha-auth-textfield label{color:var(--jl-mut);font-family:Inter,system-ui,sans-serif}
+html.jl-skin ha-auth-textfield .base:focus-within label{color:var(--jl-c)}
+html.jl-skin ha-auth-textfield ha-icon-button{color:var(--jl-mut)}
+
+/* "Keep me logged in", "Forgot password?" */
+html.jl-skin ha-authorize .space-between{font-size:13px;color:var(--jl-mut)}
+html.jl-skin ha-authorize ha-checkbox{color:var(--jl-mut);font-family:Inter,system-ui,sans-serif;font-size:13px}
+html.jl-skin ha-authorize a{color:var(--jl-c)}
+html.jl-skin ha-authorize a:hover{color:var(--jl-c3)}
+html.jl-skin ha-authorize a.forgot-password{font-size:12px}
+
+/* the log-in button */
+html.jl-skin ha-authorize .action ha-button::part(base){height:50px;border:0;border-radius:12px;background:linear-gradient(90deg,#1e9fd8,var(--jl-c));
+  color:#021019;font-family:Orbitron,Inter,sans-serif;font-weight:700;font-size:15px;letter-spacing:.18em;text-transform:uppercase;
+  box-shadow:0 0 24px rgba(95,212,255,.35);transition:filter .2s,box-shadow .2s}
+html.jl-skin ha-authorize .action ha-button::part(base):hover{filter:brightness(1.12);box-shadow:0 0 34px rgba(95,212,255,.6)}
+
+/* language + Help, inside the card */
+html.jl-skin ha-authorize .footer{padding-top:18px;font-size:12px;color:#8fb8cc}
+html.jl-skin ha-authorize .footer ha-button::part(base){color:#8fb8cc}
+html.jl-skin ha-authorize .footer ha-button::part(base):hover{color:var(--jl-c3)}
+
+/* error and info messages */
+html.jl-skin ha-authorize ha-alert{background:rgba(2,10,18,.7);border-radius:10px;color:#f2fbff}
+
+/* credits */
+#jl-note{position:fixed;z-index:2;bottom:12px;left:50%;transform:translateX(-50%);font-size:11px;color:#8aa9b8;letter-spacing:.06em;
+  text-shadow:0 0 6px #000;text-align:center;white-space:nowrap;font-family:Inter,system-ui,sans-serif;pointer-events:none}
+
+/* ---------- tablet portrait and phone: status on top, core above the card ---------- */
+@media (max-width:900px){
+  html.jl-skin body{flex-direction:column;justify-content:flex-start;gap:20px;padding:40px 16px 20px;min-height:100vh}
+  #jl-bg .jl-corner,#jl-hudr{display:none}
+  #jl-status{position:relative;top:auto;left:auto;align-items:center;text-align:center;font-size:11px}
+  #jl-core{width:190px}
+  #jl-core .jl-scan{left:20px;right:20px;top:30px}
+  html.jl-skin body>.content{padding:28px 22px 20px}
+  html.jl-skin ha-authorize h1{font-size:24px}
+  #jl-note{position:relative;bottom:auto;left:auto;transform:none;white-space:normal;max-width:400px;margin-top:auto;line-height:1.5}
+}
+@media (max-height:640px) and (min-width:901px){#jl-core{width:min(28vw,60vh)}}
+
+/* phone in landscape (or any short screen in the narrow layout): a small core, so the card starts high */
+@media (max-width:900px) and (max-height:520px){
+  html.jl-skin body{padding-top:16px;gap:12px}
+  #jl-core{width:96px}
+  #jl-core .jl-scan{display:none}
+}
+
+/* tap targets at least 44 px high */
+html.jl-skin ha-authorize ha-checkbox::part(base){min-height:44px;align-items:center}   /* the clickable label itself */
+html.jl-skin ha-authorize a.forgot-password{display:inline-flex;align-items:center;min-height:44px;padding:0 2px}
+html.jl-skin ha-authorize .space-between{align-items:center}
+html.jl-skin ha-authorize .footer ha-button::part(base){min-height:44px}
+html.jl-skin ha-authorize .footer ha-language-picker{min-height:44px;display:inline-flex;align-items:center}
+
+/* ---------- reduced motion: nothing moves, nothing fades ---------- */
+@media (prefers-reduced-motion:reduce){
+  #jl-bg *,#jl-core *,.jl-hud *,html.jl-skin body>.content{animation:none!important;transition:none!important}
+  #jl-core .jl-scan{display:none}
+}

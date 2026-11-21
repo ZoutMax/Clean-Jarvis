@@ -1,0 +1,2165 @@
+"""JARVIS AI Assistant — Home Assistant integration."""
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+
+import voluptuous as vol
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_time_change,
+    async_track_state_change_event,
+)
+
+from .const import (
+    CONF_BEDROOM_AREAS,
+    CONF_BROADCAST_GROUP,
+    CONF_HONORIFIC,
+    CONF_TTS_ENGINE,
+    CONF_TTS_PREMIUM_ENGINE,
+    CONF_TTS_PREMIUM_CONTEXTS,
+    DEFAULT_HONORIFIC,
+    DEFAULT_TTS_ENGINE,
+    DEFAULT_TTS_PREMIUM_ENGINE,
+    DEFAULT_TTS_PREMIUM_CONTEXTS,
+    DOMAIN,
+)
+from .audio_routing import broadcast_target
+from .camera import (
+    async_analyze_camera,
+    async_auto_analyze_on_event,
+    register_event_listeners,
+)
+from .briefing import async_briefing
+from .scenes import async_activate_by_intent
+from .routines import async_run_routine, list_routines
+from .reminders import async_add_reminder_service, ReminderWatcher
+from .recognition import register_recognition_listener
+from .summary import async_summarise
+from .sentinel import JarvisSentinel
+from .database import purge_old_records, get_stats
+from .llm_provider import create_provider
+from .migrations import migrate_config, CURRENT_SCHEMA_VERSION
+from .panel_register import async_register_panel, async_unregister_panel
+from .websocket import async_register as async_register_ws
+from .proactive_audio import (
+    async_setup_proactive_audio,
+    async_unload_proactive_audio,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+JARVIS_SERVICE_NAMES = (
+    "analyze_camera",
+    "analyze_on_event",
+    "train_doorbell_backlog",
+    "check_packages",
+    "backup",
+    "restore",
+    "briefing",
+    "scene_by_intent",
+    "routine",
+    "add_reminder",
+    "conversation_summary",
+    "sentinel_start",
+    "sentinel_stop",
+    "database_purge",
+    "database_stats",
+    "replay_policy",
+    "nap",
+    "shush",
+    "unshush",
+    "observer_start",
+    "lockdown",
+    "remember",
+    "forget",
+    "observer_stop",
+    "observer_status",
+    "create_automation",
+    "diagnose_doorbell",
+    "test_notify",
+    "test_tts",
+    "test_routing",
+)
+
+
+def _prewarm_persisted_state() -> None:
+    """Read persisted state files once, off the event loop (blocking-I/O
+    hygiene). Best-effort — a failure here must never block setup."""
+    try:
+        from . import ha_secrets
+        ha_secrets._read_secrets(force=True)      # refresh + cache secrets.yaml
+    except Exception:
+        pass
+    try:
+        from . import modes
+        modes._load()
+    except Exception:
+        pass
+    try:
+        from . import intrusion
+        intrusion._load_log()
+    except Exception:
+        pass
+    try:
+        from . import reasoning_cache
+        reasoning_cache.load()
+    except Exception:
+        pass
+    try:   # Jarvis Home patch (2026-11-15): jh-loop-io - output mutes read here, never on the loop
+        from . import output_gate
+        output_gate._load_mutes()
+    except Exception:
+        pass
+
+PLATFORMS = ["conversation", "stt"]
+# Config-entry only (v6.45.0): warns users who still have `jarvis:` in YAML.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+# v6.45.0: the legacy add-on machinery is gone. Setup is config-entry only
+# (HACS → Add Integration), the conversation agent registers via PLATFORMS,
+# and /config/jarvis/config.json is the runtime store owned by the panel —
+# nothing external writes it. The old jarvis_config.json import trigger,
+# async_setup/async_setup_post_start hooks, and the ADDON_OWNED_KEYS
+# reconcile block were all paths for an add-on that no longer exists.
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up JARVIS from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+    from . import paths
+    paths.set_config_dir_from_hass(hass)
+
+    # Several storage helpers expose sync APIs and are imported before hass is
+    # available. Seed their module-level defaults once HA tells us its config dir.
+    from . import jarvis_config as _path_jc
+    _path_jc.set_config_path(paths.config_path("jarvis", "config.json", hass=hass))
+
+    # External DB location (issue #491c): relocate the .db files to a configured
+    # volume / network share. The setting lives in config.json (loaded just above,
+    # from the default dir), so reading it never depends on the share. Off the loop
+    # we create/verify the target, migrate existing databases into it once, and
+    # point all later DB opens there; any problem falls back to <config>/jarvis.
+    # Jarvis Home patch (2026-11-15): jh-config-off-loop - the first read of config.json (open + json.load) runs in the
+    # executor; HA warned about a blocking call in the event loop here. Later reads come from memory.
+    await hass.async_add_executor_job(_path_jc.get_all)
+    _db_store = str(_path_jc.get("db_storage_path", "") or "").strip()
+    if _db_store:
+        _default_jarvis = paths.config_path("jarvis", hass=hass)
+
+        def _relocate_dbs():
+            target = paths.set_jarvis_storage_dir(_db_store)
+            if target is None or str(target) == str(_default_jarvis):
+                return target
+            try:
+                import shutil
+                if not any(target.glob("*.db")) and _default_jarvis.exists():
+                    for f in _default_jarvis.glob("*.db*"):   # .db + -wal / -shm
+                        dst = target / f.name
+                        if f.is_file() and not dst.exists():
+                            shutil.copy2(str(f), str(dst))
+            except Exception:
+                pass
+            return target
+
+        _relocated = await hass.async_add_executor_job(_relocate_dbs)
+        if _relocated is not None and str(_relocated) != str(_default_jarvis):
+            _LOGGER.info("JARVIS: databases hosted at external path %s (issue #491)",
+                         _relocated)
+        elif _relocated is None:
+            _LOGGER.warning("JARVIS: db_storage_path %r is unusable (missing / not "
+                            "writable) — using the default <config>/jarvis", _db_store)
+
+    from . import database as _path_db
+    from . import ha_secrets as _path_hs
+    from . import reminders as _path_reminders
+    from . import routines as _path_routines
+    from . import websocket as _path_ws
+    _path_db.DB_PATH = paths.config_path("jarvis", "conversations.db", hass=hass)
+    _path_hs.SECRETS_PATH = paths.config_path("secrets.yaml", hass=hass)
+    _path_reminders.DB_PATH = paths.config_path("jarvis", "reminders.db", hass=hass)
+    _path_routines.ROUTINE_FILE = paths.config_path_str("jarvis_routines.yaml", hass=hass)
+    _path_ws._LOG_FILE = paths.config_path("jarvis", "jarvis.log", hass=hass)
+
+    # ── Run config migrations if entry is from an older schema ──────────────
+    current_version = entry.data.get("schema_version", 1)
+    if current_version < CURRENT_SCHEMA_VERSION:
+        new_data   = dict(entry.data)
+        new_options = dict(entry.options)
+        new_data, new_options, new_version = migrate_config(
+            new_data, new_options, current_version
+        )
+        new_data["schema_version"] = new_version
+        hass.config_entries.async_update_entry(
+            entry, data=new_data, options=new_options
+        )
+        _LOGGER.info(
+            "JARVIS: migrated config from schema v%d to v%d",
+            current_version, new_version,
+        )
+
+    honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+
+    # ── LLM provider — resolved from the single source of truth (jarvis_config
+    # wins over stale entry data/options) so the boot client, conversation, and
+    # agent never diverge on which model to run. ───────────────────────────
+    from . import jarvis_config as _jc
+    from . import ha_secrets as _hs
+    await hass.async_add_executor_job(
+        _jc.init_from_entry,
+        dict(entry.data), dict(entry.options),
+    )
+    await _hs.relocate_entry_credentials(hass, entry)
+    await _hs.relocate_plaintext_credentials(hass, entry)
+    _eff = await hass.async_add_executor_job(_jc.effective_config, entry)
+    # Warm the remaining persisted-state caches off the event loop too, so the
+    # hot paths that read them (observer tick, panel data, intrusion log) don't
+    # trip Home Assistant's blocking-I/O detector on first access.
+    await hass.async_add_executor_job(_prewarm_persisted_state)
+    try:   # Jarvis Home patch (2026-11-15): jh-loop-io - capability trust read off the loop
+        from . import actuation as _jh_act
+        await hass.async_add_executor_job(_jh_act._learn_store_load, hass)
+    except Exception:
+        pass
+    # Governance: apply any owner overrides for the kernel enforce kill-switches
+    # (set from the panel's Governance tab) to the live flags. With nothing
+    # stored — the shipped state — this is a no-op, so boot behaviour is
+    # unchanged. Defensive; never raises into setup.
+    try:
+        from . import enforcement as _enforcement
+        await hass.async_add_executor_job(_enforcement.apply_overrides)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: enforcement overrides skipped: %s", exc)
+    llm_provider_name = _eff.get("llm_provider", "groq")
+    llm_model         = _eff.get("model", "openai/gpt-oss-120b")
+    from .const import resolve_provider_base_url
+    llm_base_url = resolve_provider_base_url(_eff, llm_provider_name)
+    await _hs.promote_shared_secret_for_provider(hass, llm_provider_name)
+    # Credentials live only in secrets.yaml — each provider has its own entry
+    # (PROVIDER_API_KEY_FIELDS) so switching the Main Agent's provider can't
+    # reuse a stale/different provider's key.
+    api_key = await _hs.async_get_provider_key(hass, llm_provider_name)
+
+    try:
+        llm_client = await hass.async_add_executor_job(
+            create_provider,
+            llm_provider_name, api_key, llm_model, llm_base_url,
+        )
+        _LOGGER.info(
+            "JARVIS: LLM provider '%s' initialised (model=%s)",
+            llm_provider_name, llm_model,
+        )
+    except Exception as exc:
+        _LOGGER.error("JARVIS: LLM provider init failed: %s", exc)
+        return False
+
+    sentinel = JarvisSentinel(hass, llm_client, honorific, entry=entry)
+    client_ref = {"client": llm_client}
+
+    def _current_client():
+        return client_ref["client"]
+
+    # Register camera event listeners (nest_event, frigate_event)
+    camera_unsubs = register_event_listeners(hass)
+
+    # Central scheduler for periodic sweeps + a resource registry for one-call,
+    # fail-safe teardown on unload/reload (v7.43.0).
+    from .scheduler import JarvisScheduler
+    from .resources import JarvisResources
+    sched = JarvisScheduler(hass)
+    resources = JarvisResources()
+
+    # ── Kernel event bus (Phase 1, SHADOW MODE) ──────────────────────────────
+    # The observer, camera and voice paths publish JarvisEvents to this bus
+    # alongside their existing logic; the ledger records them to its own SQLite
+    # file for a queryable, correlated trail (docs/KERNEL_PLAN.md). Nothing
+    # consumes events to drive behaviour yet. Entirely best-effort: a bus or
+    # ledger failure can never affect the authoritative paths. The ledger
+    # buffers in memory and is flushed off-loop on a scheduler tick (and on
+    # unload), so a high-frequency source like state_changed never blocks the loop.
+    from .kernel import EventLedger, JarvisEventBus
+    event_bus = JarvisEventBus()
+    event_ledger = EventLedger(paths.config_path_str("jarvis", "events.db", hass=hass))
+    event_bus.subscribe_all(event_ledger.record)
+    # MCU Phase H: the cross-path thrash reactor consumes the actuation stream so
+    # the bus genuinely drives behaviour (the autonomous path backs off on
+    # cross-path thrash), not just a passive ledger. Best-effort.
+    try:
+        from . import actuation
+        actuation.register_stream_reactor(event_bus)
+        # MCU Phase H: a second bus consumer — the safety-situation reactor tracks
+        # elevated intrusion/hazard situations off the transition stream (reconciled
+        # from the store at boot) so discretionary autonomy pauses while JARVIS is
+        # handling a security / safety event.
+        actuation.register_situation_reactor(event_bus, hass)
+    except Exception:  # pragma: no cover - defensive, never block setup
+        pass
+
+    async def _flush_event_ledger(now=None):
+        await hass.async_add_executor_job(event_ledger.flush)
+
+    sched.add("event-ledger-flush", 30, _flush_event_ledger)
+
+    # ── Authority parity tally persistence (Step A.5) ────────────────────────
+    # The engine-vs-gate agreement tally lives in hass.data and otherwise resets
+    # on every restart, wiping the evidence the enforce-allowlist widening relies
+    # on. Load it at setup and flush it off-loop on a scheduler tick (and on
+    # unload) so it accrues across restarts and updates. Best-effort, drives
+    # nothing — a failure here never touches the authoritative actuator path.
+    from . import authority_bridge as _authority_bridge
+    await hass.async_add_executor_job(_authority_bridge.load_parity, hass)
+
+    async def _save_authority_parity(now=None):
+        await hass.async_add_executor_job(_authority_bridge.save_parity, hass)
+
+    sched.add("authority-parity-save", 300, _save_authority_parity)
+
+    # ── Authority parity OBSERVER (Step B — log-only) ────────────────────────
+    # The agent path only feeds the parity tally when JARVIS itself actuates a
+    # protected device, which for locks / alarms / covers barely ever happens —
+    # so the per-capability agreement the enforce-allowlist widening needs stays
+    # blank. This observer watches those domains for real state transitions
+    # (however initiated) and records engine-vs-gate parity into the same tally,
+    # so the decision becomes data-driven. Observe-only; never touches the
+    # authoritative path. Kill-switch: authority_observer.AUTHORITY_OBSERVER_ENABLED.
+    try:
+        from . import authority_observer as _authority_observer
+        _authority_parity_unsub = _authority_observer.register(hass)
+        if _authority_parity_unsub is not None:
+            resources.add_unsubs([_authority_parity_unsub])
+    except Exception as exc:  # never fail setup over a log-only observer
+        _LOGGER.debug("authority observer setup skipped: %s", exc)
+
+    # ── Continuity of self (roadmap Phase I, I2 — shadow) ───────────────────
+    # Log what JARVIS was in the middle of before this restart (active goals,
+    # open situations, mode), then capture a fresh agency snapshot periodically
+    # so the next boot can resume. SHADOW: reads live state, writes its own
+    # snapshot DB + a log line, drives nothing. Entirely best-effort — a failure
+    # can never affect the authoritative paths. Kill-switch:
+    # continuity.AGENCY_CAPTURE_ENABLED.
+    from . import continuity as _continuity
+    # Read the pre-restart snapshot FIRST — summary (I2) + reconcile (I3) both
+    # need it before the boot seed overwrites "latest" with a post-restart one.
+    await hass.async_add_executor_job(_continuity.boot_summary, hass)
+    await hass.async_add_executor_job(_continuity.boot_reconcile, hass)
+    # I4 (owner-gated, default OFF): speak that continuity line through the output
+    # seam when continuity.CONTINUITY_RESUME_ANNOUNCE is on — silent otherwise.
+    await _continuity.announce_resume(hass, entry)
+
+    async def _agency_capture(now=None):
+        await hass.async_add_executor_job(_continuity.capture_now, hass)
+
+    sched.add("agency-capture", 300, _agency_capture)
+    await _agency_capture()   # seed an initial snapshot so a quick restart resumes
+
+    # ── Durable token-telemetry store (MCU Tranche 1 — token cost accounting) ──
+    # The session usage ring (llm_provider) resets on restart, so measured LLM
+    # spend was only ever known for the current session. Fold its records into a
+    # small on-disk lifetime + per-day cost ledger on a tick (and on unload) so
+    # the accounting survives reboots. Observe-only and best-effort — a failure
+    # never touches a call path. Kill-switch: llm_provider.TOKEN_TELEMETRY_PERSIST
+    # / the token_telemetry_persist config key.
+    async def _flush_token_telemetry(now=None):
+        try:
+            from . import llm_provider as _llm, token_store as _token_store
+            if not _llm.telemetry_persist_enabled():
+                _llm.drain_pending_records()      # keep the buffer bounded when off
+                return
+            records = _llm.drain_pending_records()
+            if records:
+                await hass.async_add_executor_job(_token_store.flush, hass, records)
+        except Exception as exc:
+            _LOGGER.debug("token telemetry flush tick error: %s", exc)
+
+    sched.add("token-telemetry-flush", 300, _flush_token_telemetry)
+
+    # ── Keep the local Ollama model warm (MCU latency work) ──────────────────
+    # A cold Ollama load (e.g. Gemma 4 26B into the GPU) makes the FIRST turn
+    # after an idle gap take minutes, then every later turn is fast. keep_alive
+    # only holds a model AFTER a request, and JARVIS's num_ctx loads a separate
+    # resident instance from a hand-run CLI session — so nothing keeps JARVIS's
+    # own instance warm. Pin it: warm once now and on a periodic tick so the
+    # model is already resident when the user speaks. Local-only (the tick no-ops
+    # for cloud providers), off-loop, best-effort. Kill-switch:
+    # ollama_warm.OLLAMA_WARM_ENABLED / the ollama_keep_warm config key.
+    async def _ollama_warm_tick(now=None):
+        try:
+            from . import ollama_warm as _warm, fast_chat as _fast
+            # Also keep the fast-chat tier's small model resident, so a simple
+            # turn routed to it is instant too (not just the big Main Agent model).
+            extra = []
+            client = _current_client()
+            try:
+                from . import jarvis_config as _jc
+                cfg = {"fast_chat_enabled": _jc.get("fast_chat_enabled", False),
+                       "fast_model": _jc.get("fast_model", ""),
+                       "fast_provider": _jc.get("fast_provider", "")}
+                rc = (hass.data.get(DOMAIN, {}).get(entry.entry_id, {}) or {}).get(
+                    "runtime_config", {})
+                if isinstance(rc, dict):
+                    for k in ("fast_chat_enabled", "fast_model", "fast_provider"):
+                        if rc.get(k) not in (None, ""):
+                            cfg[k] = rc[k]
+                fm = _fast.fast_model_name(cfg)
+                # Only warm the fast model when it lives on the SAME backend as the
+                # Main Agent client (blank provider = inherit main). A fast model on
+                # a different provider is served elsewhere and can't be warmed via
+                # this client — and a cloud model has no cold-start to warm anyway.
+                fp = str(cfg.get("fast_provider") or "").strip()
+                main_name = str(getattr(client, "name", "") or "")
+                if fm and (not fp or fp == main_name):
+                    extra = [fm]
+            except Exception:
+                extra = []
+            await _warm.async_warm(hass, client, extra_models=extra)
+        except Exception as exc:
+            _LOGGER.debug("ollama warm tick error: %s", exc)
+
+    try:
+        from . import ollama_warm as _warm_mod
+        sched.add("ollama-warm", _warm_mod.OLLAMA_WARM_INTERVAL_S, _ollama_warm_tick)
+        hass.async_create_task(_ollama_warm_tick())   # warm immediately at startup
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: ollama keep-warm not scheduled: %s", exc)
+
+    # ── Auto-analyze camera events GOING FORWARD (doorbell / person) ─────────
+    # The listeners above only CACHE Nest/Frigate events — historically nothing
+    # was analyzed unless a user automation called jarvis.analyze_on_event. These
+    # listeners make JARVIS inspect notable events itself: a doorbell PRESS always
+    # gets a look; person/motion are throttled per-camera so a busy street/sidewalk
+    # can't spam the vision model, and the spoken announcement is still notability-
+    # gated (only deliveries, unfamiliar people, etc. are voiced). Toggle:
+    # General → "Camera Watch" (camera_auto_analyze); motion behind a second flag.
+    import time as _auto_time
+    from .camera import _nest_device_to_camera as _nest2cam
+
+    _auto_cd: dict[str, float] = {}      # person/motion throttle, per entity
+    _chime_cd: dict[str, float] = {}     # doorbell-press anti-double, per entity
+
+    def _auto_flag(key: str, default: bool) -> bool:
+        try:
+            _d = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            _rc = _d.get("runtime_config", {}) if isinstance(_d, dict) else {}
+            if key in _rc:
+                _v = _rc[key]
+                return _v if isinstance(_v, bool) else str(_v).lower() in ("1", "true", "yes", "on")
+        except Exception:
+            pass
+        return default
+
+    def _auto_fire(entity_id: str, reason: str, ctx: str, doorbell: bool = False) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context=ctx)
+        spk = _get_speakers(hass, entry)
+        hass.async_create_task(
+            async_auto_analyze_on_event(
+                hass, _current_client(), honorific, tts, spk, entity_id, reason, doorbell=doorbell
+            )
+        )
+
+    @callback
+    def _auto_nest(event) -> None:
+        if not _auto_flag("camera_auto_analyze", True):
+            return
+        try:
+            data = event.data
+            device_id = data.get("device_id") or data.get("nest_device_id")
+            etype = str(data.get("type") or data.get("event_type") or "").lower()
+            if not device_id:
+                return
+            # Doorbell PRESS → the full announced analysis. Person events feed
+            # SILENT visitor learning (training data only, never spoken) when
+            # enabled; motion/sound stay ignored.
+            if "chime" not in etype and "doorbell" not in etype:
+                if "person" in etype and _auto_flag("visitor_learning", True):
+                    entity_id = _nest2cam(hass, device_id)
+                    if not entity_id:
+                        return
+                    now = _auto_time.monotonic()
+                    if now - _auto_cd.get(entity_id, float("-inf")) < 180.0:
+                        return
+                    _auto_cd[entity_id] = now
+                    honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+                    from .camera import async_visitor_observation
+                    hass.async_create_task(
+                        async_visitor_observation(hass, _current_client(), honorific, entity_id)
+                    )
+                return
+            entity_id = _nest2cam(hass, device_id)
+            if not entity_id:
+                return
+            now = _auto_time.monotonic()
+            if now - _chime_cd.get(entity_id, float("-inf")) < 12.0:
+                return  # collapse a rapid double-press
+            _chime_cd[entity_id] = now
+            _auto_fire(entity_id, "Someone is at the front door", "doorbell", doorbell=True)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS auto-analyze (nest) error: %s", exc)
+
+    @callback
+    def _auto_frigate(event) -> None:
+        # Frigate has no doorbell-press concept; its events are person/object
+        # detections. With the doorbell-only default, leave Frigate dormant unless
+        # the user opts into the noisier non-doorbell analysis.
+        if not (_auto_flag("camera_auto_analyze", True)
+                and _auto_flag("camera_auto_analyze_motion", False)):
+            return
+        try:
+            data = event.data
+            if data.get("type") != "new":
+                return
+            after = data.get("after") or data.get("before") or {}
+            cam = after.get("camera")
+            label = str(after.get("label") or "").lower()
+            if not cam:
+                return
+            entity_id = f"camera.{str(cam).lower()}"
+            if not hass.states.get(entity_id):
+                return
+            if label and label not in (
+                "person", "car", "truck", "package", "dog", "cat", "bicycle", "motorcycle",
+            ):
+                return  # ignore irrelevant tracked objects
+            now = _auto_time.monotonic()
+            if now - _auto_cd.get(entity_id, float("-inf")) < 120.0:
+                return
+            _auto_cd[entity_id] = now
+            _auto_fire(entity_id, f"{label.capitalize()} detected" if label else "Motion detected", "camera")
+        except Exception as exc:
+            _LOGGER.debug("JARVIS auto-analyze (frigate) error: %s", exc)
+
+    try:
+        camera_unsubs.append(hass.bus.async_listen("nest_event", _auto_nest))
+        camera_unsubs.append(hass.bus.async_listen("frigate_event", _auto_frigate))
+        _LOGGER.info("JARVIS: camera auto-analysis active (doorbell always, person/motion throttled)")
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: auto-analyze listener registration failed: %s", exc)
+
+    # ── Generic HA motion → camera vision (opt-in, default off) ──────────────
+    # Nest/Frigate are the only built-in triggers above, so a user on plain HA
+    # cameras + a local vision model (no NVR) never gets a scene analysed on
+    # ordinary motion — which also starves best-effort face recognition (#140),
+    # since that rides on top of the vision analysis. This maps a motion/occupancy
+    # sensor firing to the camera covering its area and runs a SILENT analysis
+    # (no spoken alert; it only feeds scene learning + the recognition hook).
+    # Default OFF, throttled per-camera, so it never spams the vision model or
+    # adds announcements unless the user turns it on.
+    _motion_vision_cd: dict[str, float] = {}
+    MOTION_VISION_DEBOUNCE = 120.0
+    _MOTION_CLASSES = ("motion", "occupancy", "presence", "moving")
+
+    def _camera_covering_area(area_id: str) -> str | None:
+        """A camera entity in the given HA area (direct area assignment first,
+        then the saved floor-plan coverage). None if nothing covers it."""
+        if not area_id:
+            return None
+        try:
+            from .audio_routing import entity_area
+            for st in hass.states.async_all("camera"):
+                if entity_area(hass, st.entity_id) == area_id:
+                    return st.entity_id
+        except Exception:
+            pass
+        try:
+            from .camera_coverage import camera_for_area
+            from homeassistant.helpers import area_registry as _ar
+            area = _ar.async_get(hass).async_get_area(area_id)
+            if area and area.name:
+                return camera_for_area(hass, area.name)
+        except Exception:
+            pass
+        return None
+
+    @callback
+    def _auto_ha_motion(event) -> None:
+        if not _auto_flag("camera_motion_vision", False):
+            return
+        try:
+            data = event.data
+            new = data.get("new_state")
+            old = data.get("old_state")
+            if new is None or str(new.state).lower() != "on":
+                return
+            if old is not None and str(old.state).lower() == "on":
+                return  # only the off→on edge
+            if new.attributes.get("device_class") not in _MOTION_CLASSES:
+                return
+            from .audio_routing import entity_area
+            area_id = entity_area(hass, new.entity_id)
+            if not area_id:
+                return
+            cam = _camera_covering_area(area_id)
+            if not cam or not hass.states.get(cam):
+                return
+            now = _auto_time.monotonic()
+            if now - _motion_vision_cd.get(cam, float("-inf")) < MOTION_VISION_DEBOUNCE:
+                return
+            _motion_vision_cd[cam] = now
+            honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+            hass.async_create_task(
+                async_auto_analyze_on_event(
+                    hass, _current_client(), honorific, None, [], cam,
+                    "Motion detected", doorbell=False, announce=False,
+                )
+            )
+        except Exception as exc:
+            _LOGGER.debug("JARVIS auto-analyze (HA motion) error: %s", exc)
+
+    try:
+        from homeassistant.helpers.event import async_track_state_change_event
+        _motion_ids = [
+            st.entity_id for st in hass.states.async_all("binary_sensor")
+            if st.attributes.get("device_class") in _MOTION_CLASSES
+        ]
+        if _motion_ids:
+            camera_unsubs.append(
+                async_track_state_change_event(hass, _motion_ids, _auto_ha_motion)
+            )
+            _LOGGER.info("JARVIS: generic-motion camera vision available (opt-in) "
+                         "watching %d motion/occupancy sensors", len(_motion_ids))
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: HA-motion vision listener registration failed: %s", exc)
+
+    # ── Package & mail detection — periodic porch check ─────────────────────
+    # Deliveries often don't ring the bell (carrier drops and leaves), so a low-
+    # frequency vision sweep of the doorbell/porch camera catches them. Per-camera
+    # state means a package sitting all day is announced once, on arrival. Skipped
+    # during quiet hours. Toggle: General → "Package Watch" (package_detection).
+    PKG_INTERVAL = timedelta(minutes=15)
+
+    async def _package_tick(_now) -> None:
+        if not _auto_flag("package_detection", True):
+            return
+        try:
+            from . import package_monitor
+            honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+            tts = _get_tts(hass, entry, context="package")
+            spk = _get_speakers(hass, entry)
+            report = await package_monitor.periodic_check(
+                hass, _current_client(), honorific, tts, spk, configured_camera=None
+            )
+            _LOGGER.debug("JARVIS package check: %s", report)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS package tick error: %s", exc)
+
+    if sched.add("package", PKG_INTERVAL, _package_tick):
+        _LOGGER.info("JARVIS: package/mail detection active (porch sweep every %s min)",
+                     int(PKG_INTERVAL.total_seconds() // 60))
+
+    # Timely deliveries (v8.0.0): the 15-min sweep can be minutes late for a
+    # silent drop-off, so also react the instant porch/doorbell/driveway motion
+    # fires (or a mailbox opens) — debounced per sensor so a busy porch can't spam
+    # vision. A mailbox opening announces mail directly (no vision call).
+    _pkg_event_cd: dict[str, float] = {}
+    _pkg_mailbox_ids: set[str] = set()
+    PKG_EVENT_DEBOUNCE = 120.0
+    PKG_FOLLOWUP_DELAY = 60.0   # carriers drop the package a few seconds after the motion
+
+    async def _pkg_on_motion(event) -> None:
+        if not _auto_flag("package_detection", True):
+            return
+        try:
+            new = event.data.get("new_state")
+            old = event.data.get("old_state")
+            if not new or str(new.state) != "on":
+                return
+            if old is not None and str(old.state) == "on":
+                return                      # only the off→on (or unknown→on) edge
+            eid = event.data.get("entity_id")
+            import time as _t
+            now = _t.monotonic()
+            if now - _pkg_event_cd.get(eid, 0.0) < PKG_EVENT_DEBOUNCE:
+                return
+            _pkg_event_cd[eid] = now
+            from . import package_monitor
+            honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+            tts = _get_tts(hass, entry, context="package")
+            spk = _get_speakers(hass, entry)
+            if eid in _pkg_mailbox_ids:
+                # A mailbox opening is only a HINT — wind, an animal, or someone
+                # checking the mail trips it too. Confirm an actual delivery on a
+                # mailbox/porch/driveway camera (a mail carrier or delivery
+                # vehicle, or mail being delivered) before announcing. Only when
+                # no camera can see the spot do we fall back to trusting the
+                # sensor (carrier_present -> None). A direct announce, not a
+                # periodic_check: the porch camera has its own motion triggers,
+                # so sweeping it here could announce the same mail twice.
+                confirmed = await package_monitor.carrier_present(hass, _current_client())
+                if confirmed or confirmed is None:
+                    await package_monitor.announce_mail(hass, honorific, tts, spk, eid)
+                return
+            await package_monitor.periodic_check(
+                hass, _current_client(), honorific, tts, spk, configured_camera=None)
+
+            # Motion usually fires as the carrier ARRIVES; the package lands a few
+            # seconds later and the leaving motion is inside the debounce. Look
+            # once more after they've likely gone. The per-camera state machine
+            # de-dupes, so this can never announce the same delivery twice.
+            async def _followup(_now) -> None:
+                try:
+                    if not _auto_flag("package_detection", True):
+                        return
+                    await package_monitor.periodic_check(
+                        hass, _current_client(), honorific, tts, spk,
+                        configured_camera=None)
+                except Exception as exc:
+                    _LOGGER.debug("JARVIS package follow-up check error: %s", exc)
+
+            async_call_later(hass, PKG_FOLLOWUP_DELAY, _followup)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS package motion trigger error: %s", exc)
+
+    try:
+        from . import package_monitor as _pm
+        _pkg_mailbox_ids.update(_pm.mailbox_sensors(hass))
+        _pkg_trigger_ids = list(dict.fromkeys(
+            _pm.delivery_motion_sensors(hass) + sorted(_pkg_mailbox_ids)))
+        if _pkg_trigger_ids:
+            camera_unsubs.append(
+                async_track_state_change_event(hass, _pkg_trigger_ids, _pkg_on_motion))
+            _LOGGER.info("JARVIS: instant package/mail triggers active on %d sensor(s)",
+                         len(_pkg_trigger_ids))
+    except Exception as exc:
+        _LOGGER.debug("JARVIS package motion trigger setup failed: %s", exc)
+
+    # ── Arrival greeting (opt-in, default OFF) — v9.84.0 ───────────────────────
+    # Greet a resident by name when they come through a door the household chose,
+    # within chosen hours. "Who arrived" is resolved by recognition or presence
+    # (arrival_greeting.identify_arrival); when no resident can be named, JARVIS
+    # stays silent — it never greets a stranger or guesses. A per-person cooldown
+    # lives in arrival_greeting; a short per-door debounce here stops a bouncing
+    # contact double-firing. The door list / hours / cooldown are read live, so
+    # changes apply without a restart (the set of watched sensors is fixed at
+    # setup — a newly-added non-door-class entity needs a reload to be watched).
+    _greet_door_cd: dict[str, float] = {}
+    GREET_DOOR_DEBOUNCE = 8.0
+
+    def _greet_doors_cfg():
+        from . import jarvis_config as _jc
+        doors = _jc.get("arrival_greeting_doors", []) or []
+        if isinstance(doors, str):
+            import json as _json
+            try:
+                doors = _json.loads(doors)
+            except Exception:
+                doors = [d.strip() for d in doors.replace("\n", ",").split(",") if d.strip()]
+        return doors if isinstance(doors, list) else []
+
+    async def _arrival_door_opened(event) -> None:
+        try:
+            from . import arrival_greeting, jarvis_config
+            if not bool(jarvis_config.get("arrival_greeting_enabled", False)):
+                return
+            new = event.data.get("new_state")
+            old = event.data.get("old_state")
+            if not new or str(new.state) != "on":
+                return
+            if old is not None and str(old.state) == "on":
+                return                               # off→on edge only
+            eid = event.data.get("entity_id")
+            if eid not in _greet_doors_cfg():
+                return
+            import time as _t
+            now_m = _t.monotonic()
+            if now_m - _greet_door_cd.get(eid, 0.0) < GREET_DOOR_DEBOUNCE:
+                return
+            _greet_door_cd[eid] = now_m
+            from datetime import datetime as _dt
+            _n = _dt.now()
+            if not arrival_greeting.within_hours(
+                    _n.hour * 60 + _n.minute,
+                    jarvis_config.get("arrival_greeting_start", ""),
+                    jarvis_config.get("arrival_greeting_end", "")):
+                return
+            name = arrival_greeting.identify_arrival(hass)
+            if not name:
+                return                               # stay silent — never guess
+            if not arrival_greeting.has_departed(name):
+                return                               # only greet a genuine return — they must have left first
+            cd = jarvis_config.get("arrival_greeting_cooldown_min",
+                                   arrival_greeting.DEFAULT_COOLDOWN_MIN)
+            if not arrival_greeting.allow_greeting(name, cd):
+                return
+            arrival_greeting.clear_departure(name)   # consume: one welcome per leave→return
+            try:
+                from . import briefing
+                tg = briefing._time_greeting()
+            except Exception:
+                tg = ""
+            text = arrival_greeting.greeting_text(name, tg)
+            if not text:
+                return
+            tts = _get_tts(hass, entry, context="greeting")
+            spk = _get_speakers(hass, entry)
+            from .tts_helper import async_announce
+            await async_announce(hass, text, tts, spk, context="greeting")
+            try:
+                from .websocket import jarvis_log
+                jarvis_log("GREETING", f"welcomed {name} ({eid})")
+            except Exception:
+                pass
+        except Exception as exc:
+            _LOGGER.debug("JARVIS arrival greeting error: %s", exc)
+
+    def _presence_departed(event) -> None:
+        # Record a resident leaving the property (person/device_tracker → away) so
+        # the greeting only fires on a genuine leave→return. The leaving edge only;
+        # non-residents are ignored (only names on the face roster are tracked).
+        try:
+            from . import arrival_greeting
+            new = event.data.get("new_state")
+            if not new or str(new.state).lower() not in ("not_home", "away"):
+                return
+            old = event.data.get("old_state")
+            if old is not None and str(old.state).lower() in ("not_home", "away"):
+                return                               # already away → leaving edge only
+            attrs = getattr(new, "attributes", {}) or {}
+            nm = attrs.get("friendly_name") \
+                or str(event.data.get("entity_id", "")).split(".", 1)[-1]
+            if arrival_greeting._is_resident(nm):
+                arrival_greeting.note_departure(nm)
+        except Exception:
+            pass
+
+    try:
+        _door_classes = ("door", "garage_door", "garage", "gate", "opening")
+        _door_ids = [st.entity_id for st in hass.states.async_all("binary_sensor")
+                     if st.attributes.get("device_class") in _door_classes]
+        for _d in _greet_doors_cfg():            # include explicitly-chosen non-door-class sensors
+            if _d and _d not in _door_ids:
+                _door_ids.append(_d)
+        if _door_ids:
+            camera_unsubs.append(
+                async_track_state_change_event(hass, _door_ids, _arrival_door_opened))
+            _LOGGER.info("JARVIS: arrival-greeting listener on %d door sensor(s) (opt-in, "
+                         "default off)", len(_door_ids))
+        # Track resident departures (person + device_tracker) so a greeting only
+        # fires for someone who actually left — see arrival_greeting._departed.
+        _presence_ids = [st.entity_id
+                         for dom in ("person", "device_tracker")
+                         for st in hass.states.async_all(dom)]
+        if _presence_ids:
+            camera_unsubs.append(
+                async_track_state_change_event(hass, _presence_ids, _presence_departed))
+    except Exception as exc:
+        _LOGGER.debug("JARVIS arrival greeting listener setup failed: %s", exc)
+
+    # Hourly gentle service-health sweep (v6.70.3): re-runs the core-dependency
+    # checks on its own so the panel stays current without the user opening it.
+    # It's reachability-only and never alarms — a synthetic miss yields IDLE, and
+    # only a real-usage failure (recorded by the actual call sites) shows DOWN.
+    HEALTH_INTERVAL = timedelta(hours=1)
+
+    async def _health_tick(_now) -> None:
+        try:
+            from .diagnostics import run_service_health
+            res = await run_service_health(hass)
+            _LOGGER.debug("JARVIS hourly health: %s", res.get("summary"))
+        except Exception as exc:
+            _LOGGER.debug("JARVIS health tick error: %s", exc)
+
+    if sched.add("health", HEALTH_INTERVAL, _health_tick):
+        _LOGGER.info("JARVIS: hourly service-health sweep active")
+
+    # Multi-hazard monitor (v6.71.0): polls USGS/NWS/EONET every 10 min for new
+    # nearby significant events, scoped to home coordinates (or a panel override).
+    # No-op unless the user enables it; each feed fails safe (never fabricates).
+    HAZARD_INTERVAL = timedelta(minutes=10)
+
+    async def _hazard_tick(_now) -> None:
+        try:
+            from . import hazard_monitor
+            honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+            res = await hazard_monitor.periodic_check(hass, honorific)
+            if res.get("fired"):
+                _LOGGER.debug("JARVIS hazard sweep: %s", res)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS hazard tick error: %s", exc)
+
+    if sched.add("hazard", HAZARD_INTERVAL, _hazard_tick):
+        _LOGGER.info("JARVIS: multi-hazard monitor active (sweep every %s min)",
+                     int(HAZARD_INTERVAL.total_seconds() // 60))
+
+    # Automatic document ingestion (v6.79.0): pick up files dropped into
+    # /config/jarvis/documents (and any configured watch folders) without needing
+    # the manual Scan button. Incremental — only new/changed files are ingested,
+    # so this never re-embeds the whole library on a timer.
+    DOCS_SCAN_INTERVAL = timedelta(minutes=10)
+
+    async def _docs_tick(_now) -> None:
+        try:
+            from . import documents
+            res = await documents.auto_ingest_new(hass)
+            watch = await documents.scan_watch_folders(hass)
+            n = (res.get("new_files", 0) or 0) + (watch.get("new_files", 0) or 0)
+            if n:
+                _LOGGER.info("JARVIS: auto-ingested %d new document(s)", n)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS docs auto-ingest error: %s", exc)
+
+    if sched.add("documents", DOCS_SCAN_INTERVAL, _docs_tick):
+        _LOGGER.info("JARVIS: document auto-ingest active (scan every %s min)",
+                     int(DOCS_SCAN_INTERVAL.total_seconds() // 60))
+
+    # Daily knowledge-store maintenance: hard-purge facts past their TTL and
+    # deletion tombstones past their retention window (bounds knowledge.db growth
+    # without needing the user to run the database_purge service by hand).
+    KNOWLEDGE_PURGE_INTERVAL = timedelta(hours=24)
+
+    async def _knowledge_purge_tick(_now) -> None:
+        try:
+            from . import knowledge
+            removed = await hass.async_add_executor_job(knowledge.purge_expired)
+            if removed:
+                _LOGGER.info("JARVIS: daily knowledge purge removed %d row(s)", removed)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS knowledge purge tick error: %s", exc)
+
+    if sched.add("knowledge_purge", KNOWLEDGE_PURGE_INTERVAL, _knowledge_purge_tick):
+        _LOGGER.info("JARVIS: daily knowledge purge active")
+
+    # Daily DB-retention sweep (issue #491 — uncontrolled DB growth): bound the
+    # append-only observation stores — patterns.db (state_changes / commands) and
+    # jarvis.db (conversations / sentinel_events / activity_log) — to the
+    # configured window and VACUUM to reclaim disk, so they can't fill the volume.
+    # Pattern learning only looks back a week or two, so the default keeps far more
+    # than it needs. `db_retention_days` = 0 keeps everything (opt out).
+    DB_RETENTION_INTERVAL = timedelta(hours=24)
+    DEFAULT_DB_RETENTION_DAYS = 90
+
+    async def _db_retention_tick(_now) -> None:
+        try:
+            from . import jarvis_config, cognitive_core
+
+            def _cfg_int(key, dflt):
+                try:
+                    return int(jarvis_config.get(key, dflt))
+                except (TypeError, ValueError):
+                    return dflt
+
+            days = _cfg_int("db_retention_days", DEFAULT_DB_RETENTION_DAYS)
+            # Issue #491b — "keep the rule, flush the source": once a routine has
+            # been learned it lives in person_patterns / suggestions (never pruned),
+            # so the raw observation rows that fed it can go sooner than the general
+            # logs. A positive db_source_retention_days overrides the general window
+            # for the pattern store only. Keep it >= ~a month so the miner (which
+            # backfills 30 days and needs a week of recurrences) isn't starved.
+            src_days = _cfg_int("db_source_retention_days", 0)
+            pattern_days = src_days if src_days > 0 else days
+            total = 0
+            if pattern_days > 0:                 # 0 on both = retention disabled
+                logger = getattr(getattr(cognitive_core, "_CORE", None),
+                                 "state_logger", None)
+                if logger is not None:
+                    total += await hass.async_add_executor_job(
+                        logger.prune_old, pattern_days) or 0
+            if days > 0:
+                total += await hass.async_add_executor_job(purge_old_records, days) or 0
+            if total:
+                _LOGGER.info("JARVIS: DB retention sweep removed %d old row(s) "
+                             "(logs %d day(s), learning source %d day(s))",
+                             total, days, pattern_days)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS DB retention tick error: %s", exc)
+
+    if sched.add("db_retention", DB_RETENTION_INTERVAL, _db_retention_tick):
+        _LOGGER.info("JARVIS: daily DB-retention sweep active (default %d days)",
+                     DEFAULT_DB_RETENTION_DAYS)
+
+    # ── Scheduled briefings (v6.78.0) ─────────────────────────────────────────
+    # JARVIS delivers its own morning and evening briefing at configured clock
+    # times. Off by default; enable per-briefing in Settings. Each run reuses the
+    # same content engine as the jarvis.briefing service, so what you hear is
+    # identical to calling it by hand.
+    class _SchedCall:
+        """Minimal ServiceCall stand-in for a scheduled (non-service) run."""
+        def __init__(self, data: dict):
+            self.data = data
+
+    def _brief_cfg(key, default):
+        try:
+            from . import jarvis_config
+            v = jarvis_config.get(key, default)
+            return v if v is not None else default
+        except Exception:
+            return default
+
+    def _parse_hhmm(value, fallback_h, fallback_m):
+        try:
+            h, m = str(value).split(":")[:2]
+            h, m = int(h), int(m)
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h, m
+        except Exception:
+            pass
+        return fallback_h, fallback_m
+
+    async def _run_briefing(kind: str) -> None:
+        """Deliver a scheduled briefing if it's enabled and someone's home."""
+        try:
+            if not bool(_brief_cfg(f"briefing_{kind}_enabled", False)):
+                return
+            # Don't talk to an empty house unless explicitly allowed.
+            if bool(_brief_cfg("briefing_require_home", True)):
+                # Only skip when we are CONFIDENT the house is empty — every
+                # tracked person is explicitly away. Unknown/unavailable presence
+                # must not suppress the briefing (fail open); the old check
+                # silenced scheduled briefings whenever presence was not a clean
+                # "home".
+                try:
+                    from .presence import everyone_confidently_away
+                    if everyone_confidently_away(hass):
+                        _LOGGER.debug("JARVIS: skipping %s briefing — everyone away", kind)
+                        return
+                except Exception:
+                    pass
+            honorific = entry.options.get(CONF_HONORIFIC,
+                                          entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+            tts = _get_tts(hass, entry, context="briefing")
+            spk = _get_speakers(hass, entry)
+            call = _SchedCall({
+                "announce": True,
+                "include_weather": bool(_brief_cfg("briefing_include_weather", True)),
+                "include_calendar": bool(_brief_cfg("briefing_include_calendar", True)),
+                "include_presence": bool(_brief_cfg("briefing_include_presence", True)),
+                "include_events": bool(_brief_cfg("briefing_include_events", True)),
+                "include_energy": bool(_brief_cfg("briefing_include_energy", True)),
+                "include_hazards": bool(_brief_cfg("briefing_include_hazards", True)),
+                # morning looks back overnight; evening looks back over the day
+                "hours": 12 if kind == "morning" else 14,
+            })
+            await async_briefing(hass, call, _current_client(), honorific, tts, spk)
+            _LOGGER.info("JARVIS: delivered %s briefing", kind)
+        except Exception as exc:
+            # A scheduled briefing failing must be VISIBLE — this was
+            # previously debug-level, which hid a NameError entirely.
+            _LOGGER.warning("JARVIS %s briefing failed: %s", kind, exc)
+
+    async def _morning_briefing(_now) -> None:
+        await _run_briefing("morning")
+
+    async def _evening_briefing(_now) -> None:
+        await _run_briefing("evening")
+
+    try:
+        mh, mm = _parse_hhmm(_brief_cfg("briefing_morning_time", "07:30"), 7, 30)
+        eh, em = _parse_hhmm(_brief_cfg("briefing_evening_time", "19:30"), 19, 30)
+        camera_unsubs.append(async_track_time_change(
+            hass, _morning_briefing, hour=mh, minute=mm, second=0))
+        camera_unsubs.append(async_track_time_change(
+            hass, _evening_briefing, hour=eh, minute=em, second=0))
+        _LOGGER.info("JARVIS: briefings scheduled (morning %02d:%02d, evening %02d:%02d)",
+                     mh, mm, eh, em)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: briefing scheduler registration failed: %s", exc)
+
+    # Register DoubleTake MQTT face recognition listener
+    recognition_unsubs = await register_recognition_listener(hass)
+
+    # Reminder watcher — checks every 30 seconds for due reminders
+    reminder_watcher = ReminderWatcher(
+        hass,
+        honorific_getter=lambda: entry.options.get(
+            CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC)
+        ),
+        tts_getter=lambda: _get_tts(hass, entry, context="reminder"),
+        speakers_getter=lambda: _get_speakers(hass, entry),
+    )
+
+    # Hand every disposable to the resource registry so unload tears them all
+    # down in one fail-safe call. The scheduler is a closeable (its shutdown()
+    # cancels every timer); the listener unsubs are collected too.
+    resources.add_unsubs(camera_unsubs)
+    resources.add_unsubs(recognition_unsubs)
+    resources.add_closeable(sched)
+
+    hass.data[DOMAIN][entry.entry_id] = {
+        "client":             llm_client,
+        "client_ref":         client_ref,
+        "sentinel":           sentinel,
+        "camera_unsubs":      camera_unsubs,
+        "recognition_unsubs": recognition_unsubs,
+        "resources":          resources,
+        "scheduler":          sched,
+        "reminder_watcher":   reminder_watcher,
+        "llm_provider_name":  llm_provider_name,
+        "schema_version":     CURRENT_SCHEMA_VERSION,
+        "event_bus":          event_bus,
+        "event_ledger":       event_ledger,
+    }
+
+    # Register services (idempotent — guarded against double-registration on
+    # reload) + the options-reload listener, then forward the conversation
+    # platform AS EARLY AS POSSIBLE — so `conversation.jarvis` is registered
+    # before the disk-touching panel-settings restore below. The ESP32 voice
+    # satellites resolve the agent the moment they connect at boot/reconnect, and
+    # a late registration is what produced the transient
+    # "intent recognition engine conversation.jarvis is not found" errors. The
+    # agent reads runtime_config lazily, so the brief window before the restore
+    # completes just falls back to defaults.
+    _register_services(hass, entry, _current_client, sentinel)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    try:   # Jarvis Home patch (2026-11-15): jh-faces-profile - residents from profile pictures
+        from .recognition import jh_profile_setup
+        for _jh_u in jh_profile_setup(hass, entry):
+            entry.async_on_unload(_jh_u)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS: profile picture residents not started: %s", exc)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Restore persisted panel settings via centralized jarvis_config module.
+    # This loads from /config/jarvis/config.json (or migrates from old path).
+    # We restore EVERY panel-writable key (LLM provider/model selections,
+    # cognition tunables, floor plan, etc.) so choices made in the panel win
+    # over addon-config defaults and survive reboots/updates. runtime_config
+    # takes precedence over entry.options/data, so this is authoritative.
+    # Secrets (api_key, gemini_api_key, etc.) live only in secrets.yaml — never
+    # panel-writable, never restored from/to config.json (jarvis_config refuses
+    # to store them; see ha_secrets.py).
+    try:
+        from . import jarvis_config
+        from .websocket import PANEL_WRITABLE_KEYS
+
+        # Initialize config from entry data (backfill any missing keys)
+        await hass.async_add_executor_job(
+            jarvis_config.init_from_entry,
+            dict(entry.data), dict(entry.options),
+        )
+
+        # Load persisted settings into runtime_config
+        cfg = await hass.async_add_executor_job(jarvis_config.get_all)
+        # v6.48.0: a hand-edited config.json that couldn't be used was
+        # sidelined by jarvis_config.load() — tell the user loudly instead of
+        # silently reverting every setting to defaults.
+        if getattr(jarvis_config, "last_load_error", None):
+            try:
+                await hass.services.async_call(
+                    "persistent_notification", "create", {
+                        "title": "JARVIS: config.json was invalid",
+                        "message": (
+                            f"{jarvis_config.last_load_error}. JARVIS started "
+                            "with defaults. Fix the JSON in the preserved file "
+                            "and copy it back to /config/jarvis/config.json, "
+                            "then restart."),
+                        "notification_id": "jarvis_config_corrupt",
+                    }, blocking=False)
+            except Exception as exc:
+                _LOGGER.warning("JARVIS: could not raise config-corruption notice: %s", exc)
+        restore_keys = set(PANEL_WRITABLE_KEYS) | {
+            "broadcast_group", "observer_quiet_start",
+            "observer_quiet_end", "bedroom_areas",
+            "movie_media_player",  # so TTS routing can exclude the TV in-memory
+        }
+        rc = {k: cfg[k] for k in restore_keys if k in cfg}
+        if rc:
+            hass.data[DOMAIN][entry.entry_id]["runtime_config"] = rc
+            _LOGGER.info(
+                "Restored %d panel settings from jarvis_config (%d total keys in file)",
+                len(rc), len(cfg),
+            )
+    except Exception as exc:
+        _LOGGER.debug("Config restore: %s", exc)
+
+    # Auto-start Sentinel + Reminder watcher
+    await sentinel.async_start()
+    await reminder_watcher.async_start()
+
+    # ── v5.2 Observer Mode ──────────────────────────────────────────────────
+    # Observer subscribes to state_changed events and proactively announces
+    # interesting things through the LLM tier pipeline. OFF by default. Enabled
+    # via the panel (jarvis_config) or add-on config — read from effective_config
+    # so a panel-enabled observer stays on across a restart (v7.45.1).
+    observer_enabled = bool(_eff.get("observer_enabled", False))
+    if observer_enabled:
+        # Observer's own settings come from the same effective config (data +
+        # options + panel, panel winning), not bare entry, for the same reason.
+        observer_config = dict(_eff)
+        from . import observer as observer_mod
+        await observer_mod.start(hass, observer_config)
+        hass.data[DOMAIN][entry.entry_id]["observer_running"] = True
+        _LOGGER.info("JARVIS Observer mode ENABLED — watching for interesting events")
+    else:
+        hass.data[DOMAIN][entry.entry_id]["observer_running"] = False
+        _LOGGER.info(
+            "JARVIS Observer mode disabled. Enable via addon config → observer_enabled=true"
+        )
+
+    # ── Lockdown (security) — wired independently of Observer / cognitive loop ─
+    # Lockdown is safety-critical, so it must not depend on observer being on or
+    # on the cognitive-core start completing cleanly. Set up the manager + the
+    # event-driven alarm→lockdown sync here, regardless of the above.
+    try:
+        from . import cognitive_core, jarvis_config
+        rc = hass.data.get(DOMAIN, {}).get(
+            entry.entry_id, {}).get("runtime_config", {})
+        lockdown_config = await hass.async_add_executor_job(
+            jarvis_config.effective_config_with_runtime, entry, rc)
+        await cognitive_core.ensure_lockdown(hass, lockdown_config)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS lockdown wiring failed (non-fatal): %s", exc)
+
+    # ── v5.4 Command Center panel ──────────────────────────────────────────
+    # Register sidebar panel. Idempotent — safe if called after reload.
+    try:
+        await async_register_panel(hass)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS panel registration failed (non-fatal): %s", exc)
+
+    # Register WebSocket API command for live panel data
+    try:
+        async_register_ws(hass)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS WS command registration failed (non-fatal): %s", exc)
+
+    # Clean Jarvis: optional pages (Map, People, My phone, Household Chat) - commands and the nightly history purge
+    try:
+        from . import optional_pages
+        await optional_pages.async_setup(hass, entry)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS optional pages setup failed (non-fatal): %s", exc)
+
+    # ── v6.8 Proactive audio (jarvis.speak) + infrastructure audit ─────────
+    try:
+        await async_setup_proactive_audio(hass, entry)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS proactive-audio setup failed (non-fatal): %s", exc)
+
+    # ── v6.28 In-process bootstrap ─────────────────────────────────────────
+    # Re-homes the old add-on's voice-stack setup (Piper/Whisper/openWakeWord
+    # install, JARVIS voice download, Assist pipeline) into the integration.
+    # No-ops cleanly off-Supervisor; runs once per version as a background task.
+    try:
+        from . import bootstrap
+        bootstrap.schedule_bootstrap(hass)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS bootstrap scheduling failed (non-fatal): %s", exc)
+
+    # ── v6.34 Voice recognition ────────────────────────────────────────────
+    # Plug an external speaker-recognition service (VoiceBM, speaker-recognition,
+    # etc.) into the identity resolver's voice tier. No-op until enabled + a
+    # source entity is configured.
+    try:
+        from . import voice_recognition
+        voice_recognition.register(hass)
+    except Exception as exc:
+        _LOGGER.warning("JARVIS voice recognition registration failed (non-fatal): %s", exc)
+
+    # ── Faces panel restart persistence (issue #331) ───────────────────────────
+    # Restore the recognition + pinned-snapshot caches from the previous run so the
+    # Faces tab isn't empty after an HA/JARVIS restart. Executor — small file read.
+    try:
+        from . import recognition
+        await hass.async_add_executor_job(recognition.warm_start)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS recognition cache warm-start failed (non-fatal): %s", exc)
+    try:   # Jarvis Home patch (2026-11-07): older intrusion stills in www get unguessable names too
+        from . import intrusion as _jh_intrusion
+        await hass.async_add_executor_job(_jh_intrusion.retoken_old_stills)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS intrusion still rename failed (non-fatal): %s", exc)
+
+    try:   # reads routines.yaml — keep file I/O off the event loop
+        _routines = await hass.async_add_executor_job(list_routines)
+    except Exception:
+        _routines = []
+    _LOGGER.info("JARVIS online. Good day, %s. Routines available: %s",
+                 honorific, ", ".join(_routines))
+    return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry when options are updated."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Clean Jarvis (review round 4): JARVIS removed: put back what its optional switches changed outside JARVIS (Tuya
+    clean-up, Home Assistant's own Map made admin-only) and remove the login media and recorded Assist turns."""
+    try:
+        from .optional_cleanup import async_on_remove
+        await async_on_remove(hass, entry)
+    except Exception as exc:  # noqa: BLE001 - never block the removal
+        _LOGGER.warning("JARVIS: clean-up after removal failed: %s", exc)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload JARVIS."""
+    data = hass.data[DOMAIN].get(entry.entry_id, {})
+
+    # Persist the authority parity tally one last time on a clean unload/reload
+    # (Step A.5) so the agreement evidence survives. Best-effort — never blocks
+    # or fails the unload.
+    try:
+        from . import authority_bridge as _authority_bridge
+        await hass.async_add_executor_job(_authority_bridge.save_parity, hass)
+    except Exception:
+        pass
+
+    # Fold any unpersisted token-usage records into the durable cost ledger one
+    # last time (MCU Tranche 1), so a clean unload/reload doesn't drop the
+    # session's tail. Best-effort — never blocks or fails the unload.
+    try:
+        from . import llm_provider as _llm, token_store as _token_store
+        if _llm.telemetry_persist_enabled():
+            _records = _llm.drain_pending_records()
+            if _records:
+                await hass.async_add_executor_job(_token_store.flush, hass, _records)
+        else:
+            _llm.drain_pending_records()
+    except Exception:
+        pass
+
+    # Unregister the panel early — best effort
+    try:
+        async_unregister_panel(hass)
+    except Exception as exc:
+        _LOGGER.debug("Panel unregister note: %s", exc)
+
+    sentinel: JarvisSentinel | None = data.get("sentinel")
+    if sentinel:
+        await sentinel.async_stop()
+
+    reminder_watcher = data.get("reminder_watcher")
+    if reminder_watcher:
+        await reminder_watcher.async_stop()
+
+    # Stop observer if it's running
+    if data.get("observer_running"):
+        try:
+            from . import observer as observer_mod
+            await observer_mod.stop()
+        except Exception as exc:
+            _LOGGER.debug("Observer stop failed: %s", exc)
+
+    # Tear down listeners, timers, and the scheduler in one fail-safe call.
+    resources = data.get("resources")
+    if resources is not None:
+        try:
+            summary = resources.close_all()
+            _LOGGER.debug("JARVIS: resource teardown %s", summary)
+        except Exception as exc:
+            _LOGGER.debug("Resource teardown note: %s", exc)
+    else:
+        # Legacy entries (set up before the resource registry existed).
+        sched = data.get("scheduler")
+        if sched is not None:
+            try:
+                sched.shutdown()
+            except Exception:
+                pass
+        for unsub in data.get("camera_unsubs", []):
+            try:
+                unsub()
+            except Exception:
+                pass
+        for unsub in data.get("recognition_unsubs", []):
+            try:
+                if callable(unsub):
+                    unsub()
+            except Exception:
+                pass
+
+    # Cancel proactive-audio listeners (audit interval + startup) and service
+    try:
+        await async_unload_proactive_audio(hass, entry)
+    except Exception as exc:
+        _LOGGER.debug("Proactive-audio unload note: %s", exc)
+
+    # Stop the persistent-log writer thread so it doesn't outlive the entry and
+    # leak across reloads. The join is brief but blocks, so run it off-loop.
+    try:
+        from .websocket import stop_log_writer
+        await hass.async_add_executor_job(stop_log_writer)
+    except Exception as exc:
+        _LOGGER.debug("Log-writer stop note: %s", exc)
+
+    # Flush any buffered events so the shadow trail isn't lost on unload/reload.
+    event_ledger = data.get("event_ledger")
+    if event_ledger is not None:
+        try:
+            await hass.async_add_executor_job(event_ledger.flush)
+        except Exception as exc:
+            _LOGGER.debug("Event-ledger flush note: %s", exc)
+
+    # Remove services registered by this entry using a single source of truth so
+    # the reload/unload lifecycle stays symmetric as new services are added.
+    for service in JARVIS_SERVICE_NAMES:
+        hass.services.async_remove(DOMAIN, service)
+
+    ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    return ok
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_tts(hass: HomeAssistant, entry: ConfigEntry, context: str = "chat") -> str | None:
+    """
+    Return the TTS entity to use for this context.
+
+    For 'premium' contexts (briefing/doorbell/camera/recognition by default)
+    we route to the premium TTS engine (ElevenLabs) if configured.
+    All other contexts use the regular engine (Piper or similar).
+    """
+    from .tts_helper import resolve_tts_for_context
+    # Effective config (jarvis_config wins). entry.options is empty when all
+    # config lives in the panel store, which previously left the briefing unable
+    # to resolve its TTS engine — so it silently bailed before announcing.
+    try:
+        from . import jarvis_config
+        cfg = jarvis_config.effective_config(entry)
+    except Exception:
+        cfg = {**dict(entry.data), **dict(entry.options)}
+
+    regular = cfg.get(CONF_TTS_ENGINE, DEFAULT_TTS_ENGINE)
+    premium = cfg.get(CONF_TTS_PREMIUM_ENGINE, DEFAULT_TTS_PREMIUM_ENGINE)
+    premium_contexts = cfg.get(CONF_TTS_PREMIUM_CONTEXTS, DEFAULT_TTS_PREMIUM_CONTEXTS)
+
+    return resolve_tts_for_context(
+        hass, context, regular, premium, premium_contexts
+    )
+
+
+def _get_speakers(hass: HomeAssistant, entry: ConfigEntry) -> list[str]:
+    """
+    Return the list of speakers for PROACTIVE ANNOUNCEMENTS.
+    Checks runtime_config.announcement_speakers first, falls back to
+    broadcast_group from entry options/data.
+    """
+    import json as _json
+
+    def _as_list(raw):
+        if not raw:
+            return None
+        try:
+            v = _json.loads(raw) if isinstance(raw, str) else raw
+            return v if isinstance(v, list) and v else None
+        except Exception:
+            return None
+
+    # Panel-live value first (runtime_config)
+    try:
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+        live = _as_list(rc.get("announcement_speakers"))
+        if live:
+            _LOGGER.debug("Announcement speakers from panel config: %s", live)
+            return live
+    except Exception as exc:
+        _LOGGER.debug("Error reading announcement_speakers: %s", exc)
+
+    # Authoritative effective config (jarvis_config wins). entry.options is empty
+    # when all config lives in the panel store — previously this fell through to
+    # an empty broadcast group, leaving announcements with no speakers.
+    try:
+        from . import jarvis_config
+        cfg = jarvis_config.effective_config(entry)
+    except Exception:
+        cfg = {**dict(entry.data), **dict(entry.options)}
+    speakers = _as_list(cfg.get("announcement_speakers"))
+    if speakers:
+        return speakers
+    result = broadcast_target(hass, broadcast_group=(cfg.get(CONF_BROADCAST_GROUP) or None))
+    _LOGGER.debug("Announcement speakers from broadcast_group: %s", result)
+    return result
+
+
+def _register_services(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    client_getter,
+    sentinel: JarvisSentinel,
+) -> None:
+    """Register all JARVIS services. Called once per entry setup."""
+
+    # Jarvis Home patch (2026-11-06): the services any household login may call, the ones the panel and daily
+    # use need. An allowlist, so a new service starts as admin only. Automations carry no user and are not limited.
+    _JH_OPEN_SERVICES = frozenset({"analyze_camera", "briefing", "scene_by_intent", "routine", "add_reminder",
+                                   "check_packages", "nap", "shush", "unshush", "observer_status"})
+
+    def _register_service(name: str, handler, schema=None) -> None:
+        """Guard registration so reloads are idempotent and unload stays symmetric."""
+        if name not in JARVIS_SERVICE_NAMES:
+            raise ValueError(f"Unlisted JARVIS service: {name}")
+        if hass.services.has_service(DOMAIN, name):
+            _LOGGER.debug("JARVIS service already registered: %s.%s", DOMAIN, name)
+            return
+        if name not in _JH_OPEN_SERVICES:
+            from homeassistant.helpers.service import async_register_admin_service
+            async_register_admin_service(hass, DOMAIN, name, handler,
+                                         schema=vol.Schema({}, extra=vol.ALLOW_EXTRA) if schema is None else schema)
+            return
+        if schema is None:
+            hass.services.async_register(DOMAIN, name, handler)
+        else:
+            hass.services.async_register(DOMAIN, name, handler, schema=schema)
+
+    async def _camera(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="camera")
+        spk = _get_speakers(hass, entry)
+        await async_analyze_camera(hass, call, client_getter(), honorific, tts, spk)
+
+    _register_service(
+        "analyze_camera",
+        _camera,
+        schema=vol.Schema({
+            vol.Required("entity_id"): cv.entity_id,
+            vol.Optional("prompt"): cv.string,
+            vol.Optional("announce", default=True): cv.boolean,
+        }),
+    )
+
+    async def _analyze_on_event(call: ServiceCall) -> None:
+        """Push-triggered analyze — intended for doorbell/motion automations."""
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="doorbell")
+        spk = _get_speakers(hass, entry)
+        entity_id = call.data["entity_id"]
+        reason    = call.data.get("reason", "Activity detected")
+        await async_auto_analyze_on_event(
+            hass, client_getter(), honorific, tts, spk, entity_id, reason
+        )
+
+    _register_service(
+        "analyze_on_event",
+        _analyze_on_event,
+        schema=vol.Schema({
+            vol.Required("entity_id"): cv.entity_id,
+            vol.Optional("reason", default="Activity detected"): cv.string,
+        }),
+    )
+
+    # ── Doorbell backlog → training data ───────────────────────────────────────
+    async def _train_backlog(call: ServiceCall) -> None:
+        """Analyse the Nest doorbell's recorded event history into the training
+        log. Best-effort; reports how many events it managed to analyse."""
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        limit = int(call.data.get("limit", 40) or 40)
+        from . import doorbell_training
+        from .camera import async_analyze_camera, _FakeCall, active_cameras, active_camera_states
+
+        # Resolve a doorbell camera entity for naming/attribution
+        doorbell_entity = None
+        for st in active_camera_states(hass):
+            if any(k in st.entity_id for k in ("doorbell", "front_door")):
+                doorbell_entity = st.entity_id
+                break
+        if doorbell_entity is None:
+            cams = active_cameras(hass)
+            doorbell_entity = cams[0] if cams else "camera.front_doorbell"
+
+        async def _analyze_image(image_bytes, label):
+            prompt = (
+                f"Recorded doorbell event ({label}). Identify who is at the door — "
+                f"appearance, clothing, packages, vehicles. "
+                f"Focus on what {honorific} would want to know."
+            )
+            fc = _FakeCall({"entity_id": doorbell_entity, "prompt": prompt, "announce": False})
+            return await async_analyze_camera(
+                hass, fc, client_getter(), honorific, None, [],
+                gate_announce=True, force_images=[image_bytes],
+            )
+
+        report = await doorbell_training.scan_backlog(hass, _analyze_image, honorific, limit=limit)
+        _LOGGER.info("JARVIS doorbell backlog scan: %s", report)
+        try:
+            from .websocket import jarvis_log
+            if report.get("ok"):
+                jarvis_log("CAMERA",
+                           f"Backlog training: analysed {report['analyzed']} doorbell "
+                           f"event(s) into the dataset (of {report['found']} found)")
+            else:
+                jarvis_log("CAMERA", f"Backlog training: {report.get('reason', 'no events analysed')}")
+        except Exception:
+            pass
+
+    _register_service(
+        "train_doorbell_backlog",
+        _train_backlog,
+        schema=vol.Schema({
+            vol.Optional("limit", default=40): vol.Coerce(int),
+        }),
+    )
+
+    async def _check_packages(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="package")
+        spk = _get_speakers(hass, entry)
+        from . import package_monitor
+        cam = call.data.get("entity_id")
+        report = await package_monitor.periodic_check(
+            hass, client_getter(), honorific, tts, spk, configured_camera=cam
+        )
+        _LOGGER.info("JARVIS manual package check: %s", report)
+
+    _register_service(
+        "check_packages",
+        _check_packages,
+        schema=vol.Schema({
+            vol.Optional("entity_id"): cv.entity_id,
+        }),
+    )
+
+    async def _briefing(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="briefing")
+        spk = _get_speakers(hass, entry)
+        _jh_uid = getattr(getattr(call, "context", None), "user_id", None)
+        if _jh_uid:   # review round 8 (jh-r8-briefing): a login that is not an administrator gets a briefing by the where-is
+            # rule: no calendar events, and no home/away line while anyone is hidden from it
+            from types import SimpleNamespace as _JhNs
+            try:
+                _jh_user = await hass.auth.async_get_user(_jh_uid)
+                if _jh_user is None or not _jh_user.is_admin:
+                    from .presence import jh_hidden_people
+                    _jh_hid = await jh_hidden_people(hass, _jh_uid)
+                    call = _JhNs(data={**dict(call.data), "include_calendar": False,
+                                       **({"include_presence": False} if _jh_hid else {})}, context=call.context)
+            except Exception:   # the rule cannot be checked: the private parts are left out
+                call = _JhNs(data={**dict(call.data), "include_calendar": False, "include_presence": False}, context=call.context)
+        await async_briefing(hass, call, client_getter(), honorific, tts, spk)
+
+    async def _jarvis_backup(call):
+        from .backup import create_backup
+        path = await hass.async_add_executor_job(create_backup, hass.config.path())
+        _LOGGER.info("JARVIS state backed up to %s", path)
+        await hass.services.async_call("persistent_notification", "create", {
+            "title": "JARVIS backup",
+            "message": (f"JARVIS state saved to:\n`{path}`\n\nDownload this file before "
+                        "re-flashing so memory, patterns and knowledge survive a wipe."),
+            "notification_id": "jarvis_backup",
+        }, blocking=False)
+
+    _register_service("backup", _jarvis_backup)
+
+    async def _jarvis_restore(call):
+        from .backup import restore_backup
+        archive = (call.data or {}).get("archive", "") or ""
+        path = await hass.async_add_executor_job(restore_backup, hass.config.path(), archive)
+        _LOGGER.info("JARVIS state restored from %s", path)
+        await hass.services.async_call("persistent_notification", "create", {
+            "title": "JARVIS restore",
+            "message": (f"JARVIS state restored from:\n`{path}`\n\nRestart Home Assistant "
+                        "to load the restored memory and patterns."),
+            "notification_id": "jarvis_restore",
+        }, blocking=False)
+
+    _register_service(
+        "restore",
+        _jarvis_restore,
+        schema=vol.Schema({vol.Optional("archive"): str}),
+    )
+
+    _register_service(
+        "briefing",
+        _briefing,
+        schema=vol.Schema({
+            vol.Optional("announce", default=True): cv.boolean,
+            vol.Optional("include_weather", default=True): cv.boolean,
+            vol.Optional("include_calendar", default=True): cv.boolean,
+            vol.Optional("include_presence", default=True): cv.boolean,
+            vol.Optional("include_events", default=True): cv.boolean,
+            vol.Optional("include_energy", default=True): cv.boolean,
+            vol.Optional("hours", default=12): vol.All(int, vol.Range(min=1, max=48)),
+        }),
+    )
+
+    async def _scene_intent(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="chat")
+        spk = _get_speakers(hass, entry)
+        await async_activate_by_intent(hass, call, client_getter(), honorific, tts, spk)
+
+    _register_service(
+        "scene_by_intent",
+        _scene_intent,
+        schema=vol.Schema({
+            vol.Required("intent"): cv.string,
+            vol.Optional("announce", default=True): cv.boolean,
+        }),
+    )
+
+    async def _routine(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="routine")
+        spk = _get_speakers(hass, entry)
+        await async_run_routine(hass, call, honorific, tts, spk)
+
+    _register_service(
+        "routine",
+        _routine,
+        schema=vol.Schema({
+            vol.Required("name"): cv.string,
+        }),
+    )
+
+    async def _add_reminder(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="reminder")
+        spk = _get_speakers(hass, entry)
+        await async_add_reminder_service(hass, call, honorific, tts, spk)
+
+    _register_service(
+        "add_reminder",
+        _add_reminder,
+        schema=vol.Schema({
+            vol.Required("label"): cv.string,
+            vol.Required("trigger_at"): cv.string,
+            vol.Optional("repeat"): vol.In(["daily", "weekly", "hourly"]),
+            vol.Optional("require_home", default=True): cv.boolean,
+            vol.Optional("respect_quiet", default=True): cv.boolean,
+        }),
+    )
+
+    async def _summary(call: ServiceCall) -> None:
+        honorific = entry.options.get(CONF_HONORIFIC, entry.data.get(CONF_HONORIFIC, DEFAULT_HONORIFIC))
+        tts = _get_tts(hass, entry, context="summary")
+        spk = _get_speakers(hass, entry)
+        await async_summarise(hass, call, client_getter(), honorific, tts, spk)
+
+    _register_service(
+        "conversation_summary",
+        _summary,
+        schema=vol.Schema({
+            vol.Optional("hours", default=24): vol.All(int, vol.Range(min=1, max=168)),
+            vol.Optional("device_id"): cv.string,
+            vol.Optional("announce", default=True): cv.boolean,
+            vol.Optional("store", default=True): cv.boolean,
+        }),
+    )
+
+    async def _sentinel_start(call: ServiceCall) -> None:
+        await sentinel.async_start()
+
+    _register_service("sentinel_start", _sentinel_start)
+
+    async def _sentinel_stop(call: ServiceCall) -> None:
+        await sentinel.async_stop()
+
+    _register_service("sentinel_stop", _sentinel_stop)
+
+    async def _db_purge(call: ServiceCall) -> None:
+        days = call.data.get("days", 30)
+        deleted = await hass.async_add_executor_job(purge_old_records, days)
+        _LOGGER.info("JARVIS DB purge: %d records deleted (>%d days)", deleted, days)
+        # Also prune the pattern store (state_changes/commands) — the biggest
+        # append-only table — so a manual purge reclaims it too, not just jarvis.db.
+        try:
+            from . import cognitive_core
+            logger = getattr(getattr(cognitive_core, "_CORE", None),
+                             "state_logger", None)
+            if logger is not None:
+                p_deleted = await hass.async_add_executor_job(logger.prune_old, days)
+                if p_deleted:
+                    _LOGGER.info("JARVIS DB purge: %d pattern row(s) removed (>%d days)",
+                                 p_deleted, days)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS DB purge: pattern purge error: %s", exc)
+        try:
+            from . import knowledge
+            k_deleted = await hass.async_add_executor_job(knowledge.purge_expired)
+            if k_deleted:
+                _LOGGER.info("JARVIS DB purge: %d expired/tombstoned knowledge fact(s) removed",
+                             k_deleted)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS DB purge: knowledge purge error: %s", exc)
+
+    _register_service(
+        "database_purge",
+        _db_purge,
+        schema=vol.Schema({
+            vol.Optional("days", default=30): vol.All(int, vol.Range(min=1, max=365))
+        }),
+    )
+
+    async def _db_stats(call: ServiceCall) -> None:
+        stats = await hass.async_add_executor_job(get_stats)
+        hass.bus.async_fire("jarvis_db_stats", stats)
+
+    _register_service("database_stats", _db_stats)
+
+    async def _replay_policy(call: ServiceCall) -> None:
+        """Replay recorded decisions of a kind against candidate confidence
+        thresholds and report the best-separating threshold from real outcomes.
+        Read-only — evaluates history, never changes behaviour."""
+        from . import replay as _replay
+        kind = str(call.data.get("kind", "")).strip()
+        min_samples = call.data.get("min_samples") or _replay.DEFAULT_MIN_SAMPLES
+        result = await hass.async_add_executor_job(
+            _replay.replay_kind, kind, int(min_samples))
+        hass.bus.async_fire("jarvis_replay_result", result)
+        if result.get("ready"):
+            rec = result["recommended"]
+            _LOGGER.info(
+                "Replay[%s]: %d judged decisions — best threshold %.2f "
+                "(accuracy %.0f%%; would avoid %d mistakes, lose %d good calls)",
+                kind, result.get("samples", 0), rec["threshold"],
+                rec["accuracy"] * 100, rec["mistakes_avoided"], rec["good_calls_lost"])
+        else:
+            _LOGGER.info("Replay[%s]: %s", kind, result.get("reason", "no data"))
+
+    _register_service(
+        "replay_policy",
+        _replay_policy,
+        schema=vol.Schema({
+            vol.Required("kind"): str,
+            vol.Optional("min_samples"): vol.All(int, vol.Range(min=1, max=100000)),
+        }),
+    )
+
+    async def _nap(call: ServiceCall) -> None:
+        """Manual mute for N minutes (default 30). Suppresses non-critical
+        announcements until the duration elapses."""
+        from . import sleep_detection as sd
+        duration = call.data.get("duration_minutes", 30)
+        sd.set_nap(duration)
+        hass.bus.async_fire("jarvis_observer_nap", {"duration_minutes": duration})
+
+    _register_service(
+        "nap",
+        _nap,
+        schema=vol.Schema({
+            vol.Optional("duration_minutes", default=30):
+                vol.All(int, vol.Range(min=1, max=480)),
+        }),
+    )
+
+    async def _shush(call: ServiceCall) -> None:
+        """Tell JARVIS to stop announcing. Pass all=true for blanket kill switch."""
+        from . import output_gate
+        entity_id = call.data.get("entity_id")
+        category  = call.data.get("category")
+        shush_all = bool(call.data.get("all", False))
+        result = output_gate.shush(entity_id=entity_id, category=category, all=shush_all)
+        hass.bus.async_fire("jarvis_observer_shushed", result)
+        _LOGGER.info("JARVIS shushed: %s", result)
+
+    _register_service(
+        "shush",
+        _shush,
+        schema=vol.Schema({
+            vol.Optional("entity_id"): cv.string,
+            vol.Optional("category"): cv.string,
+            vol.Optional("all"): cv.boolean,
+        }),
+    )
+
+    async def _unshush(call: ServiceCall) -> None:
+        """Undo a shush. Called with no args clears ALL mutes."""
+        from . import output_gate
+        entity_id = call.data.get("entity_id")
+        category  = call.data.get("category")
+        result = output_gate.unshush(entity_id=entity_id, category=category)
+        hass.bus.async_fire("jarvis_observer_unshushed", result)
+
+    _register_service(
+        "unshush",
+        _unshush,
+        schema=vol.Schema({
+            vol.Optional("entity_id"): cv.string,
+            vol.Optional("category"): cv.string,
+        }),
+    )
+
+    async def _observer_start(call: ServiceCall) -> None:
+        """Start the observer manually (even if config has it disabled)."""
+        from . import observer as observer_mod, jarvis_config as _jc
+        observer_config = await hass.async_add_executor_job(_jc.effective_config, entry)
+        await observer_mod.start(hass, observer_config)
+        hass.data[DOMAIN][entry.entry_id]["observer_running"] = True
+        _LOGGER.info("Observer started via service call")
+
+    _register_service("observer_start", _observer_start)
+
+    async def _lockdown(call: ServiceCall) -> None:
+        """Engage or lift the formal lockdown state (alarm-armed posture)."""
+        from . import cognitive_core
+        raw = call.data.get("state", call.data.get("enabled", "on"))
+        on = raw in (True, "on", "true", "True", "engage", "lock", 1, "1")
+        ok = await cognitive_core.request_lockdown(
+            on, reason=call.data.get("reason", "requested via service"), hass=hass)
+        if not ok:
+            _LOGGER.warning("Lockdown service: request could not be handled (no hass)")
+        else:
+            _LOGGER.info("Lockdown %s via service call", "engaged" if on else "lifted")
+
+    _register_service("lockdown", _lockdown)
+
+    async def _remember(call: ServiceCall) -> None:
+        """Teach JARVIS a durable fact or preference (knowledge store)."""
+        from . import knowledge
+        key = str(call.data.get("key", "")).strip()
+        value = str(call.data.get("value", "")).strip()
+        if not key or not value:
+            _LOGGER.warning("jarvis.remember: 'key' and 'value' are required")
+            return
+        subject = str(call.data.get("subject", knowledge.DEFAULT_SUBJECT)).strip() \
+            or knowledge.DEFAULT_SUBJECT
+        kind = str(call.data.get("kind", "fact"))
+        ttl = call.data.get("ttl_seconds")
+        try:
+            ttl = float(ttl) if ttl not in (None, "") else None
+        except (TypeError, ValueError):
+            ttl = None
+        f = await hass.async_add_executor_job(
+            lambda: knowledge.remember(key, value, subject=subject, kind=kind,
+                                       source="stated", ttl_seconds=ttl))
+        if f:
+            _LOGGER.info("jarvis.remember: stored %s/%s", subject, key)
+        else:
+            _LOGGER.warning("jarvis.remember: store failed for %s/%s", subject, key)
+
+    _register_service("remember", _remember)
+
+    async def _forget(call: ServiceCall) -> None:
+        """Forget a stored fact by id, or by key (with optional subject)."""
+        from . import knowledge
+        fid = call.data.get("id")
+        key = call.data.get("key")
+        subject = call.data.get("subject")
+        try:
+            fid = int(fid) if fid not in (None, "") else None
+        except (TypeError, ValueError):
+            fid = None
+        removed = await hass.async_add_executor_job(
+            lambda: knowledge.forget(fact_id=fid, subject=subject, key=key))
+        _LOGGER.info("jarvis.forget: removed %d fact(s)", removed)
+
+    _register_service("forget", _forget)
+
+    async def _observer_stop(call: ServiceCall) -> None:
+        """Stop the observer."""
+        from . import observer as observer_mod
+        await observer_mod.stop()
+        hass.data[DOMAIN][entry.entry_id]["observer_running"] = False
+        _LOGGER.info("Observer stopped via service call")
+
+    _register_service("observer_stop", _observer_stop)
+
+    async def _observer_status(call: ServiceCall) -> None:
+        """Fire event with current observer state — mute list, recent activity."""
+        from . import output_gate, observer as observer_mod, sleep_detection as sd
+        status = output_gate.status()
+        status["running"] = observer_mod.is_running()
+        bedroom_areas = entry.options.get(
+            CONF_BEDROOM_AREAS,
+            entry.data.get(CONF_BEDROOM_AREAS, [])
+        ) or []
+        sleeping, reason = sd.is_sleeping(
+            hass,
+            bedroom_area_ids=bedroom_areas,
+            quiet_start=entry.options.get(
+                "observer_quiet_start",
+                entry.data.get("observer_quiet_start", "22:00")
+            ),
+            quiet_end=entry.options.get(
+                "observer_quiet_end",
+                entry.data.get("observer_quiet_end", "07:00")
+            ),
+        )
+        status["sleeping"] = sleeping
+        status["sleep_reason"] = reason
+        status["bedroom_areas"] = list(bedroom_areas)
+        hass.bus.async_fire("jarvis_observer_status", status)
+        _LOGGER.info("Observer status: %s", status)
+
+    _register_service("observer_status", _observer_status)
+
+    async def _create_automation(call: ServiceCall) -> None:
+        """Create an HA automation from service call data."""
+        from .automation_creator import create_automation
+        result = await create_automation(
+            hass,
+            alias=call.data.get("alias", "Unnamed"),
+            description=call.data.get("description", ""),
+            trigger=call.data.get("trigger"),
+            condition=call.data.get("condition"),
+            action=call.data.get("action"),
+            mode=call.data.get("mode", "single"),
+        )
+        if result.get("success"):
+            hass.bus.async_fire("jarvis_automation_created", result)
+        else:
+            _LOGGER.warning("Automation creation failed: %s", result.get("error"))
+
+    _register_service("create_automation", _create_automation)
+
+    async def _diagnose_doorbell(call: ServiceCall) -> None:
+        """Run doorbell pipeline diagnostics and fire event with results."""
+        diag = {"checks": [], "verdict": "unknown"}
+
+        auto_state = hass.states.get("automation.doorbell_motion_analysis")
+        if auto_state:
+            diag["checks"].append({"check": "automation exists", "ok": True, "state": auto_state.state})
+        else:
+            diag["checks"].append({"check": "automation exists", "ok": False, "detail": "automation.doorbell_motion_analysis not found"})
+            diag["verdict"] = "Automation missing — create it or check the entity ID"
+            hass.bus.async_fire("jarvis_doorbell_diag", diag)
+            return
+
+        if auto_state.state != "on":
+            diag["checks"].append({"check": "automation enabled", "ok": False, "state": auto_state.state})
+            diag["verdict"] = "Automation exists but is disabled"
+            hass.bus.async_fire("jarvis_doorbell_diag", diag)
+            return
+        diag["checks"].append({"check": "automation enabled", "ok": True})
+
+        from .camera import active_cameras as _active_cams
+        cameras = _active_cams(hass)
+        diag["checks"].append({"check": "cameras found", "ok": len(cameras) > 0, "cameras": cameras[:10]})
+
+        svc_exists = hass.services.has_service(DOMAIN, "analyze_on_event")
+        diag["checks"].append({"check": "analyze_on_event service", "ok": svc_exists})
+
+        tts_entities = [s.entity_id for s in hass.states.async_all("tts")]
+        diag["checks"].append({"check": "TTS entities", "ok": len(tts_entities) > 0, "entities": tts_entities})
+
+        if all(c["ok"] for c in diag["checks"]):
+            diag["verdict"] = "All checks passed — trigger the doorbell and watch logs for jarvis.analyze_on_event"
+        else:
+            failed = [c["check"] for c in diag["checks"] if not c["ok"]]
+            diag["verdict"] = f"Failed checks: {', '.join(failed)}"
+
+        _LOGGER.info("Doorbell diagnostic: %s", diag)
+        hass.bus.async_fire("jarvis_doorbell_diag", diag)
+
+    _register_service("diagnose_doorbell", _diagnose_doorbell)
+
+    async def _test_notify(call: ServiceCall) -> None:
+        """Send a test notification to the configured phone."""
+        notify_svc = None
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+        notify_svc = rc.get("notify_service") or entry.options.get(
+            "notify_service", entry.data.get("notify_service", "")
+        )
+        if not notify_svc:
+            _LOGGER.warning("Test notify: no notify_service configured")
+            return
+        try:
+            domain, service = notify_svc.split(".", 1)
+            await hass.services.async_call(
+                domain, service,
+                {
+                    "title": "JARVIS",
+                    "message": "This is a test notification from JARVIS. If you see this, phone notifications are working.",
+                },
+                blocking=False,
+            )
+            _LOGGER.info("Test notification sent via %s", notify_svc)
+        except Exception as exc:
+            _LOGGER.warning("Test notification failed: %s", exc)
+
+    _register_service("test_notify", _test_notify)
+
+    async def _test_tts(call: ServiceCall) -> None:
+        """Play a test tone using JARVIS Piper voice on the broadcast group."""
+        from .tts_helper import resolve_tts_entity, async_announce
+        from .audio_routing import broadcast_target
+        from . import jarvis_config
+        cfg = jarvis_config.effective_config(entry)
+        tts_entity = resolve_tts_entity(hass, cfg.get("tts_engine", "auto"))
+        speakers = broadcast_target(
+            hass,
+            broadcast_group=(cfg.get("broadcast_group") or None),
+            announcement_speakers=cfg.get("announcement_speakers"),
+        )
+        if tts_entity and speakers:
+            await async_announce(
+                hass,
+                "JARVIS test tone. If you hear this in a British accent, the JARVIS voice is working.",
+                tts_entity,
+                speakers,
+                context="test",
+            )
+            _LOGGER.info("Test TTS sent via %s → %s", tts_entity, speakers)
+        else:
+            _LOGGER.warning(
+                "Test TTS: no announcement speakers configured — choose speakers "
+                "in Settings → Announcement Speakers (tts=%s, speakers=%s)",
+                tts_entity, speakers)
+
+    _register_service("test_tts", _test_tts)
+
+    async def _test_routing(call: ServiceCall) -> None:
+        """Dump routing diagnostics to the HA log."""
+        from .audio_routing import (
+            broadcast_target, reply_target, observer_speak_target,
+            currently_occupied_areas, anyone_home, all_areas_with_satellite,
+            speakers_in_area, satellites_in_area,
+        )
+        from .tts_helper import resolve_tts_entity, find_best_tts_entity
+
+        broadcast_group = entry.options.get(
+            "broadcast_group", entry.data.get("broadcast_group", ""))
+        tts_ent = resolve_tts_entity(
+            hass, entry.options.get("tts_engine",
+                                     entry.data.get("tts_engine", "auto")))
+        bcast = broadcast_target(hass, broadcast_group=broadcast_group or None)
+        occupied = currently_occupied_areas(hass)
+        home = anyone_home(hass)
+        sat_areas = all_areas_with_satellite(hass)
+
+        ann_spk = None
+        try:
+            import json as _json
+            data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+            raw = rc.get("announcement_speakers")
+            if raw:
+                parsed = _json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, list):
+                    ann_spk = parsed
+        except Exception:
+            pass
+
+        sat_pairs = None
+        try:
+            raw = rc.get("satellite_pairings")
+            if raw:
+                parsed = _json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, dict):
+                    sat_pairs = parsed
+        except Exception:
+            pass
+
+        _LOGGER.warning("=== JARVIS ROUTING DIAGNOSTIC ===")
+        _LOGGER.warning("TTS entity: %s", tts_ent)
+        _LOGGER.warning("TTS auto-pick: %s", find_best_tts_entity(hass))
+        _LOGGER.warning("Broadcast group (config): '%s'", broadcast_group)
+        _LOGGER.warning("Broadcast target resolved: %s", bcast)
+        _LOGGER.warning("Announcement speakers (panel): %s", ann_spk)
+        _LOGGER.warning("Satellite pairings (panel): %s", sat_pairs)
+        _LOGGER.warning("Anyone home: %s", home)
+        _LOGGER.warning("Occupied areas: %s", occupied)
+        _LOGGER.warning("Areas with satellites: %s", sat_areas)
+        for area_id in sat_areas:
+            sats = satellites_in_area(hass, area_id)
+            spks = speakers_in_area(hass, area_id)
+            _LOGGER.warning("  Area '%s': sats=%s, speakers=%s",
+                            area_id, sats, spks)
+            for sat in sats:
+                target = reply_target(
+                    hass, satellite_entity_id=sat,
+                    satellite_pairings=sat_pairs,
+                )
+                _LOGGER.warning("    reply_target(%s) → %s", sat, target)
+
+        for urg in ("low", "medium", "high", "critical"):
+            targets, mode = observer_speak_target(
+                hass, urgency=urg,
+                broadcast_group=broadcast_group or None,
+                announcement_speakers=ann_spk,
+                is_sleeping=False,
+            )
+            _LOGGER.warning("  observer(%s): targets=%s, mode=%s",
+                            urg, targets, mode)
+        _LOGGER.warning("=== END ROUTING DIAGNOSTIC ===")
+
+    _register_service("test_routing", _test_routing)

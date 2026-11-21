@@ -1,0 +1,2022 @@
+"""JARVIS conversation agent — provider-agnostic via LLMProvider interface."""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from typing import Any, Literal
+
+from homeassistant.components import conversation
+from homeassistant.components.conversation import ConversationEntityFeature
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import intent, llm
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import (
+    ALL_SPEAKERS_VALUE,
+    CONF_BROADCAST_SPEAKERS,
+    CONF_CAST_ANNOUNCE,
+    CONF_CAST_SPEAKERS,
+    CONF_DIRECTIVE,
+    CONF_DIRECTIVE_PRESET,
+    CONF_HONORIFIC,
+    CONF_MODEL,
+    CONF_REPLY_SPEAKERS,
+    CONF_ROOM_ROUTING,
+    CONF_TTS_ENGINE,
+    CONF_USE_HASS_API,
+    CONF_VOICE_SATELLITES,
+    DEFAULT_DIRECTIVE_PRESET,
+    DEFAULT_HONORIFIC,
+    DEFAULT_MODEL,
+    DEFAULT_ROOM_ROUTING,
+    DEFAULT_TTS_ENGINE,
+    DOMAIN,
+    JARVIS_PERSONA,
+    get_directive,
+)
+from .audio_routing import reply_targets
+from .database import save_message
+from .llm_provider import create_provider
+from .presence import presence_context_string
+from .tts_helper import resolve_tts_entity, async_announce
+
+
+# ── Multi-wake dedup ────────────────────────────────────────────────────────
+# When multiple satellites hear "Hey Jarvis" simultaneously, HA fires
+# separate pipelines for each. This dedup ensures only the FIRST pipeline
+# actually processes the request and routes audio. Subsequent duplicates
+# within the window get a silent cached response (no duplicate TTS).
+
+_DEDUP_WINDOW = 4.0  # seconds — covers STT variance between satellites
+_dedup_cache: dict[str, tuple[float, str | None, str | None]] = {}
+# key = normalized text, value = (timestamp, response_text_or_None, winning_device_id)
+
+
+def _dedup_key(text: str) -> str:
+    """Normalize text for dedup comparison."""
+    return text.lower().strip().rstrip(".,!?")
+
+
+def _check_and_claim_dedup(text: str, device_id: str | None) -> tuple[bool, str | None]:
+    """
+    Check if this is a duplicate wake-up AND claim the slot if not.
+
+    Returns (is_duplicate, cached_response_or_None).
+    If is_duplicate is True, caller should return a silent response without
+    processing or routing audio again.
+    """
+    key = _dedup_key(text)
+    now = time.time()
+
+    # Clean old entries
+    stale = [k for k, (ts, _, _) in _dedup_cache.items() if now - ts > _DEDUP_WINDOW * 2]
+    for k in stale:
+        _dedup_cache.pop(k, None)
+
+    if key in _dedup_cache:
+        ts, cached_resp, winning_device = _dedup_cache[key]
+        if now - ts < _DEDUP_WINDOW and device_id != winning_device:
+            # Another device already claimed this text
+            return True, cached_resp
+
+    # Claim the slot — first pipeline to arrive wins
+    _dedup_cache[key] = (now, None, device_id)
+    return False, None
+
+
+def _record_dedup_response(text: str, response: str) -> None:
+    """Update the cached response after processing completes."""
+    key = _dedup_key(text)
+    if key in _dedup_cache:
+        ts, _, device_id = _dedup_cache[key]
+        _dedup_cache[key] = (ts, response, device_id)
+
+try:
+    from .recognition import recognition_context_string
+    _RECOGNITION_CTX = True
+except ImportError:
+    _RECOGNITION_CTX = False
+
+_LOGGER = logging.getLogger(__name__)
+
+MAX_HISTORY  = 20   # messages kept in per-conversation context window
+# Jarvis Home patch (2026-11-07, round 2): voice with no login is seeded per satellite, and a satellite is shared, so the
+# seed is a short conversation window only: one person's requests do not reach the next person. A login is unchanged.
+_JH_SAT_SEED_TURNS = 6
+_JH_SAT_SEED_MINUTES = 10
+MAX_ITERS    = 8    # max agentic tool-call iterations per request
+from .paths import config_path_str
+
+PERSONA_FILE = config_path_str("jarvis_persona.txt")
+
+# Module-level persona cache. Loaded lazily via executor to avoid blocking
+# the event loop with file I/O on every conversation turn. Invalidated
+# automatically when the file's mtime changes.
+_persona_cache: dict = {"mtime": 0.0, "text": None, "checked": 0.0}
+_PERSONA_MTIME_TTL = 30.0  # re-stat at most every 30s
+
+
+_COMMAND_VERBS = {
+    "turn", "set", "lock", "unlock", "open", "close", "shut", "dim", "brighten",
+    "arm", "disarm", "activate", "run", "play", "pause", "stop", "mute", "unmute",
+    "increase", "decrease", "switch", "enable", "disable", "start", "resume",
+    "lower", "raise", "toggle", "cancel", "snooze", "remind", "ignore",
+    "tell", "show", "give", "list", "check", "read", "announce", "make",
+}
+_QUESTION_STARTS = {
+    "what", "what's", "whats", "when", "when's", "where", "where's", "who",
+    "who's", "why", "how", "how's", "is", "are", "can", "could", "would",
+    "should", "do", "does", "did", "will", "whose", "which",
+}
+# Device/control nouns that signal a genuine home command. Deliberately EXCLUDES
+# bare room names (basement, kitchen…) — those appear in ambient speech too, and
+# a real room command almost always also carries a device or action word.
+_DOMAIN_KEYWORDS = {
+    "light", "lights", "lamp", "lamps", "door", "doors", "lock", "locks",
+    "window", "windows", "thermostat", "temperature", "heat", "heating",
+    "cooling", "alarm", "scene", "fan", "blinds", "shades", "cover", "curtains",
+    "volume", "plug", "outlet", "sensor", "camera", "climate", "brightness",
+    "weather", "sump", "dehumidifier", "washer", "dryer", "thermostat",
+}
+_FILLER = {
+    # Pure discourse markers / sentence fragments that are NEVER a valid
+    # standalone instruction or answer. Deliberately EXCLUDES greetings (hi,
+    # hello), affirmatives/negatives (yes, no, sure, okay) and acknowledgments
+    # (thanks) — those are real inputs (greeting handler, yes/no answers) and
+    # must pass the gate.
+    "so", "um", "uh", "hmm", "oh", "mean", "like", "know", "and", "but",
+    "wait", "well", "anyway", "actually", "i", "me", "you", "we", "they",
+    "it", "that", "this", "there", "here",
+}
+
+
+def _is_addressed_to_jarvis(text: str, strict: bool = False) -> bool:
+    """
+    Relevance gate: does this utterance look like it's actually addressed to
+    JARVIS (a command or question), versus ambient speech a satellite happened
+    to transcribe — TV dialogue, background conversation, sentence fragments?
+
+    Tuned for HIGH PRECISION on the PASS side: it never drops anything carrying
+    a command verb, a question word, a device keyword, or the name "Jarvis", so
+    a real instruction is never rejected. It only filters input that has NONE of
+    those signals and clearly reads as filler or a stray fragment. The PRIMARY
+    defense against TV noise is wake-word gating on the satellite; this is a
+    backstop for whatever slips through. Returns True = process, False = ignore.
+
+    ``strict`` tightens the default: when media is playing near the satellite
+    (so ambient speech is almost certainly the TV/movie), input that carried no
+    positive signal is REJECTED rather than passed.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    words = t.split()
+
+    # ── Positive signals — any one means: definitely process ──
+    if "jarvis" in words:
+        return True
+    if words[0].strip(".,!?") in _COMMAND_VERBS:
+        return True          # imperative — also protects compound commands
+    if words[0].strip(".,!?") in _QUESTION_STARTS:
+        return True          # a question — including multi-part ones
+    if any(w.strip(".,!?") in _DOMAIN_KEYWORDS for w in words):
+        return True          # mentions a device/control noun
+
+    # ── No command signal at all. Reject obvious non-commands. ──
+    # Bare interjection / filler ("So", "Yeah", "I mean", "Wait but")
+    if len(words) <= 3 and all(w.strip(".,!?'") in _FILLER for w in words):
+        return False
+    # Rambling narrative with no command structure (TV dialogue tends to span
+    # multiple clauses). This is a TV/movie filter, so it only fires in STRICT
+    # mode (media actually playing nearby). In a quiet room a multi-sentence
+    # utterance with no command word is far more likely to be a genuine
+    # conversational instruction or correction — e.g. "that wasn't a question.
+    # it was a correction. please look again" — than ambient noise, so it is
+    # NOT dropped: that matches this gate's stated bias (better to occasionally
+    # answer ambient speech than to drop a real request), with wake-word gating
+    # and multi-wake dedup as the primary defenses. (In strict mode the trailing
+    # ``return not strict`` already drops everything that reaches it, so this
+    # only ever changed the quiet-room outcome anyway.)
+    if strict:
+        sentence_breaks = t.count(".") + t.count("?") + t.count("!")
+        if sentence_breaks >= 2 and len(words) >= 8:
+            return False
+
+    # Default: PASS in a quiet room (better to occasionally answer ambient
+    # speech than to drop a real request). But when media is playing nearby
+    # (strict), the ambient source is almost certainly the TV/movie, so anything
+    # that reached here without a positive signal is dropped.
+    return not strict
+
+
+def _is_connectivity_failure(text: str) -> bool:
+    """
+    Detect the sentinel strings run_agent returns when ALL providers fail.
+
+    run_agent never raises on network failure — it returns an apologetic
+    string. We match on the stable phrase fragments so a real LLM answer
+    that happens to mention connectivity isn't misclassified (those sentinels
+    always pair 'reasoning systems' with a connectivity phrase).
+    """
+    if not text:
+        return True
+    try:   # jh-r24-offline (step 166, review round 24 #4): the fixed failure lines of every language (one shared constant)
+        from .agent import jh_is_llm_failure as _jh_llm_failed
+        if _jh_llm_failed(text):
+            return True
+    except ImportError:
+        pass
+    t = text.lower()
+    return "reasoning systems" in t and (
+        "connecting to" in t or "connectivity issues" in t
+    )
+
+
+def _sync_load_persona() -> tuple[float, str | None]:
+    """Synchronous persona file read. Must be called from an executor thread."""
+    try:
+        if os.path.exists(PERSONA_FILE):
+            mtime = os.path.getmtime(PERSONA_FILE)
+            with open(PERSONA_FILE) as f:
+                text = f.read().strip() or None
+            return mtime, text
+    except OSError:
+        pass
+    return 0.0, None
+
+
+async def _ensure_persona_loaded(hass: HomeAssistant) -> None:
+    """Check & refresh the persona cache if needed. Called from async context."""
+    import time as _time
+    now = _time.time()
+    # Rate-limit mtime checks so we don't stat every turn
+    if (now - _persona_cache["checked"]) < _PERSONA_MTIME_TTL and _persona_cache["text"] is not None:
+        return
+    _persona_cache["checked"] = now
+    mtime, text = await hass.async_add_executor_job(_sync_load_persona)
+    if mtime != _persona_cache["mtime"] or _persona_cache["text"] is None:
+        _persona_cache["mtime"] = mtime
+        _persona_cache["text"] = text
+
+
+_FALLBACKS = [
+    "Technical difficulties, {honorific}. Even I have them occasionally. Please try again.",
+    "I appear to be having connectivity issues, {honorific}. Bear with me.",
+    "Something is interfering with my systems, {honorific}. One moment.",
+]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    shared = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
+    client = shared.get("client")
+    if client is None:
+        # Fallback — the shared client is normally created in the integration's
+        # async_setup_entry; only unusual setup orders land here. Resolving the
+        # configuration and the API key both touch disk, so do it from this async
+        # caller (executor-backed) instead of the entity constructor.
+        from . import ha_secrets as _hs
+        from . import jarvis_config as _jc
+        from .const import resolve_provider_base_url
+
+        effective = await hass.async_add_executor_job(
+            _jc.effective_config, config_entry
+        )
+        provider_name = effective.get("llm_provider", "groq")
+        base_url = resolve_provider_base_url(effective, provider_name)
+        api_key = await _hs.async_get_provider_key(hass, provider_name)
+        model = effective.get(CONF_MODEL) or DEFAULT_MODEL
+        client = await hass.async_add_executor_job(
+            create_provider, provider_name, api_key, model, base_url
+        )
+
+    async_add_entities([JarvisAgent(hass, config_entry, client)])
+
+
+# Jarvis Home patch (2026-11-06): a history key belongs to someone. conversation/process takes any conversation id from any login,
+# and the id user_<login> can be worked out, so without this a limited login could read another person's live chat.
+_JH_KEY_OWNERS: dict = {}   # history key -> the login that first used it, "" for voice with no login. Lives as long as the histories do.
+
+
+def _jh_hass_guard28(hass, name, args):
+    """jh-r28-hass (step 171, review round 28 #6): local_engine.jh_hass_tool_guard for a tool of the old agentic loop: the reason
+    as a JSON error, else None. A Home Assistant intent tool whose check cannot run is blocked (fails closed)."""
+    try:
+        from .local_engine import jh_hass_tool_guard
+        return jh_hass_tool_guard(hass, name, args)
+    except Exception:  # noqa: BLE001
+        if str(name or "").lower().startswith("hass"):
+            return json.dumps({"error": "Not run: JARVIS could not check this Home Assistant tool. Nothing was changed."})
+        return None
+
+
+async def _jh_limited_login(hass, uid: str) -> bool:
+    """True for a logged-in non-admin, and for a login that cannot be read. Voice with no login is not limited."""
+    if not uid:
+        return False
+    try:
+        user = await hass.auth.async_get_user(uid)
+    except Exception:
+        user = None
+    return user is None or not user.is_admin
+
+
+def _jh_key_owner(hass, cid: str):
+    """Whose history this key is, or None when nobody has used it yet."""
+    if cid.startswith("user_"):
+        return cid[len("user_"):].split("|", 1)[0]   # review round 6: the owner before the channel
+    if cid == "default":
+        return ""
+    if cid in _JH_KEY_OWNERS:
+        return _JH_KEY_OWNERS[cid]
+    try:
+        from homeassistant.helpers import device_registry as _dr
+        if _dr.async_get(hass).async_get(cid) is not None:
+            return ""   # a voice device: what is said there belongs to no login
+    except Exception:
+        pass
+    return None
+
+
+def _jh_history_key(hass, cid: str, uid: str, limited: bool) -> str:
+    """The key this turn may use. A limited login asking for a key of someone else gets its own private key instead."""
+    owner = _jh_key_owner(hass, cid)
+    if limited and owner is not None and owner != uid:
+        _LOGGER.warning("JARVIS: ignored a conversation id that belongs to someone else")
+        return f"user_{uid}"
+    if owner is None:
+        _JH_KEY_OWNERS[cid] = uid
+    return cid
+
+
+# Jarvis Home patch (2026-11-15): jh-vague-command - a short command with no target and no recent turn asks first
+import re as _jh_vre
+_JH_TURN_AT: dict = {}          # conversation key -> time of its latest turn (this run)
+_JH_VAGUE_DEFAULT_MIN = 10
+_JH_VAGUE_RE = _jh_vre.compile(
+    r"(?:(?:yes|yeah|yep|sure|alright|please|just|ja|jawel)\s+)*"
+    r"(?:yes|yeah|yep|sure|go ahead|go on|do it|do that|do this|do all|do them|do so|do both|do the rest|do all of them|"
+    r"do it all|do everything you said|"
+    r"(?:(?:turn|switch|shut|put|set)\s+)?(?:it|that|this|them|those|these|all|all of them|all of it|all of those|the rest|both)"
+    r"(?:\s+(?:on|off|down|up))?|"
+    r"(?:turn|switch|shut|put)\s+(?:on|off)\s+(?:it|that|this|them|those|these|all of them|the rest|both)|"
+    r"doe maar|doe het|doe alles|doe dat|allemaal|zet (?:ze|het|alles) (?:aan|uit))"
+    r"(?:\s+(?:too|now|as well|please|then|maar|nu))*")
+_JH_KINDS = (("lights", ("light", "lights", "lamp", "lamps", "lampen")), ("heaters", ("heater", "heaters", "heating", "verwarming")))
+
+
+# Review 2026-11-15: the same targetless commands in German, French, Spanish and Thai, and their kind words.
+_JH_VAGUE_RE = _jh_vre.compile(
+    r"(?:" + _JH_VAGUE_RE.pattern + r")"
+    r"|(?:(?:ok|okay|so|then|alright|yes)\s+)*(?:do it|go ahead|go for it|do that)(?:\s+(?:please|now|then))*"
+    r"|(?:(?:ok|okay|so|then)\s+)*(?:turn|switch|shut|put)\s+(?:them|it|em|'em|those|these)\s+all\s+(?:on|off|down|up)"
+    r"|(?:(?:ok|okay|so|then)\s+)*(?:turn|switch|shut|put)\s+(?:em|'em)\s+(?:on|off)"
+    r"|alles\s+(?:aan|uit)|zet\s+(?:ze|het|alles)\s+(?:maar\s+)?(?:aan|uit)|doe\s+(?:ze|het|alles)\s+(?:maar\s+)?(?:aan|uit)"
+    r"|(?:ja\s+)?(?:mach|mache|schalte|schalt)\s+(?:es|das|sie|alle|alles|die|den)?\s*(?:an|aus|ein|ab)?(?:\s+(?:bitte|jetzt|auch))*"
+    r"|(?:ja\s+)?mach(?:\s+(?:es|das|alles))?(?:\s+(?:bitte|jetzt))*"
+    r"|(?:oui\s+)?(?:allume|éteins|eteins|active|désactive)(?:\s+(?:les|le|la|tout|tous|toutes))?(?:\s+(?:aussi|maintenant|stp|svp))*"
+    r"|(?:oui\s+)?(?:vas y|vas-y|fais le|fais-le|fais ça|fais tout)(?:\s+(?:aussi|maintenant))*"
+    r"|(?:sí\s+|si\s+)?(?:enciéndel[oa]s?|apágal[oa]s?|enciende(?:\s+todo)?|apaga(?:\s+todo)?|hazlo|dale|adelante)(?:\s+(?:también|ahora|por favor))*"
+    r"|(?:ใช่\s*)?(?:เปิดเลย|ปิดเลย|เปิดหมด|ปิดหมด|เปิดทั้งหมด|ปิดทั้งหมด|ทำเลย|เอาเลย)(?:\s*(?:ครับ|ค่ะ|คะ))?")
+_JH_KINDS = (("lights", _JH_KINDS[0][1] + ("licht", "lichter", "lampe", "lumière", "lumières", "lampes", "luz", "luces", "lámpara",
+                                            "lámparas", "ไฟ")),
+             ("heaters", _JH_KINDS[1][1] + ("heizung", "heizungen", "heizkörper", "chauffage", "radiateur", "radiateurs",
+                                             "calefacción", "calefactor", "estufa", "ฮีตเตอร์", "เครื่องทำความร้อน")))
+
+
+def jh_is_vague(text: str) -> bool:
+    """A short command with no concrete target: only a yes, a pronoun or all, and maybe on/off."""
+    t = (text or "").lower()
+    t = _jh_vre.sub(r"\b(?:jarvis|sir|madam|ma'am)\b", " ", t)
+    t = _jh_vre.sub(r"[^\w'\s฀-๿]", " ", t)   # Thai vowel marks are no word characters, keep them
+    t = _jh_vre.sub(r"\s+", " ", t).strip()
+    return bool(t) and len(t.split()) <= 7 and bool(_JH_VAGUE_RE.fullmatch(t))
+
+
+# Jarvis Home patch (2026-11-15): jh-fresh-chat. A chat starts fresh after this many quiet minutes (0 = never).
+_JH_FRESH_DEFAULT_MIN = 30
+
+
+def _jh_fresh_minutes(hass) -> float:
+    try:
+        from . import jarvis_config
+        v = jarvis_config.runtime_get(hass, None, "jh_fresh_chat_minutes", None)
+        try:
+            from .const import DOMAIN
+            for _e in hass.config_entries.async_entries(DOMAIN):
+                v = jarvis_config.runtime_get(hass, _e, "jh_fresh_chat_minutes", v)
+                break
+        except Exception:
+            pass
+        v = float(_JH_FRESH_DEFAULT_MIN if v in (None, "") else v)
+        return max(0.0, min(1440.0, v))
+    except Exception:
+        return float(_JH_FRESH_DEFAULT_MIN)
+
+
+def _jh_vague_minutes(hass) -> float:
+    try:
+        from . import jarvis_config
+        v = jarvis_config.runtime_get(hass, None, "vague_command_minutes", None)
+        try:
+            from .const import DOMAIN
+            for _e in hass.config_entries.async_entries(DOMAIN):
+                v = jarvis_config.runtime_get(hass, _e, "vague_command_minutes", v)
+                break
+        except Exception:
+            pass
+        v = float(_JH_VAGUE_DEFAULT_MIN if v in (None, "") else v)
+        return max(0.0, min(240.0, v))
+    except Exception:
+        return float(_JH_VAGUE_DEFAULT_MIN)
+
+
+def _jh_heater_ids(hass) -> set:
+    """The heaters JARVIS counts (label, name, Assist exposure; local_engine._jh_heaters) without manual_heater plugs."""
+    try:
+        from .local_engine import _jh_heaters, _jh_is_manual
+        sw, cl = _jh_heaters(hass)
+        return {s.entity_id for s in sw + cl if not _jh_is_manual(hass, s.entity_id)}
+    except Exception:
+        return set()
+
+
+def _jh_manual_light(hass, eid) -> bool:
+    try:
+        from .local_engine import _jh_is_manual
+        return _jh_is_manual(hass, eid)
+    except Exception:
+        return False
+
+
+import contextvars as _jh_cv_r4
+_JH_PERSONA_HIDDEN = _jh_cv_r4.ContextVar("jarvis_persona_hidden", default=None)
+_JH_PERSONA_NOLOGIN = _jh_cv_r4.ContextVar("jarvis_persona_nologin", default=False)
+
+
+def _jh_live_names(hass, kind: str, state_on: bool) -> list:
+    """Friendly names of the devices of this kind that are on (or off) now; settings and hidden entities left out."""
+    try:
+        from homeassistant.helpers import entity_registry as _er
+        reg = _er.async_get(hass)
+    except Exception:
+        reg = None
+    out = []
+    for st in hass.states.async_all():
+        eid = st.entity_id
+        dom = eid.split(".", 1)[0]
+        name = str(st.attributes.get("friendly_name") or eid)
+        if kind == "lights":   # jh-r4-no-manual-light (review round 4): a manual heater shown as a light is no light to offer
+            ok = dom == "light" and not _jh_manual_light(hass, eid)
+        else:
+            ok = eid in _jh_heater_ids(hass)   # review 2026-11-15: the kit's live heaters, never a manual_heater plug
+        if not ok or st.state in ("unavailable", "unknown"):
+            continue
+        ent = reg.async_get(eid) if reg is not None else None
+        if ent is not None and (getattr(ent, "entity_category", None) or getattr(ent, "hidden_by", None)):
+            continue
+        is_on = st.state not in ("off", "idle") if dom == "climate" else st.state == "on"
+        if is_on == state_on and name not in out:
+            out.append(name)
+    return sorted(out, key=str.lower)
+
+
+import contextvars as _jh_cv_conv
+_JH_CONV_TEXT = _jh_cv_conv.ContextVar("jarvis_conv_text", default="")   # the request being answered (review round 2)
+
+
+def _jh_conv_t(hass, key, **kw) -> str:
+    """Jarvis Home patch (2026-11-15): jh-conv-lang. A reply from the local_i18n catalogue in the household reply language."""
+    try:
+        from . import local_i18n
+        from .local_engine import _output_lang, jh_text_language, jh_text_lang_sure
+        said = _JH_CONV_TEXT.get()
+        lang = (jh_text_lang_sure(said) or ("en" if jh_text_language(said) not in ("en", "de") else None)) if said else None
+        return local_i18n.t(key, lang or _output_lang(hass, None), **kw)   # review round 2: the request's language
+    except Exception:
+        return ""
+
+
+def jh_vague_question(hass, text: str, history: list, honorific: str) -> str:
+    """The clarifying question for a vague command: what is meant, with a proposal when the last question makes it clear.
+    Jarvis Home patch (2026-11-15): jh-conv-lang - in the household reply language."""
+    t = (text or "").lower()
+    act = "off" if _jh_vre.search(r"\b(?:off|uit|aus)\b", t) else ("on" if _jh_vre.search(r"\b(?:on|aan|an)\b", t) else "")
+    lead = _jh_conv_t(hass, "jh_vague_lead_all" if _jh_vre.search(r"\b(?:all|alles|allemaal)\b", t)
+                      else ("jh_vague_lead_" + act if act else "jh_vague_lead_do"))
+    h = f", {honorific}" if honorific else ""
+    prev = next((str(m.get("content") or "") for m in reversed(history or []) if m.get("role") == "user"), "").lower()
+    kind = next((k for k, words in _JH_KINDS if any(_jh_vre.search(rf"\b{w}\b", prev) for w in words)), None)
+    if not act and kind:
+        if _jh_vre.search(r"\b(?:on|aan)\b\W*$", prev) or _jh_vre.search(r"\b(?:are|is|staan|staat)\b.*\b(?:on|aan)\b", prev):
+            act = "off"
+        elif _jh_vre.search(r"\b(?:off|uit)\b", prev):
+            act = "on"
+    if kind and act:
+        kind_word = _jh_conv_t(hass, "jh_kind_word_" + kind) or kind
+        names = _jh_live_names(hass, kind, state_on=(act == "off"))
+        if names:
+            shown = ", ".join(names[:6]) + (_jh_conv_t(hass, "jh_and_more", n=len(names) - 6) if len(names) > 6 else "")
+            return f"{lead}{h}? " + _jh_conv_t(hass, "jh_vague_propose_" + act, kind=kind_word, names=shown)
+        return f"{lead}{h}? " + _jh_conv_t(hass, "jh_vague_none_" + act, kind=kind_word)
+    return f"{lead}{h}? " + _jh_conv_t(hass, "jh_vague_nothing")
+
+
+def _jh_vague_question_en(hass, text: str, history: list, honorific: str) -> str:
+    """The clarifying question for a vague command: what is meant, with a proposal when the last question makes it clear."""
+    t = (text or "").lower()
+    act = "off" if _jh_vre.search(r"\b(?:off|uit)\b", t) else ("on" if _jh_vre.search(r"\b(?:on|aan)\b", t) else "")
+    lead = "Do all of what" if _jh_vre.search(r"\b(?:all|alles|allemaal)\b", t) else (f"Turn {act} what" if act else "Do what")
+    h = f", {honorific}" if honorific else ""
+    prev = next((str(m.get("content") or "") for m in reversed(history or []) if m.get("role") == "user"), "").lower()
+    kind = next((k for k, words in _JH_KINDS if any(_jh_vre.search(rf"\b{w}\b", prev) for w in words)), None)
+    if not act and kind:
+        if _jh_vre.search(r"\b(?:on|aan)\b\W*$", prev) or _jh_vre.search(r"\b(?:are|is|staan|staat)\b.*\b(?:on|aan)\b", prev):
+            act = "off"
+        elif _jh_vre.search(r"\b(?:off|uit)\b", prev):
+            act = "on"
+    if kind and act:
+        names = _jh_live_names(hass, kind, state_on=(act == "off"))
+        if names:
+            shown = ", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
+            return f"{lead}{h}? Turn {act} the {kind} that are {'on' if act == 'off' else 'off'} now ({shown})?"
+        return f"{lead}{h}? No {kind} are {'on' if act == 'off' else 'off'} right now. Tell me what you would like me to do."
+    return (f"{lead}{h}? I have nothing recent to go on. Tell me what to do, for example "
+            f"\"turn off the living room lights\".")
+
+
+# Review round 3: a proactive offer can be answered for 10 minutes; after that it no longer takes a "yes" or turns off the vague
+# command guard. Its yes and no words, shared by the offer flow and the guard.
+_JH_OFFER_LIVE_S = 600
+_JH_LAST_REPLY: dict = {}   # jh-r15-offer: conversation id -> when JARVIS last answered in it
+
+
+def _jh_offer_here(hass, user_input, history, cid="", now=None) -> bool:
+    """Review round 15 (jh-r15-offer): a bare yes/no is taken for the proactive offer only where the offer was made and only
+    while the offer is the last thing JARVIS said there: from a voice satellite in a room the offer was spoken in, in a
+    conversation where JARVIS has not answered since the offer and whose last JARVIS turn is no other question (a tool
+    waiting for a confirmation ends in a question too). Anything else goes to the AI as usual; the offer stays."""
+    import time as _t
+    try:
+        from . import cognitive_core
+        origin = getattr(cognitive_core._CORE, "pending_offer_origin", None) or {}
+        areas = set(origin.get("areas") or [])
+        dev = getattr(user_input, "device_id", None) or ""
+        if not areas or not dev:
+            return False
+        from homeassistant.helpers import device_registry as dr
+        if not (_jh_sat_areas(hass, dev) & areas):   # jh-r16-offer: the satellite's room from its entities or its device
+            return False
+        if cid and _JH_LAST_REPLY.get(cid, 0) >= float(origin.get("at") or 0):
+            return False   # JARVIS said something else here after the offer
+        last = next((str(t.get("content") or "") for t in reversed(history or []) if t.get("role") == "assistant"), "")
+        return not last.rstrip().rstrip("\"'”’").endswith("?")
+    except Exception:
+        return False
+_JH_OFFER_YES = frozenset(("yes", "yes please", "yeah", "yep", "sure", "do it", "go ahead", "please do", "okay", "ok",
+                           "affirmative", "please"))
+_JH_OFFER_NO = frozenset(("no", "no thanks", "nope", "don't", "do not", "negative", "leave it", "nevermind", "never mind",
+                          "cancel", "stop"))
+
+
+def _jh_offer_live(now=None) -> bool:
+    """A proactive offer is waiting and was made less than 10 minutes ago."""
+    import time as _t
+    try:
+        from . import cognitive_core
+        at = getattr(cognitive_core._CORE, "pending_offer_at", None)
+        return bool(cognitive_core.get_pending_offer()) and at is not None and (_t.time() if now is None else now) - at <= _JH_OFFER_LIVE_S
+    except Exception:
+        return False
+
+
+def _jh_offer_word(text) -> bool:
+    return str(text or "").strip().lower().rstrip(".!") in (_JH_OFFER_YES | _JH_OFFER_NO)
+
+
+
+def _jh_sat_areas(hass, device_id) -> set:
+    """Review round 16 (jh-r16-offer): the rooms of a voice satellite, worked out as the offer's rooms are recorded
+    (cognitive_core._jh_areas_of): each of its entities' own area, else the device's area; the device's area when it has no
+    entities. Empty when unknown."""
+    try:
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        d = dr.async_get(hass).async_get(device_id)
+        if d is None:
+            return set()
+        dev_area = getattr(d, "area_id", None)
+        out, found = set(), False
+        for ent in list(er.async_get(hass).entities.values()):
+            if getattr(ent, "device_id", None) != device_id:
+                continue
+            found = True
+            area = getattr(ent, "area_id", None) or dev_area
+            if area:
+                out.add(area)
+        if not found and dev_area:
+            out.add(dev_area)
+        return out
+    except Exception:
+        return set()
+
+
+def _jh_offer_takes(hass, user_input, text, history, cid="", now=None) -> bool:
+    """Review round 16 (jh-r16-offer): True only when the proactive offer flow will really take this text as its yes or no:
+    the offer is live, the text is one of its words, it comes from where the offer was made (_jh_offer_here, with the history
+    before this turn) and no question of JARVIS's own is open in this conversation (good night 120 s, which one 90 s). The
+    vague-command guard and the filler guard step aside only then; anywhere else they work as usual. Unsure: False."""
+    try:
+        if user_input is None or not (_jh_offer_live(now) and _jh_offer_word(text)):
+            return False
+        hist = list(history or [])
+        if hist and hist[-1].get("role") == "user":
+            hist = hist[:-1]
+        if not _jh_offer_here(hass, user_input, hist, cid):
+            return False
+        import time as _t
+        try:   # as the offer flow: its own-question check, and none when the local engine cannot be read
+            from .local_engine import _JH_GN_ASKED, _JH_PENDING
+        except Exception:
+            return True
+        t = _t.time()
+        if (cid in _JH_GN_ASKED and t - _JH_GN_ASKED[cid] <= 120) or (
+                cid in _JH_PENDING and t - ((_JH_PENDING.get(cid) or {}).get("at") or 0) < 90):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def jh_vague_reply(hass, text: str, history: list, key: str, honorific: str, user_id: str = "",
+                         device_id: str = "", now=None, user_input=None):
+    """The question to send instead of running a vague command, or None. Records this turn's time either way."""
+    import time as _t
+    now = _t.time() if now is None else now
+    last = _JH_TURN_AT.get(key)
+    _JH_TURN_AT[key] = now
+    if len(_JH_TURN_AT) > 500:
+        for k in sorted(_JH_TURN_AT, key=_JH_TURN_AT.get)[:100]:
+            _JH_TURN_AT.pop(k, None)
+    if not jh_is_vague(text):
+        return None
+    minutes = _jh_vague_minutes(hass)
+    if not minutes:
+        return None
+    try:
+        from . import cognitive_core
+        if _jh_offer_takes(hass, user_input, text, history, key, now):   # jh-r16-offer: only when the offer flow takes it
+            return None                     # an answer to a recent proactive offer: its yes / no flow decides (review round 3)
+    except Exception:
+        pass
+    if last is None:                        # nothing this run (after a restart): the newest stored turn of this person
+        try:
+            from .database import get_thread_messages
+            from datetime import datetime, timezone
+            rows = await hass.async_add_executor_job(get_thread_messages, 1, 1, user_id, device_id or key)
+            if rows:
+                ts = datetime.fromisoformat(str(rows[-1].get("timestamp"))).replace(tzinfo=timezone.utc).timestamp()
+                last = ts
+        except Exception:
+            last = None
+    if last is not None and now - last <= minutes * 60:
+        return None                         # a recent turn: an offer, a question or a list it can refer to
+    return jh_vague_question(hass, text, history, honorific)
+
+
+def _jh_offer_refused(offer: dict) -> bool:
+    """A limited login may accept an offer only for an ordinary device action, the same list its plans use."""
+    from .agent import _jh_plan_refused
+    data = (offer or {}).get("action_data") or {}
+    ids = data.get("entity_ids") or []
+    return not ids or any(_jh_plan_refused(str(data.get("domain")), str(data.get("service")), e) for e in ids)
+
+
+class JarvisAgent(conversation.ConversationEntity):
+    """
+    JARVIS conversation agent — Groq-powered, HA home control.
+    ConversationEntityFeature.CONTROL enables home device control.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_supported_features = ConversationEntityFeature.CONTROL
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        client=None,
+    ) -> None:
+        self.hass  = hass
+        self.entry = entry
+        self._attr_unique_id = entry.entry_id
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name="JARVIS",
+            manufacturer="Stark Industries",
+            model="JARVIS AI Assistant",
+            sw_version="4.0.0",
+        )
+        self._histories: dict[str, list[dict]] = {}
+        self._threaded: set = set()   # conversations already seeded from history
+        self._fallback_idx = 0
+
+        # The shared LLM provider (created in the integration's async_setup_entry)
+        # is injected by the platform setup, so conversation automatically honours
+        # the user's chosen backend (Groq/OpenAI/Anthropic/Ollama/custom).
+        # No blocking config/secret reads happen here — see async_setup_entry.
+        if client is None:
+            shared = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            client = shared.get("client")
+        self._client = client
+        _LOGGER.info(
+            "JARVIS agent initialised — provider=%s, model=%s",
+            getattr(self._client, "name", "unknown"),
+            self._model(),
+        )
+
+    # ── Config helpers ────────────────────────────────────────────────────────
+
+    def _opt(self, key: str, default=None):
+        """Config read via the canonical resolver (runtime_config → config.json →
+        options → data → default)."""
+        from . import jarvis_config
+        return jarvis_config.runtime_get(self.hass, self.entry, key, default)
+
+    def _rt_opt(self, key: str, default=None):
+        """
+        Runtime-aware read via the canonical resolver: panel runtime_config →
+        config.json → options → data → default. The panel writes model/provider
+        changes to runtime_config, so those take effect on the next request
+        without a restart (run_agent re-resolves provider/model per call).
+        """
+        from . import jarvis_config
+        return jarvis_config.runtime_get(self.hass, self.entry, key, default)
+
+    def _model(self) -> str:
+        return self._opt(CONF_MODEL, DEFAULT_MODEL)
+
+    def _honorific(self) -> str:
+        return self._opt(CONF_HONORIFIC, DEFAULT_HONORIFIC)
+
+    def _use_hass_api(self) -> bool:
+        return bool(self._opt(CONF_USE_HASS_API, True))
+
+    def _broadcast_fallback_speakers(self) -> list[str]:
+        """The broadcast/announcement speakers briefings deliver to (e.g. a Cast
+        group). Used as a reply fallback when the paired room speaker won't play —
+        an idle/off Cast device that accepts tts.speak and produces no sound, or a
+        mic-only satellite that can't speak the reply itself. Resolved directly
+        (not room/pairing-aware) so it can never resolve back to the same
+        non-playing speaker."""
+        import json as _json
+        for key in ("announcement_speakers", CONF_BROADCAST_SPEAKERS,
+                    CONF_CAST_SPEAKERS, "broadcast_group"):
+            raw = self._opt(key, None)
+            if not raw:
+                continue
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if raw.startswith("["):
+                    try:
+                        raw = _json.loads(raw)
+                    except Exception:
+                        raw = [raw]
+                else:
+                    raw = [raw]
+            if isinstance(raw, (list, tuple)):
+                out = [str(x) for x in raw
+                       if x and not str(x).startswith("assist_satellite.")]
+                if out:
+                    return out
+        return []
+
+    def _speakers(self, device_id: str | None = None) -> list[str]:
+        """
+        Choose which speakers to broadcast a DIRECT REPLY to.
+
+        Uses the three-tier audio architecture (audio_routing.reply_targets):
+          - voice_satellites are excluded from speaking
+          - reply_speakers used for direct conversation
+          - room-aware: speak to kitchen puck → reply via kitchen Google
+          - falls back to broadcast_speakers if no reply_speakers configured
+          - falls back to legacy cast_speakers for backward compatibility
+          - satellite_pairings from panel Settings override area registry
+        """
+        # Read satellite_pairings from runtime_config
+        sat_pairings = None
+        try:
+            import json as _json
+            _data = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {})
+            _rc = _data.get("runtime_config", {}) if isinstance(_data, dict) else {}
+            _raw = _rc.get("satellite_pairings")
+            if _raw:
+                _parsed = _json.loads(_raw) if isinstance(_raw, str) else _raw
+                if isinstance(_parsed, dict) and _parsed:
+                    sat_pairings = _parsed
+        except Exception:
+            pass
+
+        return reply_targets(
+            self.hass,
+            device_id=device_id,
+            voice_satellites=self._opt(CONF_VOICE_SATELLITES, []) or [],
+            reply_speakers=self._opt(CONF_REPLY_SPEAKERS, []) or [],
+            broadcast_speakers=self._opt(CONF_BROADCAST_SPEAKERS, []) or [],
+            legacy_cast_speakers=self._opt(CONF_CAST_SPEAKERS, []) or [],
+            room_routing=bool(self._opt(CONF_ROOM_ROUTING, DEFAULT_ROOM_ROUTING)),
+            satellite_pairings=sat_pairings,
+        )
+
+    def _media_playing_near(self, device_id: str | None) -> bool:
+        """True if media is actively playing near this satellite — the designated
+        movie player (TV) anywhere, or any media_player in the satellite's own
+        area. Used to tighten the relevance gate and pause continued-conversation
+        follow-ups during media, so TV/movie dialogue isn't answered as a command.
+        """
+        hass = self.hass
+        try:
+            movie = self._rt_opt("movie_media_player", "") or ""
+            if movie:
+                st = hass.states.get(movie)
+                if st is not None and str(st.state).lower() == "playing":
+                    return True
+            if not device_id:
+                return False
+            from . import audio_routing, continued_conversation as _cc
+            sat = _cc.satellite_for_device(hass, device_id)
+            area = audio_routing.entity_area(hass, sat) if sat else None
+            if area:
+                for e in audio_routing._entities_by_domain(hass, "media_player"):
+                    if audio_routing.entity_area(hass, e) != area:
+                        continue
+                    st = hass.states.get(e)
+                    if st is not None and str(st.state).lower() == "playing":
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _satellite_speaker(self, device_id: str) -> str | None:
+        """
+        Given the device_id of the wake-word/voice satellite, return its
+        associated media_player entity (the same physical box).
+        """
+        try:
+            from homeassistant.helpers import device_registry as dr, entity_registry as er
+            ent_reg = er.async_get(self.hass)
+            for ent in ent_reg.entities.values():
+                if ent.device_id == device_id and ent.domain == "media_player":
+                    if self.hass.states.get(ent.entity_id):
+                        return ent.entity_id
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: satellite speaker lookup error: %s", exc)
+        return None
+
+    def _tts_entity(self) -> str | None:
+        return resolve_tts_entity(self.hass, self._opt(CONF_TTS_ENGINE, DEFAULT_TTS_ENGINE))
+
+    def _use_announce(self) -> bool:
+        return bool(self._opt(CONF_CAST_ANNOUNCE, True))
+
+    # ── Supported languages ───────────────────────────────────────────────────
+
+    @property
+    def supported_languages(self) -> list[str] | Literal["*"]:
+        return "*"
+
+    # ── Persona ───────────────────────────────────────────────────────────────
+
+    def _directive(self) -> str:
+        """Return the active prime directive text."""
+        preset = self._opt(CONF_DIRECTIVE_PRESET, DEFAULT_DIRECTIVE_PRESET)
+        custom = self._opt(CONF_DIRECTIVE, "")
+        return get_directive(preset, custom)
+
+    def _persona(self) -> str:
+        """Build the full system prompt.
+
+        Order matters: prime directive FIRST (unrelenting core purpose),
+        then character/style, then live context. The directive appears
+        at the top of every single LLM call.
+        """
+        base = JARVIS_PERSONA
+        cached = _persona_cache.get("text")
+        if cached:
+            base = cached
+
+        # Prime directive always comes first
+        directive = self._directive()
+        base = f"{directive}\n\n---\n\n{base}"
+
+        # Inject live context — time, presence, weather summary
+        import datetime as _dt
+        try:   # jh-r4-persona-privacy (review round 4): Home Assistant's time zone, not the container's clock
+            from homeassistant.util import dt as _jh_dtu
+            _jh_now = _jh_dtu.now()
+            if not isinstance(_jh_now, _dt.datetime):
+                _jh_now = _dt.datetime.now()
+        except Exception:
+            _jh_now = _dt.datetime.now()
+        ctx_parts = [f"Current time: {_jh_now.strftime('%A %B %-d, %-I:%M %p')}."]
+        _jh_hidden = _JH_PERSONA_HIDDEN.get()   # the people this asker may not know the whereabouts of
+
+        # Temperature unit, so freeform mentions (not just quoted sensor values)
+        # follow the household's Home Assistant unit system rather than defaulting
+        # to Fahrenheit.
+        try:
+            _tu = self.hass.config.units.temperature_unit
+            if _tu:
+                ctx_parts.append(
+                    f"This household uses {_tu} for temperature; always express "
+                    f"temperatures in {_tu}."
+                )
+        except Exception:
+            pass
+
+        try:
+            presence = presence_context_string(self.hass, hidden=_jh_hidden)
+            if presence:
+                ctx_parts.append(f"Presence: {presence}")
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: presence context error: %s", exc)
+
+        # Recent face recognitions
+        if _RECOGNITION_CTX:
+            try:
+                faces = recognition_context_string(self.hass)
+                if faces and _jh_hidden is not None:   # review round 4: no sighting of someone this asker may not see
+                    _jh_hn = {n for names in _jh_hidden.values() for n in names}
+                    if _JH_PERSONA_NOLOGIN.get():
+                        faces = ""   # voice with no login: nobody's whereabouts
+                    else:
+                        _jh_b = [b for b in faces[len("Recent faces: "):].rstrip(".").split("; ") if b and not any(
+                            b.lower().startswith(n + " ") for n in _jh_hn)]
+                        faces = ("Recent faces: " + "; ".join(_jh_b) + ".") if _jh_b else ""
+                if faces:
+                    ctx_parts.append(faces)
+            except Exception as exc:
+                _LOGGER.debug("JARVIS: recognition context error: %s", exc)
+
+        # Weather summary
+        try:
+            for state in self.hass.states.async_all("weather"):
+                temp = state.attributes.get("temperature")
+                unit = state.attributes.get("temperature_unit", "°")
+                ctx_parts.append(f"Weather: {state.state}, {temp}{unit}.")
+                break
+        except Exception:
+            pass
+
+        # v5.6.0: Full home state awareness (HGA-inspired)
+        try:
+            from .home_state import get_home_summary
+            home_summary = get_home_summary(self.hass)
+            if home_summary:
+                ctx_parts.append(f"\n## Home state snapshot\n{home_summary}")
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: home state summary error: %s", exc)
+
+        context_block = "\n\n## Current context (live data)\n" + "\n".join(ctx_parts)
+        _jh_hon = getattr(self, "_jh_hon_now", None)   # Jarvis Home patch (2026-11-14): jh-person-address
+        if _jh_hon is not None:
+            try:   # jh-r5-guarded-import (review round 5): like the other kit imports, never fatal
+                from .presence import jh_persona_address
+                return jh_persona_address(base + context_block, _jh_hon)
+            except ImportError:
+                pass
+        return (base + context_block).replace("{honorific}", self._honorific())
+
+    # ── Conversation history ──────────────────────────────────────────────────
+
+    def _history(self, cid: str) -> list[dict]:
+        h = self._histories.setdefault(cid, [])
+        if len(h) > MAX_HISTORY:
+            self._histories[cid] = h[-MAX_HISTORY:]
+        return self._histories[cid]
+
+    async def _maybe_seed_history(self, cid: str, history: list, user_id: str = "", device_id: str = "") -> None:
+        """Seed a fresh conversation with recent cross-session history, once,
+        so JARVIS continues where you left off across sessions (v6.86.0)."""
+        if cid in self._threaded:
+            return
+        self._threaded.add(cid)
+        if history:
+            return  # window already holds this session's turns — don't reseed
+        from . import memory_thread
+        enabled, hours, limit = memory_thread.config()
+        if not enabled:
+            return
+        # Jarvis Home patch: seed only this person's turns, or this device's when nobody is logged in.
+        if not user_id and device_id and device_id != cid:   # a satellite: the last few turns of the last few minutes
+            hours, limit = min(hours, _JH_SAT_SEED_MINUTES / 60), min(limit, _JH_SAT_SEED_TURNS)
+        seeded = await memory_thread.load_recent(self.hass, hours, limit, user_id=user_id, device_id=device_id or cid)
+        if seeded:
+            history[:0] = seeded  # prepend prior context ahead of this turn
+
+    # ── HA LLM tool integration ───────────────────────────────────────────────
+
+    async def _get_hass_api(self, user_input: conversation.ConversationInput):
+        try:
+            ctx = llm.LLMContext(**_ha_kwargs(
+                llm.LLMContext,
+                platform=DOMAIN,
+                context=user_input.context,
+                user_prompt=user_input.text,
+                language=user_input.language,
+                assistant=conversation.HOME_ASSISTANT_AGENT,
+                device_id=user_input.device_id,
+            ))
+            api = await llm.async_get_api(self.hass, "assist", ctx)
+            _LOGGER.debug("JARVIS: %d HA tools available", len(api.tools))
+            return api
+        except Exception as exc:  # pylint: disable=broad-except
+            _LOGGER.debug("JARVIS: HA Assist API unavailable (%s) — chat-only mode", exc)
+            return None
+
+    # ── LLM calls (provider-agnostic) ─────────────────────────────────────────
+
+    def _llm_text(self, messages: list[dict], persona: str,
+                  run_state: dict[str, Any] | None = None) -> str:
+        """Plain text call — no tools. Uses the LLMProvider interface."""
+        result = self._client.chat(
+            messages=[{"role": "system", "content": persona}] + messages,
+            max_tokens=512,
+            temperature=0.7,
+            run_state=run_state,
+        )
+        return result["text"]
+
+    def _llm_with_tools(self, messages: list[dict], persona: str, tools: list[dict],
+                        run_state: dict[str, Any] | None = None) -> dict:
+        """Call with function-calling tools. Returns standardised dict.
+
+        Returns:
+          {"type": "text", "text": "..."}               when no tool calls
+          {"type": "tool_calls",
+           "text": "...",
+           "calls": [{"id", "name", "args"}, ...]}      when tools invoked
+        """
+        result = self._client.chat(
+            messages=[{"role": "system", "content": persona}] + messages,
+            tools=tools or None,
+            max_tokens=1024,
+            temperature=0.7,
+            run_state=run_state,
+        )
+        if result["tool_calls"]:
+            return {
+                "type":  "tool_calls",
+                "text":  result["text"],
+                "calls": result["tool_calls"],
+            }
+        return {"type": "text", "text": result["text"]}
+
+    # ── Agentic loop ──────────────────────────────────────────────────────────
+
+    async def _agentic_loop(
+        self,
+        messages: list[dict],
+        persona: str,
+        hass_api,
+        user_input: conversation.ConversationInput,
+    ) -> str:
+        """LLM → execute HA tools → feed results back → repeat until text."""
+        if hass_api is None or not hass_api.tools:
+            return await self.hass.async_add_executor_job(
+                self._llm_text, messages, persona
+            )
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name":        t.name,
+                    "description": t.description,
+                    "parameters":  t.parameters,
+                },
+            }
+            for t in hass_api.tools
+        ]
+
+        working = list(messages)
+        llm_run_state: dict[str, Any] = {}
+        for _ in range(MAX_ITERS):
+            result = await self.hass.async_add_executor_job(
+                self._llm_with_tools, working, persona, tools, llm_run_state
+            )
+            if result["type"] == "text":
+                return result["text"]
+
+            working.append({
+                "role":       "assistant",
+                "content":    result.get("text") or "",
+                "tool_calls": [
+                    {
+                        "id":   c["id"],
+                        "type": "function",
+                        "function": {
+                            "name":      c["name"],
+                            "arguments": json.dumps(c["args"]),
+                        },
+                    }
+                    for c in result["calls"]
+                ],
+            })
+
+            for call in result["calls"]:
+                # jh-r28-hass (step 171, review round 28 #6): Home Assistant's own tools through the same check as agent's
+                _jh_blk28 = _jh_hass_guard28(self.hass, call["name"], call["args"])
+                if _jh_blk28:
+                    working.append({"role": "tool", "tool_call_id": call["id"], "content": _jh_blk28})
+                    continue
+                try:
+                    tool_input = llm.ToolInput(**_ha_kwargs(
+                        llm.ToolInput,
+                        tool_name=call["name"],
+                        tool_args=call["args"],
+                        platform=DOMAIN,
+                        context=user_input.context,
+                        user_prompt=user_input.text,
+                        language=user_input.language,
+                        assistant=conversation.HOME_ASSISTANT_AGENT,
+                        device_id=user_input.device_id,
+                    ))
+                    tool_result = await hass_api.async_call_tool(tool_input)
+                    result_str = (
+                        json.dumps(tool_result)
+                        if isinstance(tool_result, dict)
+                        else str(tool_result)
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    _LOGGER.warning("JARVIS tool '%s' failed: %s", call["name"], exc)
+                    result_str = f"Error: {exc}"
+
+                working.append({
+                    "role":         "tool",
+                    "tool_call_id": call["id"],
+                    "content":      result_str,
+                })
+
+        # Max iterations — ask for a plain summary of what was done
+        working.append({"role": "user", "content": "Briefly summarise what you have done."})
+        return await self.hass.async_add_executor_job(
+            self._llm_text, working, persona, llm_run_state
+        )
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    async def _async_handle_message(
+        self,
+        user_input: conversation.ConversationInput,
+        chat_log=None,
+    ) -> conversation.ConversationResult:
+        # HA's ConversationEntity.async_process is @final and sets up the chat
+        # session/log before calling this method — so JARVIS must implement only
+        # _async_handle_message and must NOT override async_process (a prior shim
+        # did, which bypassed that setup on current HA). Wrap the body so an
+        # unexpected error becomes a spoken + logged message with a real trace,
+        # instead of HA's opaque "Unexpected error during intent recognition"
+        # that leaves nothing in JARVIS's own diagnostics.
+        # Tag every LLM call THIS turn drives with one correlation id, so token
+        # telemetry can attribute the turn's full spend across the tiers it
+        # touches (MCU Tranche 1 — token cost accounting). Observe-only: the id
+        # is pure telemetry metadata and changes no behaviour. Best-effort — if
+        # the provider module can't be reached, fall back to a no-op scope.
+        import contextlib as _ctxlib
+        try:
+            from . import llm_provider as _llm
+            import uuid as _uuid
+            _conv = (getattr(user_input, "conversation_id", None)
+                     or getattr(user_input, "device_id", None) or "conv")
+            _scope = _llm.correlation_scope(f"{_conv}:{_uuid.uuid4().hex[:8]}")
+        except Exception:
+            _scope = _ctxlib.nullcontext()
+
+        with _scope:
+            try:
+                return await self._handle_message_impl(user_input, chat_log)
+            except Exception:
+                import traceback as _tb
+                last = _tb.format_exc().strip().splitlines()[-1][:200]
+                try:
+                    from .websocket import jarvis_log
+                    jarvis_log("ERROR", f"conversation handler crashed: {last}")
+                except Exception:
+                    pass
+                _LOGGER.exception("JARVIS conversation handler crashed")
+                ir = intent.IntentResponse(language=user_input.language)
+                ir.async_set_speech(
+                    "I ran into an internal error handling that request.")
+                return conversation.ConversationResult(
+                    response=ir,
+                    conversation_id=getattr(user_input, "conversation_id", None)
+                    or "default",
+                )
+
+    async def _handle_message_impl(
+        self,
+        user_input: conversation.ConversationInput,
+        chat_log=None,
+    ) -> conversation.ConversationResult:
+        shared = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {})
+        if shared.get("client") is not None:
+            self._client = shared["client"]
+        from .websocket import jarvis_log
+        device_id = getattr(user_input, 'device_id', None)
+        jarvis_log("CONV", f"ENTRY text='{user_input.text[:60]}' device={device_id}")
+        # Jarvis Home patch: no words in the log. People paste logs into bug reports, and jarvis_log above has them for admins.
+        _LOGGER.debug("JARVIS async_process ENTRY: %d characters, device_id='%s'", len(user_input.text), device_id)
+
+        # Transcribed voice text arriving here means STT just worked (HA's
+        # pipeline transcribed speech and routed it to us). Record it as a real
+        # STT success so the health panel reflects reality, not a synthetic poke
+        # (v6.70.3). Only voice-originated turns count — device_id present.
+        if device_id and (user_input.text or "").strip():
+            try:
+                from .diagnostics.service_health import record_usage
+                record_usage("stt", True)
+            except Exception:
+                pass
+
+        # ── v5.7.01: Multi-wake dedup ────────────────────────────────────
+        # If another satellite already processed this exact text within
+        # the dedup window, return the cached response WITHOUT routing
+        # audio again. This prevents 3 speakers all talking at once.
+        is_dup, cached = _check_and_claim_dedup(user_input.text, device_id)
+        if is_dup:
+            _LOGGER.warning(
+                "JARVIS dedup: suppressing duplicate from device=%s "
+                "(already handled), text='%s'",
+                device_id, user_input.text[:40],
+            )
+            jarvis_log("DEDUP", f"suppressed duplicate from {device_id}")
+            ir = intent.IntentResponse(language=user_input.language)
+            # Return empty speech so HA pipeline completes silently
+            ir.async_set_speech(cached or "")
+            return conversation.ConversationResult(
+                response=ir,
+                conversation_id=user_input.conversation_id or device_id or "default",
+            )
+
+        # ── v5.7.01: Presence gate — only the occupied room responds ─────
+        # Uses mmWave / occupancy sensors to determine if anyone is in the
+        # satellite's area. If the area is NOT occupied, suppress this
+        # pipeline so only the satellite in the user's actual room answers.
+        # v6.36.0: OFF by default. It silences the satellite you're speaking
+        # to whenever that room's presence sensor hasn't registered you yet (or
+        # is flaky), which reads as "voice stopped working". The multi-wake
+        # dedup above already stops several satellites answering at once, so the
+        # gate is opt-in for homes with reliable per-room presence.
+        if device_id and self._opt("presence_gate", False):
+            try:
+                from .audio_routing import entity_area, is_area_occupied
+                from homeassistant.helpers import (
+                    device_registry as _dr,
+                    entity_registry as _er,
+                )
+                dev_reg = _dr.async_get(self.hass)
+                dev = dev_reg.async_get(device_id)
+                sat_area = dev.area_id if dev else None
+
+                if sat_area and not is_area_occupied(self.hass, sat_area):
+                    # Double check: are ANY areas occupied? If no sensors
+                    # report occupancy anywhere, skip the gate entirely
+                    # (sensors might be offline / not configured).
+                    from .audio_routing import currently_occupied_areas
+                    occupied = currently_occupied_areas(self.hass)
+                    if occupied:
+                        _LOGGER.warning(
+                            "JARVIS presence gate: suppressing pipeline from "
+                            "device=%s area='%s' (not occupied, occupied=%s)",
+                            device_id, sat_area, occupied,
+                        )
+                        jarvis_log(
+                            "GATE",
+                            f"suppressed {sat_area} (not occupied, "
+                            f"occupied={occupied})",
+                        )
+                        ir = intent.IntentResponse(language=user_input.language)
+                        ir.async_set_speech("")
+                        return conversation.ConversationResult(
+                            response=ir,
+                            conversation_id=(
+                                user_input.conversation_id
+                                or device_id or "default"
+                            ),
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "JARVIS presence gate: no occupied areas "
+                            "detected anywhere — skipping gate (sensors "
+                            "may be offline)"
+                        )
+            except Exception as exc:
+                _LOGGER.debug("Presence gate check failed (non-fatal): %s", exc)
+
+        _jh_uid   = getattr(getattr(user_input, "context", None), "user_id", None) or ""  # Jarvis Home patch: per-user
+        try:   # jh-r6-channel-key (review round 6): the panel and a Household Chat conversation are separate live threads
+            from .optional_pages import JH_CHANNEL as _jh_chv6
+            _jh_chan6 = _jh_chv6.get()
+        except Exception:
+            _jh_chan6 = ""
+        cid       = user_input.conversation_id or user_input.device_id or (
+            (f"user_{_jh_uid}" + (("|" + _jh_chan6) if _jh_chan6 else "")) if _jh_uid else "default")
+        _jh_limited = await _jh_limited_login(self.hass, _jh_uid)
+        try:   # jh-asker (review round 2): who asks and what, for the work-day, summary and vague-command answers
+            from .local_engine import _JH_ASKER as _jh_ask
+            _jh_ask.set(_jh_uid)
+            _JH_CONV_TEXT.set(user_input.text or "")
+        except Exception:
+            pass
+        cid = _jh_history_key(self.hass, cid, _jh_uid, _jh_limited)
+        honorific = self._honorific()
+        _jh_hon_global = honorific
+        try:   # Jarvis Home patch (2026-11-14): jh-person-address - the asker's own form of address
+            from .presence import jh_address_for as _jh_af
+            honorific = _jh_af(self.hass, _jh_uid, honorific)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: form of address: %s", exc)
+        # Warm persona cache (reads file in executor) before sync _persona()
+        await _ensure_persona_loaded(self.hass)
+        self._jh_hon_now = honorific
+        try:   # review round 4: the presence and faces in the prompt follow the where-is rule for this asker
+            from .presence import jh_hidden_people as _jh_hp
+            _jh_ptok = _JH_PERSONA_HIDDEN.set(await _jh_hp(self.hass, _jh_uid))
+        except Exception:
+            _jh_ptok = _JH_PERSONA_HIDDEN.set({s.entity_id: {str(s.attributes.get("friendly_name") or "").strip().lower()}
+                                               for s in self.hass.states.async_all("person")})   # unreadable: everyone hidden
+        _jh_ntok = _JH_PERSONA_NOLOGIN.set(not _jh_uid)
+        try:
+            persona   = self._persona()
+        finally:
+            self._jh_hon_now = None
+            _JH_PERSONA_HIDDEN.reset(_jh_ptok)
+            _JH_PERSONA_NOLOGIN.reset(_jh_ntok)
+        try:   # jh-fresh-chat: after a quiet spell the old topic is gone
+            import time as _jh_time
+            _jh_fm = _jh_fresh_minutes(self.hass)
+            _jh_lt = self.__dict__.setdefault("_jh_last_turn", {})
+            if _jh_fm and cid in _jh_lt and _jh_time.time() - _jh_lt[cid] > _jh_fm * 60:
+                self._histories[cid] = []
+                self._threaded.add(cid)   # and no reseeding of the old turns
+            _jh_lt[cid] = _jh_time.time()
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: fresh chat check: %s", exc)
+        history   = self._history(cid)
+        # Jarvis Home patch (2026-11-07): voice with no login is stored and seeded per satellite. Each voice session has a new
+        # conversation id, so turns kept under that id were never found again. A login keeps its own rows, as before.
+        # jh-channel (step 132): one thread per channel and login - the JARVIS panel, each Household Chat conversation, each
+        # voice device - so the group chat, a private chat and the panel no longer bleed into each other
+        try:
+            from .optional_pages import JH_CHANNEL as _jh_chv
+            _jh_ch = _jh_chv.get()
+        except Exception:
+            _jh_ch = ""
+        _jh_ch = "ch:" + (_jh_ch or (("voice:" + str(user_input.device_id)) if getattr(user_input, "device_id", None) else "panel"))
+        _jh_dev = _jh_ch if _jh_uid else (getattr(user_input, "device_id", None) or cid)
+        await self._maybe_seed_history(cid, history, _jh_uid, _jh_dev)
+
+        # Jarvis Home patch (2026-11-09): a lone filler word that answers no question of JARVIS is not a command
+        import re as _jh_re
+        _jh_asked = bool(history) and history[-1].get("role") == "assistant" and str(history[-1].get("content") or "").rstrip().endswith("?")
+        if not _jh_asked and not _jh_offer_takes(self.hass, user_input, user_input.text, history, cid) and _jh_re.fullmatch(r"\s*(?:ok(?:ay)?|oké|thank you|thanks|thx|you|bye|yeah|alright|all right|cool|hmm+|uh+|um+)[\s.!?,]*",
+                                              (user_input.text or "").lower()):
+            _jh_ir = intent.IntentResponse(language=user_input.language)
+            _jh_ir.async_set_speech("" if device_id else (_jh_conv_t(self.hass, "jh_filler_ack", h=honorific)
+                                                          or f"Very good, {honorific}."))   # jh-conv-lang
+            return conversation.ConversationResult(response=_jh_ir, conversation_id=user_input.conversation_id or cid)
+
+        # Jarvis Home patch (2026-11-15): jh-vague-command - "do all" with no recent turn asks first, runs nothing
+        try:
+            _jh_vq = await jh_vague_reply(self.hass, user_input.text, history, cid, honorific, _jh_uid, _jh_dev, user_input=user_input)
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: vague-command check: %s", exc)
+            _jh_vq = None
+        if _jh_vq:
+            try:   # review 2026-11-15: the vague-command question ends any open yes / which-one question
+                from .local_engine import jh_forget_pending as _jh_fp
+                _jh_fp(cid)
+            except Exception:
+                pass
+            history.append({"role": "user", "content": user_input.text})
+            history.append({"role": "assistant", "content": _jh_vq})
+            save_message("user", user_input.text, device_id=_jh_dev, user_id=_jh_uid)
+            save_message("assistant", _jh_vq, device_id=_jh_dev, user_id=_jh_uid)
+            try:
+                from .websocket import jarvis_log as _jh_jl
+                _jh_jl("LOCAL", f"handled: {_jh_vq[:150]}")
+            except Exception:
+                pass
+            _jh_ir = intent.IntentResponse(language=user_input.language)
+            _jh_ir.async_set_speech(_jh_vq)
+            return conversation.ConversationResult(response=_jh_ir, conversation_id=user_input.conversation_id or cid)
+
+        history.append({"role": "user", "content": user_input.text})
+        save_message("user", user_input.text, device_id=_jh_dev, user_id=_jh_uid)
+        _jh_t0 = __import__("time").time()   # jh-answer-watch: when the question came in
+
+        # jh-r25-epoch (step 167, review round 25 #6): the house group's long-term memory belongs to its membership, like its
+        # thread: the group login stores and recalls under a key of its channel, which carries the membership epoch
+        # (chat:g:house:<key>), so a member added later never recalls group talk from before they joined
+        _jh_mem_uid = ("%s@%s" % (_jh_uid, _jh_ch)) if (_jh_uid and str(_jh_ch).startswith("ch:chat:g:")) else _jh_uid
+
+        # v5.6.1: Store user message in long-term memory
+        try:
+            from .memory import store_memory, get_conversation_context
+            await self.hass.async_add_executor_job(
+                lambda: store_memory(user_input.text, role="user", user_id=_jh_mem_uid,
+                    device_id=user_input.device_id or "", conversation_id=cid)
+            )
+            # Retrieve relevant past context and inject into persona
+            # jh-r3-no-recall-without-login (review round 3): voice with no login is anyone at a shared satellite; it recalls
+            # nothing from long-term memory (the satellite window still seeds the last few minutes)
+            mem_context = (await self.hass.async_add_executor_job(
+                get_conversation_context, user_input.text, 3, _jh_mem_uid,
+            )) if _jh_uid else ""
+            if mem_context:
+                persona = persona + "\n\n## Recalled for this message\n" + mem_context
+        except Exception as exc:
+            _LOGGER.debug("Memory store/retrieve: %s", exc)
+
+        # v6.25.0: Inject curated knowledge — durable facts/preferences JARVIS
+        # knows (distinct from the transcript recall above), scored against the
+        # current message so the most relevant facts lead.
+        # v6.29.0: scope to *this* person + household so one resident's private
+        # facts don't leak into another's context.
+        try:
+            from . import knowledge, identity
+            # Jarvis Home patch: a login says who this is. Presence is only a guess for voice with no login.
+            _jh_subject = identity.subject_for_user(self.hass, _jh_uid)
+            if _jh_subject and str(_jh_ch).startswith("ch:chat:g:"):
+                subjects = ["household"]   # jh-r25-epoch: the group login's own facts cross memberships, so they are not recalled
+            elif _jh_subject:
+                subjects = [_jh_subject, "household"]
+                _jh_user = await self.hass.auth.async_get_user(_jh_uid)
+                if _jh_user is not None and _jh_user.is_admin:
+                    subjects.append(identity.DEFAULT_PERSONAL_SUBJECT)  # older unattributed facts
+            else:
+                ident = identity.resolve(
+                    self.hass, device_id=getattr(user_input, "device_id", None))
+                subjects = [identity.subject_for(ident), "household"]
+            # Semantic-aware when embeddings are on (meaning, not just keywords);
+            # falls back to keyword recall internally otherwise. `requester` is the
+            # resolved speaker — the live audience the privacy policy is checked
+            # against (parity, observe-only; Tranche 1 foundation-trust).
+            kn_block = await knowledge.prompt_block_async(
+                self.hass, user_input.text, subjects=subjects,
+                requester=subjects[0])
+            if kn_block:
+                persona = persona + "\n\n## Recalled for this message\n" + kn_block
+        except Exception as exc:
+            _LOGGER.debug("Knowledge inject: %s", exc)
+
+        try:   # Jarvis Home patch (2026-11-14): jh-person-where - live facts about people for the AI
+            from .presence import jh_people_facts as _jh_pf
+            _jh_people = await _jh_pf(self.hass, user_input.text, _jh_uid)
+            if _jh_people:
+                persona = persona + "\n\n" + _jh_people
+        except Exception as exc:
+            _LOGGER.debug("JARVIS: people facts: %s", exc)
+
+        hass_api = await self._get_hass_api(user_input) if self._use_hass_api() else None
+
+        cast_routed = False  # tracks whether Cast speaker is handling TTS
+        reopen_speaker: str | None = None   # separate speaker the reply played on
+        reopen_device: str | None = None    # the wake/voice satellite's device_id
+
+        # v5.9.07: Proactive offer yes/no — resolved before main pipeline.
+        offer_reply = None
+        try:
+            from . import cognitive_core
+            try:   # review round 2: JARVIS's own open question in this conversation comes first
+                from .local_engine import _JH_GN_ASKED as _jh_gna, _JH_PENDING as _jh_pen, jh_forget_pending as _jh_fpo
+                import time as _jh_tm   # review round 3: only a question that is still open (good night 120 s, which one 90 s)
+                _jh_own_q = ((cid in _jh_gna and _jh_tm.time() - _jh_gna[cid] <= 120)
+                             or (cid in _jh_pen and _jh_tm.time() - ((_jh_pen.get(cid) or {}).get("at") or 0) < 90))
+                if not _jh_own_q:
+                    _jh_fpo(cid)   # an expired question of JARVIS no longer stands in the way
+            except Exception:
+                _jh_own_q, _jh_fpo = False, None
+            pending = None if _jh_own_q else cognitive_core.get_pending_offer()
+            if pending and not _jh_offer_live():   # review round 3: a stale offer is dropped, its yes is no longer taken
+                cognitive_core._CORE.pending_offer = None
+                pending = None
+            if pending and not _jh_offer_here(self.hass, user_input, history[:-1] if history and history[-1].get("role") == "user" else history, cid):
+                pending = None   # jh-r15-offer: not where the offer was made, or another question is open here: the AI answers
+            if pending and _jh_fpo is not None:
+                _jh_fpo(cid)
+            if pending:
+                low = user_input.text.strip().lower()
+                try:   # jh-r19-tail (step 161): the shared guard (the yes is an exact word, so it can hold no tail anyway)
+                    from .local_engine import jh_order_tail as _jh_tail_of
+                except Exception:   # a stripped-down engine (upstream's test stub) has no guard to ask
+                    _jh_tail_of = lambda _t: ""
+                try:   # jh-r21-gate (step 163, review round 21 #1): the shared yes rule too
+                    from .local_engine import jh_is_yes as _jh_yes_of
+                except Exception:   # upstream's test stub: the exact word above is the whole rule
+                    _jh_yes_of = lambda _t: True
+                affirm = low.rstrip(".!") in _JH_OFFER_YES and not _jh_tail_of(low) and _jh_yes_of(low)
+                deny = low.rstrip(".!") in _JH_OFFER_NO
+                if affirm:
+                    # Jarvis Home patch: a limited login may say yes to this one action, but its yes builds no standing autonomy.
+                    res = None if _jh_limited and _jh_offer_refused(pending) else await cognitive_core.accept_pending_offer(record=not _jh_limited)
+                    if res is None:
+                        offer_reply = f"That needs an administrator login, {honorific}. Nothing was changed."
+                    elif res.get("now_autonomous"):
+                        offer_reply = (
+                            f"Done, {honorific}. I've noticed you consistently "
+                            f"want this — I'll handle it automatically from now on. "
+                            f"Say 'stop doing that on your own' to revoke."
+                        )
+                    elif res.get("ok"):
+                        left = max(0, 3 - res.get("approvals", 0))
+                        offer_reply = f"Done, {honorific}."
+                        if 0 < left <= 2 and res.get("confirmed") and not res.get("unconfirmed"):
+                            offer_reply += (
+                                " (A couple more times and I'll handle this "
+                                "automatically.)"
+                            )
+                    else:
+                        offer_reply = f"I wasn't able to complete that, {honorific}."
+                    if res is not None and res.get("ok") and (res.get("unconfirmed") or not res.get("confirmed")):
+                        # jh-r15-offer: "Done" only for what the devices confirmed
+                        from .local_engine import jh_group_text as _jh_gt
+                        offer_reply = _jh_gt(self.hass, offer_reply, res.get("confirmed") or [], res.get("unconfirmed") or {},
+                                             honorific)
+                    jarvis_log("OFFER", f"accepted: {offer_reply[:60]}")
+                elif deny:
+                    await cognitive_core.async_decline_pending_offer()
+                    offer_reply = f"Understood, {honorific}. I'll leave it."
+                    jarvis_log("OFFER", "declined")
+                else:
+                    await cognitive_core.async_decline_pending_offer()
+        except Exception as exc:
+            _LOGGER.debug("Offer handling skipped: %s", exc)
+
+        if offer_reply is not None:
+            # Short-circuit: deliver the offer response directly.
+            offer_reply = offer_reply.replace("{honorific}", honorific)
+            try:
+                from .text_tidy import tidy_address
+                offer_reply = tidy_address(offer_reply)
+            except Exception:
+                pass
+            ir = intent.IntentResponse(language=user_input.language)
+            ir.async_set_speech(offer_reply)
+            return conversation.ConversationResult(response=ir, conversation_id=cid)
+
+        # v5.9.16: Relevance gate. Satellites without strict wake-word gating
+        # pick up TV/background speech, which the pipeline transcribes and sends
+        # here as if it were a command. Drop input that clearly isn't addressed
+        # to JARVIS (filler, fragments, rambling dialogue) BEFORE it reaches the
+        # local engine or the agent — staying silent rather than acting on, or
+        # chattering back at, ambient noise. Toggle off via `relevance_gate`.
+        #
+        # VOICE TURNS ONLY (device_id present). Typed panel / text-Assist input
+        # has no satellite, so it carries no ambient noise and is, by definition,
+        # deliberately addressed to JARVIS. Gating it dropped legitimate typed
+        # messages — a multi-sentence correction tripped the "rambling dialogue"
+        # heuristic — and surfaced in the chat panel as the empty-speech error
+        # "(JARVIS returned no text.)". The presence gate above is voice-only
+        # (``if device_id``) for the same reason.
+        _media_near = self._media_playing_near(device_id)
+        if (device_id and self._opt("relevance_gate", True)
+                and not _is_addressed_to_jarvis(user_input.text, strict=_media_near)):
+            jarvis_log("GATE", f"ignored ambient input{' (media playing)' if _media_near else ''}: '{user_input.text.strip()[:60]}'")
+            _LOGGER.info("JARVIS relevance gate: ignored '%s' (media_near=%s)", user_input.text.strip()[:80], _media_near)
+            ir = intent.IntentResponse(language=user_input.language)
+            ir.async_set_speech("")  # silence — do not respond to ambient speech
+            return conversation.ConversationResult(response=ir, conversation_id=cid)
+
+        try:
+            # v5.7.00: Local engine is PRIMARY. Complexity scoring decides
+            # whether to escalate to LLM. Handles 95%+ of requests at zero
+            # API cost. Only genuinely complex/creative/analytical requests
+            # fall through to the configured LLM agent.
+            from .local_engine import try_local, score_complexity
+            # Direct-reasoning (#469): an install that fronts JARVIS with its own
+            # agent (one that already triaged the request) can skip JARVIS's
+            # local-first classification — try_local + complexity scoring — and
+            # send the request STRAIGHT to the reasoning agent, saving the
+            # double-classification latency. Default OFF: the local engine stays
+            # primary and still handles ~95% of requests at zero API cost for
+            # everyone else. Offline safety is preserved below (a doomed LLM call
+            # still falls back to a forced local salvage pass).
+            _direct = bool(self._opt("direct_reasoning", False))
+            # Confirm/answer in the language the request came in (#522): the
+            # pipeline language (a German satellite → "de") is priority #1 in the
+            # language resolution, so a German command is confirmed in German even
+            # when JARVIS's output_language is Auto and the system is English.
+            _req_lang = getattr(user_input, "language", None)
+            # Jarvis Home patch (2026-11-14): jh-person-where - a clear 'where is <person>' is answered from HA at once
+            _jh_where = None
+            _jh_prev = None
+            try:   # jh-prev-question: "what did I ask you before?" from this login's own turns (step 131)
+                from .local_engine import jh_previous_question as _jh_pq
+                from .database import get_thread_messages as _jh_gtm
+                _jh_prev = await _jh_pq(self.hass, user_input.text, _jh_uid, _jh_dev, honorific, _jh_gtm)
+            except Exception as exc:
+                _LOGGER.debug("JARVIS: previous question: %s", exc)
+            try:
+                from .presence import jh_where_and_battery as _jh_wa   # jh-battery: where-is and the phone battery
+                from .local_engine import jh_answer_elsewhere as _jh_elsewhere   # jh-reply-lang
+                if not _jh_elsewhere(user_input.text):
+                    _jh_where = await _jh_wa(self.hass, user_input.text, _jh_uid, honorific, spoken=bool(device_id))
+            except Exception as exc:
+                _LOGGER.debug("JARVIS: where-is answer: %s", exc)
+            _jh_where = _jh_where or _jh_prev
+            if _jh_where:   # review 2026-11-15: answered without try_local, so JARVIS's own open question ends here
+                try:
+                    from .local_engine import jh_forget_pending as _jh_fp
+                    _jh_fp(cid)
+                except Exception:
+                    pass
+            if _jh_where:
+                from .local_engine import LocalResult as _jh_LR
+                local_result = _jh_LR(text=_jh_where, success=True)
+            else:
+                local_result = None if _direct else await try_local(
+                    self.hass, user_input.text, honorific, lang=_req_lang, pending_key=cid)
+
+            if local_result and local_result.handled:
+                response_text = local_result.text
+                _LOGGER.info("JARVIS local: %s", response_text[:100])
+                jarvis_log("LOCAL", f"handled: {response_text[:80]}")
+            else:
+                complexity = -1 if _direct else score_complexity(user_input.text)
+                # v5.9.06: Connectivity-aware escalation. If the circuit breaker
+                # is OPEN (LLM known-unreachable), skip the doomed network call
+                # entirely and attempt an offline salvage pass instead.
+                from . import connectivity
+                if not connectivity.allow_request():
+                    jarvis_log("OFFLINE", f"LLM down — local salvage: {user_input.text[:60]}")
+                    salvage = await try_local(
+                        self.hass, user_input.text, honorific, force=True,
+                        lang=_req_lang, pending_key=cid
+                    )
+                    if salvage and salvage.handled:
+                        response_text = salvage.text
+                        _LOGGER.info("JARVIS offline-salvage: %s", response_text[:100])
+                    else:
+                        try:   # jh-r23-offline (step 165, review round 23 #9): the request's language
+                            from .agent import jh_offline_line
+                            response_text = jh_offline_line("offline", user_input.text or "", honorific)
+                        except ImportError:
+                            response_text = (f"I'm offline at the moment, {honorific}, so I can't handle that request — it "
+                                             f"needs my reasoning systems.")
+                else:
+                    # Complex request — use the configured LLM agent.
+                    from .agent import run_agent
+                    from . import ha_secrets as _hs
+                    from . import jarvis_config as _jc
+                    # Default: the big Main Agent model handles the escalation.
+                    provider_name = self._rt_opt("llm_provider", "groq")
+                    model_val = self._rt_opt(CONF_MODEL, DEFAULT_MODEL)
+                    # Fast-chat tier (latency work): a simple conversational turn
+                    # the regex engine couldn't template — one that escalates yet
+                    # scores below the threshold — goes to the small/fast model
+                    # instead of the big Main Agent. Anything complex (or direct-
+                    # reasoning, complexity=-1) is unchanged. Best-effort: a fault
+                    # here just leaves the Main Agent model in place.
+                    _tier = None
+                    try:
+                        from . import fast_chat as _fast
+                        _tier = _fast.fast_tier_target({
+                            "fast_chat_enabled": self._rt_opt("fast_chat_enabled", False),
+                            "fast_model":        self._rt_opt("fast_model", ""),
+                            "fast_provider":     self._rt_opt("fast_provider", ""),
+                            "fast_chat_max_complexity": self._rt_opt(
+                                "fast_chat_max_complexity", 70),
+                            "llm_provider":      provider_name,
+                        }, complexity)
+                    except Exception:
+                        _tier = None
+                    if _tier:
+                        provider_name = _tier["provider"]
+                        model_val = _tier["model"]
+                    jarvis_log("AGENT",
+                               f"direct reasoning (local triage off): {user_input.text[:60]}"
+                               if _direct else
+                               (f"fast-chat → {model_val} (complexity={complexity}): {user_input.text[:60]}"
+                                if _tier else
+                                f"LLM needed (complexity={complexity}): {user_input.text[:60]}"))
+                    # Credentials live only in secrets.yaml, keyed per provider,
+                    # so resolving via a shared field can't send the wrong
+                    # provider's key to a different provider's API.
+                    api_key_val = await _hs.async_get_provider_key(self.hass, provider_name)
+                    from .const import resolve_provider_base_url
+                    base_url_val = resolve_provider_base_url({
+                        "custom_base_url": self._rt_opt("custom_base_url", ""),
+                        "ollama_base_url": self._rt_opt("ollama_base_url", ""),
+                        "llm_base_url": self._rt_opt("llm_base_url", ""),
+                    }, provider_name)
+
+                    # The reasoning-tier fallback needs the FULL config, not
+                    # entry.data|options — those are empty on panel-configured
+                    # installs, which left the fallback unable to resolve a
+                    # provider and forced the "offline" message even when a
+                    # working tier was configured. Use the single source of
+                    # truth (jarvis_config) plus live panel runtime_config.
+                    eff_config = await self.hass.async_add_executor_job(
+                        _jc.effective_config, self.entry
+                    )
+                    try:
+                        _rc = self.hass.data.get(DOMAIN, {}).get(
+                            self.entry.entry_id, {}).get("runtime_config", {})
+                        if isinstance(_rc, dict):
+                            eff_config = {**eff_config,
+                                          **{k: v for k, v in _rc.items()
+                                             if v not in (None, "")}}
+                    except Exception:
+                        pass
+
+                    try:
+                        response_text = await run_agent(
+                            self.hass,
+                            messages=history,
+                            persona=persona,
+                            provider_name=provider_name,
+                            api_key=api_key_val,
+                            model=model_val,
+                            base_url=base_url_val,
+                            hass_api=hass_api,
+                            user_input=user_input,
+                            temperature=0.7,
+                            config={**eff_config, "honorific": honorific},   # Jarvis Home patch: the asker's form of address
+                        )
+                        # Agent returns a connectivity sentinel string on total
+                        # failure; treat that as a breaker failure + salvage.
+                        if _is_connectivity_failure(response_text):
+                            connectivity.record_failure()
+                            salvage = await try_local(
+                                self.hass, user_input.text, honorific, force=True,
+                                lang=_req_lang, pending_key=cid
+                            )
+                            if salvage and salvage.handled:
+                                response_text = salvage.text
+                        else:
+                            connectivity.record_success()
+                    except Exception as agent_exc:  # pylint: disable=broad-except
+                        _LOGGER.warning("Agent call raised: %s", agent_exc)
+                        connectivity.record_failure()
+                        salvage = await try_local(
+                            self.hass, user_input.text, honorific, force=True,
+                            lang=_req_lang, pending_key=cid
+                        )
+                        if salvage and salvage.handled:
+                            response_text = salvage.text
+                        else:
+                            try:   # jh-r23-offline (step 165, review round 23 #9)
+                                from .agent import jh_offline_line
+                                response_text = jh_offline_line("lost", user_input.text or "", honorific)
+                            except ImportError:
+                                response_text = (f"I've lost connection to my reasoning systems, {honorific}. I can still "
+                                                 f"control devices and report status while I reconnect.")
+            response_text = response_text.replace("{honorific}", honorific)
+            # Tidy address-comma artifacts left by a blank honorific (#400 #8).
+            try:
+                from .text_tidy import tidy_address
+                response_text = tidy_address(response_text)
+            except Exception:
+                pass
+            try:   # Jarvis Home patch (2026-11-14): a leftover sir becomes the asker's form of address
+                from .presence import jh_swap_address
+                response_text = jh_swap_address(response_text, honorific, ("sir", _jh_hon_global))
+                from .text_tidy import tidy_address
+                response_text = tidy_address(response_text)
+            except Exception:
+                pass
+
+            # v5.7.01: Record the winning response so duplicate pipelines
+            # arriving slightly later will get caught by dedup
+            _record_dedup_response(user_input.text, response_text)
+
+            # v5.8.03: Log command for cognitive core pattern learning
+            # v6.29.0: attribute to the resolved person so per-person command
+            # patterns are real (falls back to "unknown" when not confident).
+            try:
+                from . import cognitive_core, identity, voice_recognition
+                handler = "local" if local_result and local_result.handled else "agent"
+                dev = getattr(user_input, "device_id", None)
+                who = identity.resolve(self.hass, device_id=dev).person
+                cognitive_core.log_command(
+                    text=user_input.text,
+                    handled_by=handler,
+                    person=who,
+                )
+                # Voice learns over time: if we know who this is from other
+                # signals but the voice service doesn't yet, flag an enrollment
+                # opportunity so the pending sample can be labelled automatically.
+                voice_recognition.maybe_fire_enrollment(self.hass, dev)
+            except Exception:
+                pass
+
+            # v5.7.03: Route reply to paired Cast speaker. The satellite
+            # handles wake/STT, JARVIS routes TTS output to the real
+            # speaker in the room (Google Home, Nest Audio, etc.) for
+            # better audio quality. Satellite pairings from the panel
+            # Settings determine which speaker each satellite uses.
+            try:
+                device_id_route = getattr(user_input, 'device_id', None)
+                if device_id_route:
+                    from .audio_routing import reply_target
+                    # Read satellite_pairings from runtime_config
+                    sat_pairings = None
+                    try:
+                        import json as _json
+                        _data = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {})
+                        _rc = _data.get("runtime_config", {}) if isinstance(_data, dict) else {}
+                        _raw = _rc.get("satellite_pairings")
+                        if _raw:
+                            _parsed = _json.loads(_raw) if isinstance(_raw, str) else _raw
+                            if isinstance(_parsed, dict) and _parsed:
+                                sat_pairings = _parsed
+                    except Exception:
+                        pass
+
+                    speaker = reply_target(
+                        self.hass,
+                        device_id=device_id_route,
+                        satellite_pairings=sat_pairings,
+                    )
+                    # A mic-only satellite (e.g. Waveshare with the DAC off), or
+                    # one whose room has no real speaker, resolves to itself and
+                    # can't play the reply. Fall back to the configured
+                    # reply/broadcast speakers — the same ones proactive audio
+                    # (the briefing) already uses successfully — so the reply is
+                    # heard instead of lost.
+                    if not speaker or speaker.startswith("assist_satellite."):
+                        for cand in self._speakers(device_id_route):
+                            if cand.startswith("assist_satellite."):
+                                continue
+                            st = self.hass.states.get(cand)
+                            if st is not None and st.state not in ("unavailable", "unknown"):
+                                _LOGGER.info(
+                                    "JARVIS reply: satellite can't speak, using "
+                                    "configured reply speaker %s", cand)
+                                speaker = cand
+                                break
+                    if speaker and not speaker.startswith("assist_satellite."):
+                        tts_ent = resolve_tts_entity(
+                            self.hass, self._opt("tts_engine", "auto"),
+                        )
+                        sp = self.hass.states.get(speaker)
+                        sp_reachable = sp is not None and sp.state not in (
+                            "unavailable", "unknown")
+                        if tts_ent and sp_reachable:
+                            _LOGGER.info(
+                                "JARVIS reply → Cast: tts=%s speaker=%s",
+                                tts_ent, speaker,
+                            )
+                            # Fire-and-forget to the paired speaker, then silence
+                            # the satellite. This is the delivery that worked.
+                            # v7.50–v7.51 changed this to await + poll the speaker
+                            # for a 'playing' state + fall back to broadcast; that
+                            # misfired on idle Cast speakers that play fine but don't
+                            # report 'playing' during a short announce, breaking the
+                            # working case. Reverted to the original behavior.
+                            self.hass.async_create_task(
+                                async_announce(
+                                    self.hass, response_text,
+                                    tts_ent, [speaker],
+                                    context="reply",
+                                )
+                            )
+                            cast_routed = True
+                            reopen_speaker = speaker
+                            reopen_device = device_id_route
+                            try:
+                                jarvis_log("REPLY", f"→ Cast {speaker} via {tts_ent}")
+                            except Exception:
+                                pass
+                        elif not sp_reachable:
+                            # The reply speaker is offline — do NOT silence the
+                            # satellite, or the reply is lost entirely. Let the
+                            # satellite speak instead.
+                            _LOGGER.warning(
+                                "JARVIS reply: Cast speaker %s is unavailable — "
+                                "the satellite will speak the reply instead", speaker)
+                            try:
+                                jarvis_log("REPLY", f"speaker {speaker} unavailable "
+                                           "— satellite will speak")
+                            except Exception:
+                                pass
+                        else:
+                            _LOGGER.warning("JARVIS reply: no TTS entity found")
+                            try:
+                                jarvis_log("REPLY", "no TTS entity — satellite will speak")
+                            except Exception:
+                                pass
+                    else:
+                        _LOGGER.info(
+                            "JARVIS reply: no Cast pairing for device=%s, "
+                            "pipeline speaker fallback",
+                            device_id_route,
+                        )
+                        try:
+                            jarvis_log("REPLY", f"no Cast pairing for device="
+                                       f"{device_id_route} — satellite plays "
+                                       f"(resolved={speaker})")
+                        except Exception:
+                            pass
+            except Exception as exc:
+                _LOGGER.warning("Reply routing error: %s", exc)
+
+            # Now safe to do blocking DB operations
+            history.append({"role": "assistant", "content": response_text})
+            _JH_LAST_REPLY[cid] = __import__("time").time()   # jh-r15-offer
+            if len(_JH_LAST_REPLY) > 500:   # jh-r15-offer: keep only the recent conversations
+                for _jh_k in sorted(_JH_LAST_REPLY, key=_JH_LAST_REPLY.get)[:250]:
+                    _JH_LAST_REPLY.pop(_jh_k, None)
+            try:   # jh-answer-watch: a read-only check of the answer (only while the Answer watcher is on)
+                from .optional_extras import async_note_turn as _jh_watch
+                self.hass.async_create_task(_jh_watch(self.hass, user_input.text, response_text, _jh_uid, _jh_dev,
+                                                      locals().get("_jh_t0")))
+            except Exception:
+                pass
+            try:
+                await self.hass.async_add_executor_job(
+                    save_message, "assistant", response_text, _jh_dev, _jh_uid,
+                )
+            except Exception:
+                pass
+            _LOGGER.debug("JARVIS → %s", response_text[:120])
+
+            # Store assistant response in long-term memory
+            try:
+                await self.hass.async_add_executor_job(
+                    lambda: store_memory(response_text, role="assistant", user_id=_jh_mem_uid,
+                        device_id=user_input.device_id or "", conversation_id=cid)
+                )
+            except Exception:
+                pass
+
+        except Exception as exc:  # pylint: disable=broad-except
+            _LOGGER.error(
+                "JARVIS API error (%s): %s | model=%s",
+                type(exc).__name__, exc, self._model(),
+            )
+            response_text = _FALLBACKS[self._fallback_idx % len(_FALLBACKS)].format(
+                honorific=honorific
+            )
+            self._fallback_idx += 1
+            if history and history[-1]["role"] == "user":
+                history.pop()
+
+        ir = intent.IntentResponse(language=user_input.language)
+        # When Cast routing succeeded, suppress the pipeline's TTS to the
+        # satellite speaker — only the Cast device should talk. If Cast
+        # routing failed or wasn't attempted, let the pipeline play through
+        # the satellite as fallback.
+        if cast_routed:
+            ir.async_set_speech("")  # silence satellite — Cast has it
+        else:
+            ir.async_set_speech(response_text)  # fallback: satellite speaks
+        result = conversation.ConversationResult(response=ir, conversation_id=cid)
+        # v6.88.0: keep listening for a follow-up when JARVIS invited one, so
+        # natural turn-taking works without a new wake word. Set defensively —
+        # older HA cores may not carry the field.
+        try:
+            from . import continued_conversation as _cc
+            if (_cc.enabled() and _cc.should_continue(response_text)
+                    and not self._media_playing_near(reopen_device)):
+                sat_ent = (_cc.satellite_for_device(self.hass, reopen_device)
+                           if reopen_device else None)
+                if (cast_routed and reopen_speaker and sat_ent
+                        and _cc.speaker_reopen_enabled()):
+                    # The reply is playing on a SEPARATE speaker, not the mic-only
+                    # satellite. HA's continue_conversation would reopen the mic
+                    # based on the satellite's own (instant) playback — before the
+                    # speaker finishes — so the mic would capture JARVIS's own
+                    # reply. Instead JARVIS watches the speaker and reopens the mic
+                    # only once it goes idle.
+                    _cc.schedule_reopen(
+                        self.hass, sat_ent, reopen_speaker, response_text)
+                else:
+                    # Satellite plays the reply itself (or no separate speaker) —
+                    # HA's built-in reopen timing is correct here.
+                    result.continue_conversation = True
+        except Exception:
+            pass
+        return result
+
+
+def _ha_kwargs(cls, **kwargs):
+    """Keep only the kwargs that cls's constructor accepts. Home Assistant's LLM
+    API changed fields across versions — 2026.8 moved the context out of
+    ToolInput into LLMContext and dropped user_prompt — so we pass the
+    intersection and stay compatible with old and new HA (v7.21.1). Never raises."""
+    try:
+        import inspect
+        allowed = inspect.signature(cls).parameters
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return kwargs

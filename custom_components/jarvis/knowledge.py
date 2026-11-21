@@ -1,0 +1,1200 @@
+"""
+JARVIS Knowledge — curated semantic memory (v6.25.0).
+
+This is the *semantic* memory layer: durable, curated facts and preferences that
+JARVIS knows and can reason over — distinct from two stores that already exist:
+
+  • memory.py        episodic transcript recall ("what we said before")
+  • patterns.db      high-volume behavioural telemetry ("what tends to happen")
+
+knowledge.py holds the low-volume, high-value middle: discrete facts a butler
+would simply *know* — "trash is Tuesday", "Sam runs cold at night", "Eliana's
+pickup is 3 PM today". Each is attributed to a subject so per-person identity can
+slot in later untouched, carries a source + confidence so observed/inferred facts
+rank below stated ones, and can expire so ephemeral facts clean themselves up.
+
+Storage: /config/jarvis/knowledge.db (sibling of patterns.db). Pure SQLite —
+keyword + recency + salience recall now; an embedding column can be added later
+for semantic search without reshaping callers.
+
+All DB functions are SYNC — call them via hass.async_add_executor_job(...).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+import sqlite3
+import time
+from typing import Optional
+
+from .paths import config_path_str
+
+_LOGGER = logging.getLogger(__name__)
+
+# SHADOW (#237): all_facts() also packages each curated fact as a
+# kernel.provenance.Provenance (value / source / confidence / model) and logs a
+# one-line summary — observe-only, nothing consumes it yet (conflict resolution
+# and authoritative reads attach once it earns parity). Flip PROVENANCE_SHADOW
+# to False to silence it; all_facts() returns exactly the same rows either way.
+PROVENANCE_SHADOW = True
+
+# SHADOW (Epistemic Fabric — Uncertainty): all_facts() also logs the epistemic-
+# band distribution of the curated facts (how many are KNOWN vs BELIEVED vs
+# GUESSED vs UNKNOWN by their stored confidence) — observe-only, broadening the
+# Uncertainty primitive's coverage from perception (identity.resolve, the parity
+# anchor) to curated knowledge. Flip UNCERTAINTY_SHADOW to False to silence it;
+# all_facts() returns the same rows either way. (world_model.uncertainties()
+# exposes the same facts as kernel.Uncertain values as a facade.)
+UNCERTAINTY_SHADOW = True
+
+# SHADOW (Phase T, Deep World Model): all_facts() also folds the curated facts +
+# their relation edges into a typed kernel.graph.KnowledgeGraph and logs a
+# one-line summary — observe-only, nothing reads the graph yet. Flip
+# GRAPH_SHADOW to False to silence it; all_facts() returns the same rows either
+# way. (world_model.knowledge_graph() exposes the same view as a facade.)
+GRAPH_SHADOW = True
+
+# SHADOW (Epistemic Fabric — Temporal validity): all_facts() also logs the
+# freshness-band distribution of the curated facts (how many are FRESH / AGING /
+# EXPIRED / DURABLE at `now`) via kernel.temporal, derived from each fact's
+# `updated_at` (valid-as-of) and `expires_at` (→ ttl; absent ⇒ DURABLE) —
+# observe-only, completing the fabric's coverage of curated knowledge (sourced +
+# uncertain + now time-bound). Nothing defers on staleness yet (that is the
+# parity/enforce rung). Flip TEMPORAL_SHADOW to False to silence it; all_facts()
+# returns the same rows either way.
+TEMPORAL_SHADOW = True
+
+# SHADOW (Phase W prerequisite — information-flow / privacy): all_facts() also
+# runs the fact set through kernel.privacy — the FIRST live consult of that
+# primitive — and logs how many facts the non-disclosure-across-subjects rule
+# would withhold from a *different* resident (personal facts about one subject do
+# not flow to another without consent). Observe-only: nothing is redacted or
+# withheld from any real caller and all_facts() returns the same rows either way;
+# the parity/enforce rungs (which need the live requester identity) come later.
+# Flip PRIVACY_SHADOW to False to silence it.
+PRIVACY_SHADOW = True
+
+# PARITY (Phase W prerequisite — information-flow / privacy): the recall-for-reply
+# block (prompt_block / prompt_block_async) also runs the facts it is ABOUT TO
+# DISCLOSE through kernel.privacy against the LIVE requester identity — the step
+# up from the shadow above, which used a hypothetical audience. It logs how many
+# of those facts the cross-subject non-disclosure rule would withhold from THIS
+# requester. Normally 0 (recall already scopes to [requester, household]); a
+# non-zero count is a real finding — a fact about someone else reached this
+# person's context, which the enforce rung would redact. Observe-only: the block
+# the model sees is unchanged whether this runs or not; enforce is a later,
+# owner-gated decision. Flip PRIVACY_PARITY to False to silence it.
+PRIVACY_PARITY = True
+
+# ENFORCE (Phase W prerequisite — information-flow / privacy, owner-authorized):
+# the recall-for-reply block now ACTUALLY WITHHOLDS the facts the cross-subject
+# non-disclosure rule would deny the live requester, instead of only logging them
+# (the parity above). This is a BELT over the existing subject-scoping (recall
+# already asks for [requester, household]), so normally it removes nothing; it
+# catches the rare case where a fact about a different person reached this
+# person's recall and keeps it out of the model's context. FAIL-SAFE: it only
+# ever REMOVES a cross-subject personal/sensitive fact — the requester's own
+# facts and household facts always pass — and on ANY fault it returns the recall
+# unchanged, so a privacy fault can never blank a reply. Kill-switch: flip
+# PRIVACY_ENFORCE to False to revert to parity (log-only) on the next load.
+PRIVACY_ENFORCE = True
+
+# ENFORCE (Phase T, Deep World Model) — ON (owner-enabled, 8.158.0). The curated-
+# knowledge prompt block is graph-authoritative: the recall-seeded facts are
+# expanded one hop through the knowledge graph (facts about directly-related
+# entities are pulled in too), so JARVIS's injected context reasons over the
+# graph, not just flat recall. Fail-safe: any failure (or an empty graph result)
+# falls back to exactly the flat recall block, so this can only ADD related
+# context, never lose the present behaviour or touch any actuation. Earned parity
+# first (GRAPH_PARITY measured the would-be expansion). Revert to flat recall by
+# setting this False — or from Settings → Governance (knowledge_graph).
+KNOWLEDGE_GRAPH_ENFORCE = True
+
+# PARITY (Phase T, Deep World Model): when enforce is OFF (the live state),
+# prompt_block_async still computes the would-be 1-hop graph expansion of the
+# recall seed and logs how many related facts it WOULD add — the quantified bar
+# for the enforce rung, without changing the block the model sees. Observe-only;
+# flip GRAPH_PARITY off to silence it. Independent of KNOWLEDGE_GRAPH_ENFORCE.
+GRAPH_PARITY = True
+
+# Cap on how many related-entity facts the 1-hop expansion may add, so the block
+# stays compact.
+_GRAPH_EXPAND_CAP = 6
+
+
+def _emit_provenance_shadow(facts: list) -> None:
+    """Log the provenance view of a fact set (shadow). Best-effort, never raises —
+    the knowledge store itself is unchanged whether this runs or not."""
+    try:
+        from .kernel import provenance as P
+        recs = []
+        for f in (facts or []):
+            if not isinstance(f, dict):
+                continue
+            recs.append(P.record(
+                f.get("value"),
+                source=str(f.get("source") or "knowledge"),
+                confidence=float(f.get("confidence", 1.0) or 1.0),
+                model=str(f.get("model") or ""),
+            ))
+        if recs:
+            _LOGGER.debug("provenance(shadow): %d fact record(s); e.g. %s",
+                          len(recs), P.summary(recs[0]))
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_uncertainty_shadow(facts: list) -> None:
+    """Log the epistemic-band distribution of a fact set (Epistemic Fabric —
+    Uncertainty, shadow): how many curated facts are KNOWN / BELIEVED / GUESSED /
+    UNKNOWN by their stored confidence. Observe-only, never raises — the knowledge
+    store is unchanged whether this runs or not."""
+    try:
+        from .kernel import uncertainty as U
+        bands = {U.KNOWN: 0, U.BELIEVED: 0, U.GUESSED: 0, U.UNKNOWN: 0}
+        n = 0
+        for f in (facts or []):
+            if not isinstance(f, dict):
+                continue
+            band = U.band_for(float(f.get("confidence", 1.0) or 1.0))
+            bands[band] = bands.get(band, 0) + 1
+            n += 1
+        if n:
+            _LOGGER.debug(
+                "uncertainty(shadow): %d fact(s) — %d known / %d believed / "
+                "%d guessed / %d unknown", n, bands[U.KNOWN], bands[U.BELIEVED],
+                bands[U.GUESSED], bands[U.UNKNOWN])
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_graph_shadow(facts: list) -> None:
+    """Build the typed knowledge-graph view of the current facts + relations and
+    log a one-line summary (Phase T — shadow). Best-effort, never raises — the
+    knowledge store is unchanged whether this runs or not, and nothing reads the
+    graph yet."""
+    try:
+        from .kernel import graph as G
+        try:
+            relations = related() or []
+        except Exception:
+            relations = []
+        g = G.KnowledgeGraph.from_rows(facts or [], relations)
+        if not g.is_empty():
+            _LOGGER.debug("graph(shadow): %d entit(ies), %d relation(s)",
+                          len(g.entities), len(g.relations))
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_temporal_shadow(facts: list, now: float) -> None:
+    """Log the temporal-validity band distribution of a fact set (Epistemic
+    Fabric — Temporal, shadow): how many curated facts are FRESH / AGING /
+    EXPIRED / DURABLE at ``now``, by each fact's ``updated_at`` (valid-as-of) and
+    ``expires_at`` (→ ttl; absent ⇒ DURABLE). Observe-only, never raises — the
+    knowledge store is unchanged whether this runs or not, and nothing defers on
+    staleness yet (that is the parity/enforce rung). Facts returned by
+    ``all_facts`` are already expiry-filtered, so the signal is mostly how many
+    are approaching staleness (AGING) versus fresh or durable."""
+    try:
+        from .kernel import temporal as T
+        vals = []
+        for f in (facts or []):
+            if not isinstance(f, dict):
+                continue
+            observed = float(f.get("updated_at", 0.0) or 0.0)
+            exp = f.get("expires_at")
+            ttl = None if exp is None else max(0.0, float(exp) - observed)
+            vals.append(T.assess(observed, ttl=ttl))
+        if vals:
+            st = T.summarize(vals, now)
+            _LOGGER.debug(
+                "temporal(shadow): %d fact(s) — %d fresh / %d aging / "
+                "%d expired / %d durable (%d still valid)",
+                st.count, st.fresh, st.aging, st.expired, st.durable, st.valid)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# PARITY (Epistemic Fabric — Temporal validity): all_facts() also logs how many
+# of the returned curated facts a temporal-AWARE consumer WOULD caveat as
+# approaching staleness (AGING, or EXPIRED on a row that slipped the expiry
+# filter) against the current behaviour, which caveats none. Mirrors the
+# where-last-seen parity rung (9.118.0) for semantic knowledge: the AGING share is
+# the quantified bar the owner-gated enforce rung reads before JARVIS starts
+# hedging an aging fact ("as of a while ago…"). Observe-only; all_facts() returns
+# the same rows. Flip off to silence.
+TEMPORAL_PARITY = True
+
+
+def _emit_temporal_parity(facts: list, now: float) -> None:
+    """Parity rung for the Temporal fabric on curated knowledge (Epistemic Fabric).
+    The shadow rung logs the freshness-band distribution; parity logs how many
+    returned facts a temporal-aware consumer WOULD caveat as stale (AGING/EXPIRED)
+    against the current behaviour, which caveats none. ``all_facts`` already drops
+    EXPIRED rows, so the live divergence is the AGING share — facts still valid but
+    worth a "this may be a little out of date" hedge. Observe-only; the returned
+    rows are unchanged. Never raises."""
+    if not TEMPORAL_PARITY:
+        return
+    try:
+        from .kernel import temporal as T
+        vals = []
+        for f in (facts or []):
+            if not isinstance(f, dict):
+                continue
+            observed = float(f.get("updated_at", 0.0) or 0.0)
+            exp = f.get("expires_at")
+            ttl = None if exp is None else max(0.0, float(exp) - observed)
+            vals.append(T.assess(observed, ttl=ttl))
+        if not vals:
+            return
+        st = T.summarize(vals, now)
+        would_caveat = st.aging + st.expired   # a temporal-aware consumer hedges these
+        _LOGGER.debug(
+            "temporal(parity): %d fact(s) — would_caveat=%d (aging/expired) "
+            "current_caveats=0 diverge=%s",
+            st.count, would_caveat, would_caveat > 0)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_privacy_shadow(facts: list) -> None:
+    """Log the information-flow (privacy) view of a fact set — the FIRST live
+    consult of ``kernel.privacy`` (Phase W prerequisite, shadow). Each fact is
+    mapped to a ``privacy.DataItem`` (``subject`` = whom it's about; classification
+    HOUSEHOLD for the shared ``household`` subject, PERSONAL for a person-specific
+    one) and run through the policy against a hypothetical *different* resident, to
+    show how many personal facts the non-disclosure-across-subjects rule would
+    withhold. Observe-only: nothing is redacted or withheld from any real caller
+    and the knowledge store is unchanged whether this runs or not. Never raises."""
+    try:
+        from .kernel import privacy as PV
+        items = []
+        for f in (facts or []):
+            if not isinstance(f, dict):
+                continue
+            subj = str(f.get("subject") or DEFAULT_SUBJECT).strip().lower()
+            personal = bool(subj) and subj != DEFAULT_SUBJECT
+            items.append(PV.DataItem(
+                classification=(PV.PERSONAL if personal else PV.HOUSEHOLD),
+                subject=(subj if personal else "")))
+        if not items:
+            return
+        # A hypothetical different resident (not a subject, not consented): the
+        # policy lets household facts flow and withholds personal ones about
+        # someone else — the load-bearing cross-subject rule, exercised live.
+        disclosable = PV.redact(items, audience="__nonsubject_audience__")
+        withheld = len(items) - len(disclosable)
+        _LOGGER.debug(
+            "privacy(shadow): %d fact(s) — %d would be withheld from a different "
+            "resident by the cross-subject non-disclosure rule (observe-only)",
+            len(items), withheld)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_privacy_parity(facts: list, requester: Optional[str]) -> None:
+    """Parity consult of ``kernel.privacy`` against the LIVE requester identity —
+    the step up from :func:`_emit_privacy_shadow`, which used a hypothetical
+    audience (Phase W prerequisite). Runs the non-disclosure-across-subjects
+    policy over the facts ABOUT TO BE DISCLOSED to ``requester`` and logs how many
+    the policy would withhold from them. Normally 0 — recall already scopes to
+    ``[requester, household]`` — so a non-zero count is a real finding: a fact
+    about someone else reached this person's recall context, which the enforce
+    rung would redact. Observe-only: the returned block is unchanged whether this
+    runs or not. Never raises. Kill-switch: :data:`PRIVACY_PARITY`."""
+    if not PRIVACY_PARITY:
+        return
+    try:
+        req = str(requester or "").strip().lower()
+        if not req:
+            return
+        from .kernel import privacy as PV
+        items = []
+        for f in (facts or []):
+            if not isinstance(f, dict):
+                continue
+            subj = str(f.get("subject") or DEFAULT_SUBJECT).strip().lower()
+            personal = bool(subj) and subj != DEFAULT_SUBJECT
+            items.append(PV.DataItem(
+                classification=(PV.PERSONAL if personal else PV.HOUSEHOLD),
+                subject=(subj if personal else "")))
+        if not items:
+            return
+        disclosable = PV.redact(items, audience=req)
+        withheld = len(items) - len(disclosable)
+        if withheld > 0:
+            # A fact about a DIFFERENT subject slipped into this requester's
+            # recall — the live path would disclose it; the enforce rung would
+            # not. Surface it (observe-only) so the divergence is visible before
+            # enforce is turned on.
+            _LOGGER.warning(
+                "privacy(parity): %d of %d recalled fact(s) would be WITHHELD "
+                "from requester '%s' by the cross-subject non-disclosure rule — a "
+                "cross-subject fact reached this context; enforce would redact it "
+                "(observe-only)", withheld, len(items), req)
+        else:
+            _LOGGER.debug(
+                "privacy(parity): all %d recalled fact(s) disclosable to requester "
+                "'%s' — policy agrees with the recall scoping (observe-only)",
+                len(items), req)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _privacy_enforce_filter(facts: list, requester: Optional[str]) -> list:
+    """Drop the facts the cross-subject non-disclosure rule would withhold from
+    ``requester`` — the privacy ENFORCE rung (owner-authorized). Returns the
+    disclosable subset to put in the model's context.
+
+    A BELT over the existing subject-scoping: recall already asks for
+    ``[requester, household]``, so normally nothing is removed; this keeps a
+    stray cross-subject fact out if one ever reaches the recall. FAIL-SAFE — a
+    blank/absent requester, enforce off, or ANY fault returns ``facts`` unchanged
+    (a privacy fault can never blank a reply), and only a PERSONAL/SENSITIVE fact
+    about a DIFFERENT subject is ever removed (the requester's own facts and
+    household facts always pass). Kill-switch: :data:`PRIVACY_ENFORCE`."""
+    if not PRIVACY_ENFORCE:
+        return facts
+    req = str(requester or "").strip().lower()
+    if not req or not facts:
+        return facts
+    try:
+        from .kernel import privacy as PV
+        out = []
+        withheld = 0
+        for f in facts:
+            if not isinstance(f, dict):
+                out.append(f)                 # never drop a row we can't classify
+                continue
+            subj = str(f.get("subject") or DEFAULT_SUBJECT).strip().lower()
+            personal = bool(subj) and subj != DEFAULT_SUBJECT
+            item = PV.DataItem(
+                classification=(PV.PERSONAL if personal else PV.HOUSEHOLD),
+                subject=(subj if personal else ""))
+            if PV.can_disclose(item, audience=req):
+                out.append(f)
+            else:
+                withheld += 1
+        if withheld:
+            _LOGGER.info(
+                "privacy(enforce): withheld %d cross-subject fact(s) from the "
+                "recall context for requester '%s'", withheld, req)
+        return out
+    except Exception:   # pragma: no cover - defensive: never blank a reply
+        return facts
+
+
+def _log_graph_parity(seed_facts: list, expanded: list) -> None:
+    """Phase T parity: log how many related facts the graph's 1-hop expansion
+    would add to the current flat recall — the quantified bar before the owner
+    flips KNOWLEDGE_GRAPH_ENFORCE. Observe-only; never raises."""
+    try:
+        seed_n = len(seed_facts or [])
+        added = max(0, len(expanded or []) - seed_n)
+        _LOGGER.debug(
+            "graph(parity): recall=%d fact(s); graph expansion would add %d "
+            "related fact(s) (total %d, cap %d)",
+            seed_n, added, len(expanded or []), _GRAPH_EXPAND_CAP)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _graph_expand_facts(seed_facts: list) -> list:
+    """Graph-authoritative 1-hop expansion of a recall-seeded fact set (Phase T
+    enforce). Builds the knowledge graph from the live facts + relations and, for
+    each subject present in the seed, appends facts about directly-related
+    entities (one hop, in or out edges), de-duped by (subject, key) and capped at
+    ``_GRAPH_EXPAND_CAP``. The seed facts always come first and are never dropped.
+    Best-effort → the seed facts unchanged on any failure (the fail-safe for the
+    enforce path). SYNC — call via executor."""
+    seed = list(seed_facts or [])
+    try:
+        from .kernel import graph as G
+        all_rows = all_facts() or []
+        relations = related() or []
+    except Exception:
+        return seed
+    try:
+        g = G.KnowledgeGraph.from_rows(all_rows, relations)
+        by_subject: dict = {}
+        for f in all_rows:
+            by_subject.setdefault(str(f.get("subject", "")).lower(), []).append(f)
+        seen = {(str(f.get("subject", "")).lower(), str(f.get("key", "")))
+                for f in seed}
+        seed_subjects = {str(f.get("subject", "")).lower()
+                         for f in seed if f.get("subject")}
+        out = list(seed)
+        added = 0
+        for subj in sorted(seed_subjects):
+            if added >= _GRAPH_EXPAND_CAP:
+                break
+            neighbours = set()
+            for r in g.relate(subj):            # out-edges: subj -> X
+                neighbours.add(str(r.object).lower())
+            for r in g.relate(object=subj):     # in-edges:  Y -> subj
+                neighbours.add(str(r.subject).lower())
+            neighbours.discard(subj)
+            for n in sorted(neighbours):
+                for f in by_subject.get(n, []):
+                    key = (n, str(f.get("key", "")))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(f)
+                    added += 1
+                    if added >= _GRAPH_EXPAND_CAP:
+                        break
+                if added >= _GRAPH_EXPAND_CAP:
+                    break
+        return out
+    except Exception:   # pragma: no cover - defensive
+        return seed
+
+DB_PATH = config_path_str("jarvis", "knowledge.db")
+
+KINDS = ("fact", "preference", "event", "profile")
+SOURCES = ("stated", "observed", "inferred")
+DEFAULT_SUBJECT = "household"
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "on", "at",
+    "for", "and", "or", "my", "your", "our", "i", "me", "do", "does", "what",
+    "that", "this", "it", "with", "about", "they", "them", "their",
+}
+
+
+# ── connection / schema ──────────────────────────────────────────────────────
+
+def _connect() -> Optional[sqlite3.Connection]:
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        # Shared connection factory — guarantees the handle closes even on an
+        # error path, consistent with database.py / local_mind / scene_memory.
+        from .sqlite_utils import ClosingConnection
+        conn = sqlite3.connect(DB_PATH, timeout=10, factory=ClosingConnection)
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        return conn
+    except Exception as exc:
+        _LOGGER.warning("knowledge: connect failed: %s", exc)
+        return None
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS facts (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind            TEXT NOT NULL DEFAULT 'fact',
+            subject         TEXT NOT NULL DEFAULT 'household',
+            key             TEXT NOT NULL,
+            value           TEXT NOT NULL,
+            source          TEXT NOT NULL DEFAULT 'stated',
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            salience        REAL NOT NULL DEFAULT 1.0,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL,
+            last_referenced REAL,
+            expires_at      REAL,
+            UNIQUE(subject, key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject)")
+    # migrate: add columns introduced after the initial schema
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(facts)").fetchall()}
+    for col, decl in (("deleted_at", "REAL"), ("embedding", "BLOB")):
+        if col not in cols:
+            try:
+                conn.execute(f"ALTER TABLE facts ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise  # only a concurrent-migration race is expected here
+    # Relations graph (v8.3.0): typed edges between subjects/entities so JARVIS
+    # can traverse how things relate ("Sam -> owns -> car.jeep", "kitchen ->
+    # adjacent_to -> garage") rather than only storing flat facts. Soft-deleted
+    # like facts, so a re-observed edge can't resurrect one the user removed.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS relations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject     TEXT NOT NULL,
+            predicate   TEXT NOT NULL,
+            object      TEXT NOT NULL,
+            source      TEXT NOT NULL DEFAULT 'stated',
+            confidence  REAL NOT NULL DEFAULT 1.0,
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL,
+            deleted_at  REAL,
+            UNIQUE(subject, predicate, object)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_subject ON relations(subject)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_object ON relations(object)")
+    conn.commit()
+
+
+def _row_to_fact(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "subject": row["subject"],
+        "key": row["key"],
+        "value": row["value"],
+        "source": row["source"],
+        "confidence": round(row["confidence"], 3),
+        "salience": round(row["salience"], 3),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "last_referenced": row["last_referenced"],
+        "expires_at": row["expires_at"],
+    }
+
+
+def _tokens(text: str) -> set:
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if t not in _STOPWORDS and len(t) > 1}
+
+
+# ── write ────────────────────────────────────────────────────────────────────
+
+def remember(
+    key: str,
+    value: str,
+    *,
+    subject: str = DEFAULT_SUBJECT,
+    kind: str = "fact",
+    source: str = "stated",
+    confidence: float = 1.0,
+    salience: float = 1.0,
+    ttl_seconds: Optional[float] = None,
+    respect_stated: bool = False,
+    now: Optional[float] = None,
+) -> Optional[dict]:
+    """
+    Upsert a fact. One value per (subject, key) — re-teaching the same key updates
+    it in place (and a stated fact overrides a previously observed/inferred one).
+
+    respect_stated: when True, an incoming non-"stated" write (e.g. an observation
+    from the pattern analyzer) will NOT overwrite an existing fact the user
+    explicitly stated — the stated fact is returned unchanged. This keeps machine
+    inference from clobbering things the user told us directly.
+
+    Returns the stored fact, or None on failure. SYNC — call via executor.
+    """
+    key = (key or "").strip()
+    value = (value or "").strip()
+    if not key or not value:
+        return None
+    if kind not in KINDS:
+        kind = "fact"
+    if source not in SOURCES:
+        source = "stated"
+    now = now if now is not None else time.time()
+    expires_at = (now + ttl_seconds) if ttl_seconds else None
+    subject = (subject or DEFAULT_SUBJECT).strip() or DEFAULT_SUBJECT
+
+    conn = _connect()
+    if conn is None:
+        return None
+    try:
+        # BEGIN IMMEDIATE grabs the write lock before the read below, so a
+        # concurrent forget() can't slip a tombstone in between our SELECT and
+        # UPDATE/INSERT and get silently resurrected.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id, source, deleted_at FROM facts WHERE subject = ? AND key = ?",
+            (subject, key),
+        ).fetchone()
+        if existing:
+            if existing["deleted_at"] is not None and source != "stated":
+                # user deleted this fact; don't let re-observation resurrect it
+                conn.commit()
+                return None
+            if respect_stated and existing["source"] == "stated" and source != "stated":
+                row = conn.execute(
+                    "SELECT * FROM facts WHERE id = ?", (existing["id"],)).fetchone()
+                conn.commit()
+                return _row_to_fact(row)  # don't clobber a user-stated fact
+            conn.execute(
+                """
+                UPDATE facts SET value = ?, kind = ?, source = ?, confidence = ?,
+                    salience = ?, updated_at = ?, expires_at = ?, deleted_at = NULL
+                WHERE id = ?
+                """,
+                (value, kind, source, confidence, salience, now, expires_at, existing["id"]),
+            )
+            fid = existing["id"]
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO facts
+                    (kind, subject, key, value, source, confidence, salience,
+                     created_at, updated_at, last_referenced, expires_at, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (kind, subject, key, value, source, confidence, salience,
+                 now, now, None, expires_at),
+            )
+            fid = cur.lastrowid
+        row = conn.execute("SELECT * FROM facts WHERE id = ?", (fid,)).fetchone()
+        conn.commit()
+        _LOGGER.info("knowledge: remembered [%s] %s/%s = %r", kind, subject, key, value)
+        return _row_to_fact(row)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _LOGGER.warning("knowledge: remember failed: %s", exc)
+        return None
+    finally:
+        conn.close()
+
+
+def forget(
+    *,
+    fact_id: Optional[int] = None,
+    subject: Optional[str] = None,
+    key: Optional[str] = None,
+    now: Optional[float] = None,
+) -> int:
+    """
+    Soft-delete by id, or by (subject, key): rows are tombstoned (deleted_at set),
+    not removed, so a re-observed fact can't resurrect what the user deleted —
+    only an explicit stated re-teach (see remember()) revives it. Returns rows
+    affected. SYNC.
+    """
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return 0
+    try:
+        with conn:
+            if fact_id is not None:
+                cur = conn.execute(
+                    "UPDATE facts SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+                    (now, fact_id))
+            elif key is not None:
+                if subject is not None:
+                    cur = conn.execute(
+                        "UPDATE facts SET deleted_at = ? "
+                        "WHERE subject = ? AND key = ? AND deleted_at IS NULL",
+                        (now, subject, key))
+                else:
+                    cur = conn.execute(
+                        "UPDATE facts SET deleted_at = ? WHERE key = ? AND deleted_at IS NULL",
+                        (now, key))
+            else:
+                return 0
+            return cur.rowcount
+    except Exception as exc:
+        _LOGGER.warning("knowledge: forget failed: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+_TOMBSTONE_TTL = 365 * 86400.0  # keep deletion tombstones a year before hard-purging
+
+
+def purge_expired(now: Optional[float] = None) -> int:
+    """
+    Remove facts past their expiry, and hard-delete tombstones (soft-deleted
+    facts) older than _TOMBSTONE_TTL. Returns rows removed. SYNC.
+    """
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return 0
+    try:
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM facts WHERE expires_at IS NOT NULL AND expires_at < ? "
+                "AND deleted_at IS NULL", (now,))
+            removed = cur.rowcount
+            cur = conn.execute(
+                "DELETE FROM facts WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                (now - _TOMBSTONE_TTL,))
+            removed += cur.rowcount
+            return removed
+    except Exception as exc:
+        _LOGGER.warning("knowledge: purge failed: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+# ── read ─────────────────────────────────────────────────────────────────────
+
+def _live_rows(conn: sqlite3.Connection, subject: Optional[str], now: float,
+               subjects: Optional[list] = None) -> list:
+    sql = ("SELECT * FROM facts WHERE deleted_at IS NULL "
+           "AND (expires_at IS NULL OR expires_at >= ?)")
+    params: list = [now]
+    if subjects is not None:
+        placeholders = ",".join("?" for _ in subjects) or "''"
+        sql += f" AND subject IN ({placeholders})"
+        params.extend(subjects)
+    elif subject is not None:
+        sql += " AND subject = ?"
+        params.append(subject)
+    return conn.execute(sql, params).fetchall()
+
+
+def all_facts(subject: Optional[str] = None, now: Optional[float] = None,
+               subjects: Optional[list] = None) -> list[dict]:
+    """All non-expired facts (optionally for one subject), newest first. SYNC."""
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return []
+    try:
+        rows = _live_rows(conn, subject, now, subjects)
+        facts = [_row_to_fact(r) for r in rows]
+        facts.sort(key=lambda f: f["updated_at"], reverse=True)
+        if PROVENANCE_SHADOW:
+            _emit_provenance_shadow(facts)   # #237: observe-only
+        if UNCERTAINTY_SHADOW:
+            _emit_uncertainty_shadow(facts)  # Epistemic Fabric: observe-only
+        if GRAPH_SHADOW:
+            _emit_graph_shadow(facts)        # Phase T: observe-only
+        if TEMPORAL_SHADOW:
+            _emit_temporal_shadow(facts, now)  # Epistemic Fabric: observe-only
+        if TEMPORAL_PARITY:
+            _emit_temporal_parity(facts, now)  # Temporal: parity (observe-only)
+        if PRIVACY_SHADOW:
+            _emit_privacy_shadow(facts)        # Phase W prerequisite: observe-only
+        return facts
+    except Exception as exc:
+        _LOGGER.warning("knowledge: all_facts failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+def recall(
+    query: str = "",
+    *,
+    subject: Optional[str] = None,
+    k: int = 5,
+    now: Optional[float] = None,
+    touch: bool = True,
+    subjects: Optional[list] = None,
+) -> list[dict]:
+    """
+    Retrieve the k most relevant facts. Scored by query-term overlap (key+value),
+    then salience·confidence, then recency. Empty query → most salient/recent.
+    Bumps last_referenced on returned facts so referenced knowledge stays warm.
+    SYNC — call via executor.
+    """
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return []
+    try:
+        rows = _live_rows(conn, subject, now, subjects)
+        if not rows:
+            return []
+        q_tokens = _tokens(query)
+        scored = []
+        for r in rows:
+            f = _row_to_fact(r)
+            text_tokens = _tokens(f["key"] + " " + f["value"])
+            overlap = len(q_tokens & text_tokens)
+            match = (overlap / len(q_tokens)) if q_tokens else 0.0
+            if q_tokens and overlap == 0:
+                continue  # a real query that hits nothing is not relevant
+            age_days = max(0.0, (now - f["updated_at"]) / 86400.0)
+            recency = 1.0 / (1.0 + age_days)
+            score = (3.0 * match) + (f["salience"] * f["confidence"]) + (0.5 * recency)
+            scored.append((score, f))
+        scored.sort(key=lambda s: s[0], reverse=True)
+        top = [f for _, f in scored[:max(1, k)]]
+        if touch and top:
+            ids = [f["id"] for f in top]
+            with conn:
+                conn.executemany(
+                    "UPDATE facts SET last_referenced = ? WHERE id = ?",
+                    [(now, i) for i in ids],
+                )
+        return top
+    except Exception as exc:
+        _LOGGER.warning("knowledge: recall failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+# ── prompt injection ─────────────────────────────────────────────────────────
+
+_SUBJECT_LABEL = {"household": "Household", "primary": "About the primary resident"}
+
+
+def prompt_block(query: str = "", *, subject: Optional[str] = None,
+                 limit: int = 12, now: Optional[float] = None,
+                 subjects: Optional[list] = None) -> str:
+    """
+    A compact "what you know" block for the system prompt. If a query is given,
+    the most relevant facts; otherwise the most salient. Returns "" when empty so
+    callers can concatenate unconditionally.
+    """
+    facts = (recall(query, subject=subject, k=limit, now=now, touch=False, subjects=subjects)
+             if query else all_facts(subject=subject, now=now, subjects=subjects)[:limit])
+    return _format_block(facts)
+
+
+def _format_block(facts: list[dict]) -> str:
+    """Render a facts list as the "What you know" prompt block. Shared by the
+    sync (keyword) and async (semantic) prompt builders."""
+    if not facts:
+        return ""
+    by_subject: dict = {}
+    for f in facts:
+        by_subject.setdefault(f["subject"], []).append(f)
+    lines = ["## What you know"]
+    for subj, items in by_subject.items():
+        lines.append(_SUBJECT_LABEL.get(subj, subj))
+        for f in items:
+            hedge = "" if f["source"] == "stated" and f["confidence"] >= 0.9 else " (~)"
+            lines.append(f"- {f['key']}: {f['value']}{hedge}")
+    return "\n".join(lines)
+
+
+async def prompt_block_async(hass, query: str = "", *, subject: Optional[str] = None,
+                             limit: int = 12, now: Optional[float] = None,
+                             subjects: Optional[list] = None,
+                             requester: Optional[str] = None) -> str:
+    """Semantic-aware "what you know" block: when embeddings are on and a query is
+    given, facts are ranked by meaning (recall_semantic, which falls back to
+    keyword recall on its own); otherwise this matches the sync prompt_block.
+    Returns "" when empty so callers can concatenate unconditionally. ASYNC.
+
+    ``requester`` is the live audience identity this block is being built for; when
+    given, the facts about to be disclosed are run through the kernel privacy
+    policy against that requester (parity, observe-only)."""
+    if query:
+        facts = await recall_semantic(hass, query, subject=subject, k=limit,
+                                      now=now, subjects=subjects)
+    else:
+        facts = await hass.async_add_executor_job(
+            lambda: all_facts(subject=subject, now=now, subjects=subjects)[:limit])
+    # Phase T enforce (owner-gated, default off): make the block graph-authoritative
+    # by expanding the recall-seeded facts one hop through the knowledge graph.
+    # Fail-safe: any failure or empty result keeps the recall block exactly.
+    if KNOWLEDGE_GRAPH_ENFORCE and facts:
+        try:
+            expanded = await hass.async_add_executor_job(_graph_expand_facts, facts)
+            if expanded:
+                facts = expanded
+        except Exception:   # pragma: no cover - defensive
+            pass
+    elif GRAPH_PARITY and facts:
+        # Phase T parity: measure the would-be expansion without changing the
+        # block the model sees. Observe-only.
+        try:
+            expanded = await hass.async_add_executor_job(_graph_expand_facts, facts)
+            _log_graph_parity(facts, expanded)
+        except Exception:   # pragma: no cover - defensive
+            pass
+    # Privacy (Phase W prerequisite): audit the facts about to be disclosed
+    # against the live requester (parity, observe-only), then — enforce — actually
+    # withhold any the cross-subject rule would deny them. The filter is a
+    # fail-safe belt over the existing subject-scoping: normally it removes
+    # nothing and it can never blank the block.
+    _emit_privacy_parity(facts, requester)
+    facts = _privacy_enforce_filter(facts, requester)
+    return _format_block(facts)
+
+
+# ── relations graph (v8.3.0) ─────────────────────────────────────────────────
+
+def _row_to_relation(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "subject": row["subject"],
+        "predicate": row["predicate"],
+        "object": row["object"],
+        "source": row["source"],
+        "confidence": round(row["confidence"], 3),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def relate(
+    subject: str,
+    predicate: str,
+    obj: str,
+    *,
+    source: str = "stated",
+    confidence: float = 1.0,
+    now: Optional[float] = None,
+) -> Optional[dict]:
+    """Upsert a typed edge subject —predicate→ object (e.g. "sam", "owns",
+    "car.jeep"). One row per (subject, predicate, object). A non-"stated" write
+    will not resurrect an edge the user explicitly removed. SYNC — via executor."""
+    subject = (subject or "").strip()
+    predicate = (predicate or "").strip()
+    obj = (obj or "").strip()
+    if not subject or not predicate or not obj:
+        return None
+    if source not in SOURCES:
+        source = "stated"
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id, deleted_at FROM relations "
+            "WHERE subject = ? AND predicate = ? AND object = ?",
+            (subject, predicate, obj),
+        ).fetchone()
+        if existing:
+            if existing["deleted_at"] is not None and source != "stated":
+                conn.commit()
+                return None  # don't let re-observation resurrect a removed edge
+            conn.execute(
+                "UPDATE relations SET source = ?, confidence = ?, updated_at = ?, "
+                "deleted_at = NULL WHERE id = ?",
+                (source, confidence, now, existing["id"]),
+            )
+            rid = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO relations "
+                "(subject, predicate, object, source, confidence, created_at, "
+                " updated_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                (subject, predicate, obj, source, confidence, now, now),
+            )
+            rid = cur.lastrowid
+        row = conn.execute("SELECT * FROM relations WHERE id = ?", (rid,)).fetchone()
+        conn.commit()
+        return _row_to_relation(row)
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _LOGGER.warning("knowledge: relate failed: %s", exc)
+        return None
+    finally:
+        conn.close()
+
+
+def unrelate(subject: str, predicate: Optional[str] = None,
+             obj: Optional[str] = None, *, now: Optional[float] = None) -> int:
+    """Soft-delete edges from ``subject`` (optionally narrowed by predicate and/or
+    object). Returns rows affected. SYNC."""
+    subject = (subject or "").strip()
+    if not subject:
+        return 0
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return 0
+    try:
+        sql = "UPDATE relations SET deleted_at = ? WHERE subject = ? AND deleted_at IS NULL"
+        params: list = [now, subject]
+        if predicate:
+            sql += " AND predicate = ?"
+            params.append(predicate)
+        if obj:
+            sql += " AND object = ?"
+            params.append(obj)
+        with conn:
+            return conn.execute(sql, params).rowcount
+    except Exception as exc:
+        _LOGGER.warning("knowledge: unrelate failed: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def related(subject: Optional[str] = None, *, obj: Optional[str] = None,
+            predicate: Optional[str] = None) -> list[dict]:
+    """Live edges matching any given end. With ``subject`` → its outgoing edges;
+    with ``obj`` → its incoming edges; ``predicate`` narrows either. Newest
+    first. SYNC — call via executor."""
+    conn = _connect()
+    if conn is None:
+        return []
+    try:
+        sql = "SELECT * FROM relations WHERE deleted_at IS NULL"
+        params: list = []
+        if subject:
+            sql += " AND subject = ?"
+            params.append(subject.strip())
+        if obj:
+            sql += " AND object = ?"
+            params.append(obj.strip())
+        if predicate:
+            sql += " AND predicate = ?"
+            params.append(predicate.strip())
+        sql += " ORDER BY updated_at DESC"
+        return [_row_to_relation(r) for r in conn.execute(sql, params).fetchall()]
+    except Exception as exc:
+        _LOGGER.warning("knowledge: related failed: %s", exc)
+        return []
+    finally:
+        conn.close()
+
+
+# ── semantic recall (v8.3.0) ──────────────────────────────────────────────────
+# Keyword recall (above) misses paraphrase — "who runs cold at night" won't match
+# a fact keyed "sleep temperature preference". These helpers add embedding-based
+# recall on top, reusing the same nomic-embed store the document RAG uses. They
+# degrade gracefully: with embeddings disabled/unavailable, callers fall back to
+# keyword recall(), so semantic recall is always safe to prefer.
+
+def set_embedding(fact_id: int, vector: list) -> bool:
+    """Store a packed embedding for one fact. SYNC — call via executor."""
+    conn = _connect()
+    if conn is None:
+        return False
+    try:
+        from . import embeddings
+        blob = embeddings._pack(vector)
+        with conn:
+            conn.execute("UPDATE facts SET embedding = ? WHERE id = ?", (blob, fact_id))
+        return True
+    except Exception as exc:
+        _LOGGER.debug("knowledge: set_embedding failed: %s", exc)
+        return False
+    finally:
+        conn.close()
+
+
+def _live_rows_needing_embedding(subject: Optional[str], now: float,
+                                 subjects: Optional[list], limit: int) -> list:
+    conn = _connect()
+    if conn is None:
+        return []
+    try:
+        rows = _live_rows(conn, subject, now, subjects)
+        return [r for r in rows if r["embedding"] is None][:max(0, limit)]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+async def remember_and_embed(hass, key: str, value: str, **kwargs) -> Optional[dict]:
+    """remember() a fact, then compute + store its embedding so it is reachable by
+    semantic recall. The embedding is best-effort: the fact is saved regardless.
+    ASYNC — the DB writes run off-loop, the embed call is already async."""
+    fact = await hass.async_add_executor_job(
+        lambda: remember(key, value, **kwargs))
+    if not fact:
+        return fact
+    try:
+        from . import embeddings
+        if embeddings.is_enabled():
+            vec = await embeddings.embed_one(hass, f"{key}: {value}")
+            if vec:
+                await hass.async_add_executor_job(set_embedding, fact["id"], vec)
+    except Exception as exc:
+        _LOGGER.debug("knowledge: embed-on-write failed: %s", exc)
+    return fact
+
+
+async def recall_semantic(
+    hass,
+    query: str,
+    *,
+    subject: Optional[str] = None,
+    k: int = 5,
+    now: Optional[float] = None,
+    subjects: Optional[list] = None,
+    lazy_embed_limit: int = 25,
+) -> list[dict]:
+    """Retrieve the k facts most semantically similar to ``query`` by embedding
+    cosine. Facts without an embedding yet are embedded lazily (bounded per call)
+    so the store fills in over use. Falls back to keyword recall() when
+    embeddings are disabled, the query can't be embedded, or nothing has an
+    embedding. ASYNC."""
+    now = now if now is not None else time.time()
+    try:
+        from . import embeddings
+        if not embeddings.is_enabled():
+            return await hass.async_add_executor_job(
+                lambda: recall(query, subject=subject, k=k, now=now, subjects=subjects))
+        # Backfill a bounded batch of un-embedded live facts first.
+        pending = await hass.async_add_executor_job(
+            _live_rows_needing_embedding, subject, now, subjects, lazy_embed_limit)
+        for r in pending:
+            try:
+                vec = await embeddings.embed_one(hass, f"{r['key']}: {r['value']}")
+                if vec:
+                    await hass.async_add_executor_job(set_embedding, r["id"], vec)
+            except Exception:
+                break  # embedding backend went away — stop, use what we have
+        q_vec = await embeddings.embed_one(hass, query) if query else None
+        if not q_vec:
+            return await hass.async_add_executor_job(
+                lambda: recall(query, subject=subject, k=k, now=now, subjects=subjects))
+
+        def _rank():
+            conn = _connect()
+            if conn is None:
+                return []
+            try:
+                rows = _live_rows(conn, subject, now, subjects)
+                scored = []
+                for r in rows:
+                    if r["embedding"] is None:
+                        continue
+                    try:
+                        vec = embeddings._unpack(r["embedding"])
+                        sim = embeddings._cosine(q_vec, vec)
+                    except Exception:
+                        continue
+                    f = _row_to_fact(r)
+                    f["similarity"] = round(sim, 4)
+                    scored.append((sim, f))
+                scored.sort(key=lambda s: s[0], reverse=True)
+                return [f for _, f in scored[:max(1, k)]]
+            finally:
+                conn.close()
+
+        top = await hass.async_add_executor_job(_rank)
+        if top:
+            return top
+        # Nothing embedded / matched — keyword fallback keeps recall useful.
+        return await hass.async_add_executor_job(
+            lambda: recall(query, subject=subject, k=k, now=now, subjects=subjects))
+    except Exception as exc:
+        _LOGGER.debug("knowledge: recall_semantic failed: %s", exc)
+        try:
+            return await hass.async_add_executor_job(
+                lambda: recall(query, subject=subject, k=k, now=now, subjects=subjects))
+        except Exception:
+            return []
+
+
+# ── stats (panel) ────────────────────────────────────────────────────────────
+
+def stats(now: Optional[float] = None) -> dict:
+    now = now if now is not None else time.time()
+    conn = _connect()
+    if conn is None:
+        return {"total": 0, "by_kind": {}, "by_subject": {}}
+    try:
+        rows = _live_rows(conn, None, now)
+        by_kind: dict = {}
+        by_subject: dict = {}
+        for r in rows:
+            by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+            by_subject[r["subject"]] = by_subject.get(r["subject"], 0) + 1
+        return {"total": len(rows), "by_kind": by_kind, "by_subject": by_subject}
+    except Exception as exc:
+        _LOGGER.warning("knowledge: stats failed: %s", exc)
+        return {"total": 0, "by_kind": {}, "by_subject": {}}
+    finally:
+        conn.close()

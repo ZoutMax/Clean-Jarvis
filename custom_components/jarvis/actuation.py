@@ -1,0 +1,1119 @@
+"""Universal actuation envelope (MCU Phase B).
+
+The golden-path wiring Phase A proved on ``control_device``, extracted so every
+actuator tool routes its device changes through the *same* kernel contract
+instead of re-implementing it:
+
+    context (WorldModel)  →  request (ActuatorRequest)  →  plan_shadow (kernel.plan)
+          →  [caller performs the HA service call]  →  emit_event (JarvisEvent)
+          →  outcome (ActuatorOutcome, via the caller's verify step)
+
+The envelope itself is pure glue over the ``kernel`` primitives — **best-effort**
+(every function degrades to a null result and never raises into a caller's
+authoritative path, so wiring a path onto it can never break that path) and
+**non-gating**: it *describes and records* an actuation; it does not perform the
+service call (the caller does) or authorize it. Authorization enforcement lives
+in `policy.confirm_gate` + `authority_bridge`, not here.
+
+Beyond the envelope, this module also hosts JARVIS's **agency self-limits**, and
+several of those are now LIVE gates (not shadow): the autonomous-action budget
+(G1), the per-path loop detector (G2), and the cross-path thrash reactor (H)
+actually suppress a runaway *discretionary-autonomous* actuation. All three are
+bounded to that population (never a user command or a safety-critical action),
+**fail open**, and are one-line kill-switchable (``AGENCY_BUDGET_ENFORCE`` /
+``LOOP_DETECT_ENFORCE`` / ``STREAM_THRASH_ENFORCE``). The envelope-wide lenses
+below (E/E4) still only observe.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from collections import deque
+from typing import Any, Dict, Optional, Sequence
+
+_LOGGER = logging.getLogger(__name__)
+
+# ── agency self-limits shadow (MCU Phase E/E4) ──────────────────────────────────
+# The kernel loop detector and agency budget watch JARVIS's *own* actuation rate:
+# the detector notices an action thrashing (A → event → A, or flapping), the
+# budget counts autonomous actions against a self-imposed hourly ceiling. Here
+# they run in SHADOW — every actuation is fed in and a loop / exhausted-budget
+# verdict is logged, but the verdict is NEVER acted on: no action is suppressed
+# or deferred. These envelope-wide lenses stay shadow-only on purpose; the
+# dedicated, tightly-scoped gates below (G1 budget / G2 loop / H cross-path
+# thrash) are what actually ENFORCE, on the discretionary-autonomous population.
+_loop_detector = None
+_agency_budget = None
+_stream_detector = None   # cross-path loop detector, fed by the event-bus reactor
+# Situation-event reactor state (MCU Phase H — the situation stream as a consumed
+# nervous system). ``situation_id -> kind`` for each safety-critical situation
+# (intrusion / hazard) currently in an ELEVATED lifecycle state. Fed by
+# ``_situation_react`` off the bus, reconciled from the store at setup; consulted
+# by the discretionary-autonomous path to pause routine autonomy while JARVIS is
+# handling a security / safety event.
+_active_safety_situations: dict = {}
+# Which situation families are safety-critical enough to pause discretionary
+# autonomy for. A delivery is not — the reactor records its transitions but never
+# gates autonomy on them (so delivery's event cell stays honest at parity).
+_SAFETY_SITUATION_KINDS = frozenset({"intrusion", "hazard"})
+
+# ── agency budget ENFORCE (MCU Phase G/G1) ──────────────────────────────────────
+# First *decision* primitive promoted from shadow to enforce on the live home,
+# chosen as the safest first trial: it gates ONLY a *discretionary autonomous*
+# actuation — JARVIS acting on a learned/trusted pattern of its own accord
+# (cognitive_core._execute_action_data). It does NOT see:
+#   * user-requested actuations (the agent tool path / control_device), nor
+#   * safety-critical responses (nighttime lockdown, intrusion securing — those
+#     call hass.services directly and never route through this gate),
+# so neither a user command nor a safety action can ever be budget-blocked.
+#
+# KILL-SWITCH: flip AGENCY_BUDGET_ENFORCE to False to revert instantly to
+# shadow (log-only, zero behaviour change) on the next load — a one-line revert,
+# no other edit required. Tests pass `enforce=` explicitly.
+#
+# The gate FAILS OPEN: any internal error allows the action, so a budget bug can
+# never stop JARVIS from acting. The ceiling is the kernel default (60 autonomous
+# actions / rolling hour) — generous for the autonomous-only population, so it
+# only ever trips on a genuine runaway (feedback loop / over-eager pattern).
+AGENCY_BUDGET_ENFORCE = True
+
+# A DEDICATED budget counting only discretionary autonomous actuations — a
+# different, correctly-scoped population from the envelope-wide _agency_budget
+# shadow lens below (which still watches the whole actuation stream for thrash).
+_autonomous_budget = None
+
+# ── loop-detect ENFORCE (MCU Phase G/G2) ────────────────────────────────────────
+# The second staged flip, same tightly-scoped path as G1: a thrashing discretionary
+# autonomous actuation (the same action re-firing in a tight window, or an
+# A -> event -> A self-trigger) is actually SUPPRESSED, not merely logged. Same
+# exclusions as G1 — user-requested and safety-critical actuations never reach it.
+# HIGH threshold on purpose (5 firings of the identical action within 60s, well
+# above any legitimate proactive cadence) so a real repeat is never mistaken for a
+# loop. FAILS OPEN; one-line kill-switch LOOP_DETECT_ENFORCE reverts to shadow.
+LOOP_DETECT_ENFORCE = True
+_autonomous_loop = None
+
+# ── cross-path thrash reactor (MCU Phase H — the event bus as nervous system) ──
+# The per-path loop gate above (G2) only sees one path's own firings. The event
+# bus carries EVERY actuation (control.actuation) from every path, so a consumer
+# of that stream can catch an oscillation spread across paths — control_device
+# turns a light on, a scene turns it off, a proactive pattern turns it on … —
+# that no single path's inline gate can. This is the behaviour that makes the bus
+# a genuinely CONSUMED nervous system rather than a passive ledger: a subscriber
+# feeds a cross-path LoopDetector from the stream, and the discretionary
+# autonomous path consults it (stream_thrash_check) and backs off per target on
+# confirmed cross-path thrash. Bounded to the autonomous population (the safe
+# class, same as G1/G2), FAILS OPEN, reversible via STREAM_THRASH_ENFORCE.
+STREAM_THRASH_ENFORCE = True
+
+# MCU Phase H — pause discretionary autonomy while a safety-critical situation is
+# active. When True (default), the discretionary-autonomous path backs off en
+# masse if an intrusion or hazard situation is being handled, so routine learned
+# automations don't fire into (or interfere with) a security / safety response.
+# ADDITIVE and fail-OPEN: it only ever SUPPRESSES discretionary autonomy, never a
+# user request or a safety response (those don't reach that path), and any reactor
+# error leaves autonomy running. Flip to False to revert to no suppression.
+SITUATION_AUTONOMY_SUPPRESS_ENFORCE = True
+
+
+def loop_detect_check(key: str, *, enforce: Optional[bool] = None,
+                      cause: Optional[str] = None,
+                      event_id: Optional[str] = None,
+                      now: Optional[float] = None) -> tuple:
+    """ENFORCE gate (G2): is this *discretionary autonomous* actuation thrashing?
+
+    Records the firing into a dedicated high-threshold loop detector and returns
+    ``(allowed, reason)``. When the detector reports an active loop or a post-loop
+    cooldown and enforce is on, returns ``(False, reason)`` so the caller
+    SUPPRESSES the actuation (breaking the cycle). When the kill-switch is off it
+    logs a would-suppress and returns ``(True, reason)`` (shadow). FAILS OPEN —
+    any internal error returns ``(True, "error")`` so a detector fault can never
+    block JARVIS. Only the autonomous proactive path calls this.
+    """
+    global _autonomous_loop
+    if enforce is None:
+        enforce = LOOP_DETECT_ENFORCE
+    try:
+        import time
+        from .kernel import loop_detect as _ld
+        if _autonomous_loop is None:
+            _autonomous_loop = _ld.LoopDetector(
+                window_s=60.0, max_repeats=5, cooldown_s=60.0)
+        t = time.time() if now is None else now
+        verdict = _autonomous_loop.record(key, now=t, cause=cause,
+                                          event_id=event_id)
+        if verdict:         # looping or cooling down from a just-flagged loop
+            if enforce:
+                _LOGGER.warning(
+                    "loop detect: autonomous actuation %s thrashing (%s, count=%s) "
+                    "— SUPPRESSING this action (enforce, G2)",
+                    key, verdict.reason, verdict.count)
+                return False, verdict.reason
+            _LOGGER.warning(
+                "loop detect: autonomous actuation %s thrashing (%s) — NOT "
+                "suppressed (kill-switch off / shadow)", key, verdict.reason)
+            return True, verdict.reason
+        return True, _ld.NONE
+    except Exception:   # pragma: no cover - defensive, fail open
+        return True, "error"
+
+
+def agency_budget_check(*, enforce: Optional[bool] = None,
+                        now: Optional[float] = None) -> tuple:
+    """ENFORCE gate (G1): may one more *discretionary autonomous* actuation
+    happen now, against the self-imposed hourly ceiling?
+
+    Returns ``(allowed, remaining)``. Records against the budget only when the
+    action is allowed (a blocked action consumes no slot). When the ceiling is
+    reached: returns ``(False, 0)`` under enforce (the caller must skip the
+    actuation), or ``(True, 0)`` when the kill-switch is off (shadow — logs a
+    would-block and lets it through). FAILS OPEN — any internal error returns
+    ``(True, None)`` so a budget fault can never block JARVIS.
+
+    Only the autonomous proactive path calls this; user-requested and
+    safety-critical actuations never reach it.
+    """
+    global _autonomous_budget
+    if enforce is None:
+        enforce = AGENCY_BUDGET_ENFORCE
+    try:
+        import time
+        from .kernel import budget as _bg
+        if _autonomous_budget is None:
+            _autonomous_budget = _bg.AgencyBudget()
+        t = time.time() if now is None else now
+        verdict = _autonomous_budget.check_and_record(_bg.ACTION, now=t)
+        if not verdict:
+            cap = _autonomous_budget.limits.rate_for(_bg.ACTION)
+            if enforce:
+                _LOGGER.warning(
+                    "agency budget: autonomous-action ceiling reached (%s/hr) — "
+                    "BLOCKING this autonomous action (enforce, G1)", cap)
+                return False, 0
+            _LOGGER.warning(
+                "agency budget: autonomous-action ceiling reached (%s/hr) — "
+                "NOT blocked (kill-switch off / shadow)", cap)
+            return True, 0
+        return True, verdict.remaining
+    except Exception:   # pragma: no cover - defensive, fail open
+        return True, None
+
+
+def _agency_shadow(capability: str, entity_id: str, *,
+                   cause: Optional[str] = None,
+                   event_id: Optional[str] = None) -> None:
+    """Feed one actuation into the kernel loop detector + agency budget and log
+    any thrash-loop or exhausted-budget verdict. SHADOW / log-only: best-effort,
+    never suppresses an action, never raises into the actuation path."""
+    global _loop_detector, _agency_budget
+    try:
+        import time
+        from .kernel import loop_detect as _ld, budget as _bg
+        if _loop_detector is None:
+            _loop_detector = _ld.LoopDetector()
+        if _agency_budget is None:
+            _agency_budget = _bg.AgencyBudget()
+        now = time.time()
+        key = f"{capability}:{entity_id}"
+        verdict = _loop_detector.record(key, now=now, cause=cause,
+                                        event_id=event_id)
+        if verdict.looping:
+            _LOGGER.warning(
+                "agency shadow: actuation loop on %s (%s, count=%s) — NOT "
+                "suppressed (shadow)", key, verdict.reason, verdict.count)
+        bverdict = _agency_budget.check_and_record(_bg.ACTION, now=now)
+        if not bverdict:
+            _LOGGER.warning(
+                "agency shadow: autonomous-action budget exhausted at %s — NOT "
+                "enforced (shadow)", key)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _stream_react(event) -> None:
+    """Event-bus subscriber: feed the CROSS-PATH loop detector from one actuation
+    event. Keyed by ``capability:target`` exactly as the per-path G2 gate keys an
+    action, so a firing any path publishes populates the shared detector. SHADOW-
+    safe: only records; never raises into publish (the bus already guards us, but
+    belt-and-braces)."""
+    global _stream_detector
+    try:
+        if getattr(event, "type", None) != "control.actuation":
+            return
+        import time
+        from .kernel import loop_detect as _ld
+        if _stream_detector is None:
+            _stream_detector = _ld.LoopDetector()
+        data = getattr(event, "data", None) or {}
+        cap = data.get("capability") or ""
+        target = getattr(event, "subject", None) or data.get("target") or ""
+        if not cap or not target:
+            return
+        _stream_detector.record(f"{cap}:{target}", now=time.time(),
+                                cause=getattr(event, "correlation_id", None),
+                                event_id=getattr(event, "id", None))
+    except Exception:   # pragma: no cover - defensive, never break a publish
+        pass
+
+
+def register_stream_reactor(bus):
+    """Subscribe the cross-path thrash reactor to actuation events on ``bus``.
+    Called once at setup. Returns the unsubscribe handle, or None. Best-effort."""
+    try:
+        from .kernel.event import EVENT_ACTUATION
+        return bus.subscribe(EVENT_ACTUATION, _stream_react)
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def stream_thrash_check(key: str, *, enforce: Optional[bool] = None,
+                        now: Optional[float] = None) -> tuple:
+    """Does the cross-path event stream show ``key`` thrashing right now? Returns
+    ``(ok_to_proceed, reason)``. Peeks the bus-fed detector WITHOUT recording (the
+    reactor records from the stream). FAILS OPEN: no detector, flag off, or any
+    error → ``(True, None)``. Reversible via STREAM_THRASH_ENFORCE / ``enforce``."""
+    if enforce is None:
+        enforce = STREAM_THRASH_ENFORCE
+    try:
+        if not enforce or _stream_detector is None:
+            return True, None
+        import time
+        if _stream_detector.peek(key, now=(now if now is not None else time.time())):
+            return False, "cross-path thrash on the event stream"
+        return True, None
+    except Exception:   # pragma: no cover - defensive, fail open
+        return True, None
+
+
+# ── situation-event reactor: pause autonomy during a safety situation ────────────
+# A second consumer of the kernel event bus (after the cross-path thrash reactor):
+# it watches the SITUATION transition stream and tracks which safety-critical
+# situations (intrusion / hazard) are currently ELEVATED, so the discretionary-
+# autonomous path can pause routine autonomy while one is being handled. This is
+# what makes the situation stream a *consumed* nervous system (its event cell
+# earns enforce), and it is genuinely useful on its own: a butler stops the
+# routine fussing when there's a security or safety concern.
+
+# Elevated lifecycle states for a safety situation (BENIGN/RESOLVED/NORMAL are NOT
+# elevated — a benign/false-alarm or closed episode does not pause autonomy).
+_ELEVATED_SITUATION_STATES = frozenset({"possible", "investigating", "confirmed",
+                                        "response"})
+
+
+def _situation_react(event) -> None:
+    """Event-bus subscriber: track elevated safety situations from the situation
+    transition stream. Keyed by ``situation_id`` so overlapping episodes don't
+    clear each other. Best-effort: only updates in-memory state, never raises into
+    a publish."""
+    try:
+        if getattr(event, "type", None) != "situation.transition":
+            return
+        data = getattr(event, "data", None) or {}
+        kind = data.get("kind")
+        if kind not in _SAFETY_SITUATION_KINDS:
+            return                       # e.g. delivery — recorded nowhere, inert
+        sid = data.get("situation_id") or getattr(event, "subject", None) or kind
+        state = str(data.get("state") or "").lower()
+        if state in _ELEVATED_SITUATION_STATES:
+            _active_safety_situations[sid] = kind
+        else:                            # benign / resolved / normal → stand down
+            _active_safety_situations.pop(sid, None)
+    except Exception:   # pragma: no cover - defensive, never break a publish
+        pass
+
+
+def _reconcile_safety_situations(hass) -> None:
+    """Seed the elevated-situation set from the durable store at setup, so a
+    restart mid-incident doesn't start with autonomy un-paused until the next
+    transition. Best-effort — a read failure leaves the set empty (fail-open)."""
+    try:
+        from .kernel import SituationManager
+        from .paths import config_path_str
+        mgr = SituationManager(config_path_str("jarvis", "situations.db", hass=hass))
+        for kind in _SAFETY_SITUATION_KINDS:
+            for sit in mgr.open_situations(kind):
+                if str(getattr(sit, "state", "")).lower() in _ELEVATED_SITUATION_STATES:
+                    _active_safety_situations[getattr(sit, "id", None) or kind] = kind
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def register_situation_reactor(bus, hass=None):
+    """Subscribe the safety-situation reactor to situation events on ``bus`` and
+    (when ``hass`` is given) reconcile the elevated set from the store. Called once
+    at setup. Returns the unsubscribe handle, or None. Best-effort."""
+    try:
+        if hass is not None:
+            _reconcile_safety_situations(hass)
+        from .kernel.event import EVENT_SITUATION
+        return bus.subscribe(EVENT_SITUATION, _situation_react)
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def safety_situation_active(*, enforce: Optional[bool] = None) -> tuple:
+    """Is a safety-critical situation (intrusion / hazard) being handled right now?
+    Returns ``(active, kinds)`` — ``kinds`` a sorted tuple of the active families.
+    FAILS OPEN: flag off or any error → ``(False, ())`` (autonomy is NOT paused),
+    so a reactor fault never blocks JARVIS. Reversible via
+    SITUATION_AUTONOMY_SUPPRESS_ENFORCE / ``enforce``."""
+    if enforce is None:
+        enforce = SITUATION_AUTONOMY_SUPPRESS_ENFORCE
+    try:
+        if not enforce or not _active_safety_situations:
+            return False, ()
+        return True, tuple(sorted(set(_active_safety_situations.values())))
+    except Exception:   # pragma: no cover - defensive, fail open
+        return False, ()
+
+
+def correlation_id() -> Optional[str]:
+    """Current kernel correlation id, or None — never raises."""
+    try:
+        from .kernel import correlation
+        return correlation.current()
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def acting_agent() -> str:
+    """The agent acting in the current context — ``"jarvis"`` on the direct path,
+    the sub-agent (e.g. ``"friday"``) while a delegated run is in scope (H6).
+    Never raises; always returns a non-empty name."""
+    try:
+        from .kernel import actor
+        return actor.current()
+    except Exception:   # pragma: no cover - defensive
+        return "jarvis"
+
+
+def context(hass, entity_id: str) -> Dict[str, Any]:
+    """Pre-action context snapshot through the kernel WorldModel facade — the
+    canonical context authority (entity_id / domain / name / state / area). The
+    raw HA state is kept alongside for the post-action verify/read-back. Returns
+    a dict that is always safe to read; ``exists`` is False when the entity is
+    unknown to both the facade and raw state."""
+    snap = None
+    try:
+        from .kernel.world_model import WorldModel
+        snap = WorldModel(hass).device(entity_id)
+    except Exception:   # pragma: no cover - defensive
+        snap = None
+    raw = None
+    try:
+        raw = hass.states.get(entity_id)
+    except Exception:   # pragma: no cover - defensive
+        raw = None
+    prev = snap["state"] if snap else (raw.state if raw is not None else "unknown")
+    area = snap.get("area") if snap else None
+    return {"snapshot": snap, "raw": raw, "prev_state": prev, "area": area,
+            "exists": bool(snap or raw is not None)}
+
+
+def request(capability: str, entity_id: str, *, params: Optional[dict] = None,
+            action: str = "", intent: Optional[str] = None,
+            expected: Optional[Sequence[str]] = None):
+    """Canonical ActuatorRequest for one actuation (carrying the expected
+    end-state when known), or None best-effort."""
+    try:
+        from .kernel import build_actuator_request
+        return build_actuator_request(
+            capability, target=entity_id, params=dict(params or {}),
+            actor=acting_agent(),
+            intent=intent or (action.replace("_", " ") if action else None),
+            correlation_id=correlation_id(),
+            idempotency_key=f"{entity_id}:{action}" if action else None,
+            expected_outcome="/".join(expected) if expected else None)
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+def plan_shadow(capability: str, entity_id: str, action: str,
+                expected: Optional[Sequence[str]] = None, *,
+                correlation: Optional[str] = None):
+    """Express the actuation as a canonical one-step kernel Plan and log it
+    (SHADOW — execution stays with the caller). Returns the Plan, or None."""
+    try:
+        from .kernel.plan import Plan, Step
+        step = Step(
+            action=capability,
+            params={"entity_id": entity_id},
+            preconditions=(f"exists:{entity_id}",),
+            postconditions=tuple(f"state:{e}" for e in (expected or ())),
+            idempotency_key=f"{entity_id}:{action}")
+        plan = Plan(goal=f"{action} {entity_id}", steps=(step,),
+                    correlation_id=correlation if correlation is not None
+                    else correlation_id())
+        _LOGGER.debug("plan(shadow): goal=%s steps=%s",
+                      plan.goal, [s.action for s in plan.steps])
+        return plan
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+# Jarvis Home patch (2026-11-15): jh-action-journal. What JARVIS switched itself: (time, capability, entity_id).
+_JH_JOURNAL = deque(maxlen=1000)
+_JH_JOURNAL_SINCE = time.time()
+
+
+def emit_event(hass, capability: str, entity_id: str, *, action: str = "",
+               area: Optional[str] = None, request=None) -> None:
+    """Publish a canonical actuation JarvisEvent on the kernel event bus (the
+    ledger records it). Best-effort; never raises."""
+    try:   # jh-action-journal
+        _JH_JOURNAL.append((time.time(), str(capability or ""), str(entity_id or "")))
+    except Exception:
+        pass
+    try:
+        from . import events
+        from .kernel import from_actuation
+        ev = from_actuation(
+            capability, target=entity_id,
+            intent=action.replace("_", " ") if action else None,
+            actor=(getattr(request, "actor", None) or acting_agent()),
+            location=area,
+            request_id=(request.id if request is not None else None),
+            correlation_id=correlation_id())
+        events.publish(hass, ev)
+        # E4: feed the actuation to the agency loop/budget watchers (shadow).
+        _agency_shadow(capability, entity_id, cause=correlation_id(),
+                       event_id=ev.id)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# SHADOW: the Epistemic-Fabric outcome primitive (kernel.outcome) is emitted
+# alongside the canonical ActuatorOutcome below — observe-only, nothing reads it
+# yet (Phase M will). Flip OUTCOME_SHADOW to False to silence it instantly. The
+# kernel.actuator ActuatorOutcome recording is unchanged either way. (#237)
+OUTCOME_SHADOW = True
+
+
+def _record_outcome_shadow(request, status: str, observed, detail: str, hass=None) -> None:
+    """Emit a structured kernel.outcome.Outcome for a verified actuation (shadow).
+
+    Derived from the same verification verdict that drives the ActuatorOutcome:
+    ``status == "verified"`` is the success verdict; the intended end-state comes
+    from the request's postconditions, the observed state from the read-back.
+    Log-only, defensive, never raises — a learning (Phase M) consumer will read
+    these once the primitive earns parity, not this path."""
+    try:
+        from .kernel import outcome as _koutcome
+        try:
+            from .kernel.actuator import VERIFIED
+        except Exception:   # pragma: no cover - defensive
+            VERIFIED = "verified"
+        expected = getattr(request, "expected_outcome", None)
+        intended = (f"state:{expected}" if expected
+                    else (detail or getattr(request, "capability", "") or ""))
+        observed_str = str(observed) if observed is not None else (detail or "")
+        oc = _koutcome.from_verification(
+            intended_result=intended,
+            observed_result=observed_str,
+            verified=(status == VERIFIED),
+            confidence=1.0,                      # direct read-back, not inferred
+            actor=str(getattr(request, "actor", "") or ""),
+            capability=str(getattr(request, "capability", "") or ""),
+            correlation_id=str(getattr(request, "correlation_id", "") or ""),
+        )
+        _LOGGER.debug("outcome(shadow): %s", oc.to_dict())
+        # Phase M (shadow + parity): feed the outcome into the learning loop and
+        # log the would-be per-capability trust adjustment, then compare it to the
+        # realized success rate — both observe-only, drive nothing.
+        _emit_learning_shadow(oc)
+        _emit_learning_parity(oc)
+        # Phase N (shadow + parity): log the would-be graduated-autonomy level
+        # this capability has earned from the same rolling window, then compare
+        # whether it would auto-execute with the blanket mode flag — observe-only.
+        _emit_autonomy_shadow(oc)
+        _emit_autonomy_parity(oc)
+        # Phase M enforce (default OFF): close the loop — persist the learned
+        # per-capability trust and feed it back as the next prior.
+        _emit_learning_enforce(oc, hass)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# SHADOW (Phase M — Learning & Adaptation): keep a bounded window of recent
+# kernel.outcome.Outcomes and, per verified actuation, log the *would-be*
+# per-capability trust adjustment the learning primitive (kernel.learning) would
+# compute from that capability's track record. Observe-only — nothing consumes
+# the adjustment; the real per-capability trust store arrives with Phase N, and
+# applying adjustments is the owner-gated LEARNING_ENFORCE rung. The prior is a
+# neutral 0.5 until that store exists. Set LEARNING_SHADOW = False to silence it.
+LEARNING_SHADOW = True
+_LEARN_WINDOW = 50                 # recent outcomes retained for the rollup
+_CAP_TRUST_PRIOR = 0.5             # neutral prior (no real trust store until Phase N)
+_recent_outcomes: deque = deque(maxlen=_LEARN_WINDOW)
+
+
+def _emit_learning_shadow(oc) -> None:
+    """Phase M shadow: roll up recent outcomes for this outcome's capability and
+    log the would-be trust WeightAdjustment. Best-effort, never raises."""
+    if not LEARNING_SHADOW:
+        return
+    try:
+        _recent_outcomes.append(oc)
+        cap = getattr(oc, "capability", "") or ""
+        if not cap:
+            return
+        from .kernel import learning
+        cap_outcomes = [o for o in _recent_outcomes
+                        if (getattr(o, "capability", "") or "") == cap]
+        adj = learning.adjust(cap, _CAP_TRUST_PRIOR, cap_outcomes)
+        if adj.samples == 0:
+            return
+        _LOGGER.debug(
+            "learning(shadow): capability=%s trust %.2f -> %.2f "
+            "(delta %+.2f, signal %.2f, n=%d)%s",
+            cap, adj.prior, adj.proposed, adj.delta, adj.signal, adj.samples,
+            " [clamped]" if adj.clamped else "")
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# PARITY (Phase M): offline-compare the learned per-capability trust against the
+# capability's realized success rate and log AGREEMENT/DIVERGENCE — observe-only.
+# The learned trust (confidence-weighted learning signal, nudged from the 0.5
+# prior) should point the same way as the raw success rate; a divergence flags a
+# capability whose confidence-weighting disagrees with its hit rate, which is
+# exactly what the enforce rung would need to get right before it trusts the
+# learned value. Nothing consumes it; set LEARNING_PARITY = False to silence it.
+LEARNING_PARITY = True
+
+
+def _emit_learning_parity(oc) -> None:
+    """Phase M parity: compare the would-be learned trust for this outcome's
+    capability against its realized success rate and log agreement. Best-effort,
+    never raises; reads the same rolling window, drives nothing."""
+    if not LEARNING_PARITY:
+        return
+    try:
+        cap = getattr(oc, "capability", "") or ""
+        if not cap:
+            return
+        from .kernel import learning, outcome as _koutcome
+        cap_outcomes = [o for o in _recent_outcomes
+                        if (getattr(o, "capability", "") or "") == cap]
+        stats = _koutcome.summarize(cap_outcomes)
+        if stats.count == 0:
+            return
+        trust = learning.adjust(cap, _CAP_TRUST_PRIOR, cap_outcomes).proposed
+        success_rate = stats.success_rate
+        agree = (trust >= _CAP_TRUST_PRIOR) == (success_rate >= 0.5)
+        _LOGGER.debug(
+            "learning(parity): capability=%s trust=%.2f success_rate=%.2f "
+            "agree=%s (n=%d)", cap, trust, success_rate, agree, stats.count)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# ENFORCE (Phase M — Learning & Adaptation): close the loop. The per-capability
+# trust the shadow/parity only *logged* is now PERSISTED and fed back as the prior
+# for the next adjustment, so trust accumulates across restarts instead of
+# resetting to the neutral 0.5 each tick — M authoritatively consumes the
+# structured kernel.outcome records (never re-reads raw logs). `learned_trust(cap)`
+# exposes the stored value for downstream consumers (e.g. graduated autonomy, not
+# yet wired — so this closes the learning loop without changing any actuation or
+# autonomy decision today). Owner-authorized ON (9.2.0, #237); kill-switch back to
+# the neutral-prior fail-safe: LEARNING_ENFORCE / the `learning_enforce` config
+# key — set either off and the prior stays 0.5 and the store is never written;
+# fail-safe — any error falls back to the neutral prior and persists nothing.
+# Stored to <config>/jarvis/capability_trust.json (house JSON-snapshot pattern),
+# loaded once, saved throttled.
+LEARNING_ENFORCE = True
+_LEARN_STORE: Dict[str, float] = {}
+_LEARN_STORE_LOADED = False
+_LEARN_STORE_PATH: Optional[str] = None
+_LEARN_LAST_SAVE = 0.0
+_LEARN_SAVE_THROTTLE = 60.0        # seconds; outcome() is not hot, but don't thrash the disk
+
+
+def _learning_enforce_on() -> bool:
+    """True when the learning enforce flip is active. Owner-authorized ON by
+    default (9.2.0); the `learning_enforce` config key is the kill-switch back to
+    the neutral-prior fail-safe. Never raises."""
+    if not LEARNING_ENFORCE:
+        return False
+    try:
+        from . import jarvis_config
+        if jarvis_config.get("learning_enforce", True) is False:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def learned_trust(cap: str) -> float:
+    """The persisted learned trust for a capability in [0, 1], or the neutral
+    prior when the loop is open / the capability is unseen. Never raises."""
+    try:
+        return float(_LEARN_STORE.get(cap, _CAP_TRUST_PRIOR))
+    except Exception:
+        return _CAP_TRUST_PRIOR
+
+
+def _in_capability_class(cap: str, cls: str) -> bool:
+    """True when fine capability ``cap`` belongs to coarse class ``cls`` — it
+    equals the class ("light") or has it as its dotted prefix ("light.turn_on")."""
+    cap = str(cap or "")
+    return bool(cls) and (cap == cls or cap.split(".", 1)[0] == cls)
+
+
+def capability_reliability(capability_class: str) -> tuple[float, int]:
+    """Aggregate learned reliability for a capability CLASS, for an autonomy
+    consumer (the learned-trust damper). Returns ``(trust, samples)``:
+
+    - ``trust`` — the **minimum** persisted :func:`learned_trust` among the fine
+      capabilities in this class (most conservative: one proven-unreliable
+      sub-capability dampens the whole class), or the neutral prior when none is
+      stored yet.
+    - ``samples`` — how many recent outcomes back it (the evidence; it is what a
+      min-evidence policy gates on, so a barely-seen capability is never damped).
+
+    A capability joins the class when it equals it or has it as its dotted prefix
+    (``"light"`` covers ``"light"`` and ``"light.turn_on"``). The recent-outcomes
+    window is bounded, so stale failures age out — trust recovers as the loop sees
+    fresh successes. Pure read; never raises.
+    """
+    cls = str(capability_class or "").strip()
+    if not cls:
+        return (_CAP_TRUST_PRIOR, 0)
+    try:
+        trusts = [float(v) for k, v in _LEARN_STORE.items()
+                  if _in_capability_class(k, cls)]
+        samples = sum(1 for o in _recent_outcomes
+                      if _in_capability_class(getattr(o, "capability", "") or "", cls))
+        trust = min(trusts) if trusts else _CAP_TRUST_PRIOR
+        return (float(trust), int(samples))
+    except Exception:
+        return (_CAP_TRUST_PRIOR, 0)
+
+
+def capability_earned_grant(capability_class: str):
+    """The kernel autonomy grant a capability CLASS has EARNED from the recent
+    verified-outcome window — built the same way the Phase N shadow/parity emit
+    builds it (``kernel.outcome.summarize`` over the rolling window →
+    ``kernel.autonomy.grant``), so the enforce consumer and the parity signal read
+    one source of truth.
+
+    Returns a ``kernel.autonomy.AutonomyGrant`` whose ``level`` / ``may_act`` say
+    whether this capability has earned the top autonomy rung (ACT), or ``None``
+    when the class is empty or on any error (caller fail-safe = act as today). A
+    class with no verified record yields its risk-class floor (SENSITIVE →
+    SUGGEST, ``may_act`` False): autonomy is EARNED, so an unproven capability has
+    not earned it. Pure read; never raises.
+    """
+    cls = str(capability_class or "").strip()
+    if not cls:
+        return None
+    try:
+        from .kernel import autonomy, outcome as _koutcome
+        cap_outcomes = [o for o in _recent_outcomes
+                        if _in_capability_class(getattr(o, "capability", "") or "", cls)]
+        stats = _koutcome.summarize(cap_outcomes)
+        return autonomy.grant(cls, stats)
+    except Exception:   # pragma: no cover - defensive
+        return None
+
+
+# Jarvis Home patch (2026-11-15): jh-loop-io - the capability-trust store is read and written off the event loop
+# (HA warned: blocking open of capability_trust.json inside the event loop, after a device command).
+import threading as _jh_threading
+_JH_LEARN_LOCK = _jh_threading.Lock()
+
+
+def _jh_on_loop() -> bool:
+    """True when this code runs in the thread of a running asyncio loop (Home Assistant's event loop)."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _jh_learn_write(path: str, data: dict) -> None:
+    """Write the trust store (a copy) atomically; one writer at a time. Never raises."""
+    try:
+        with _JH_LEARN_LOCK:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _learn_store_load(hass) -> None:
+    global _LEARN_STORE_LOADED, _LEARN_STORE_PATH
+    if _LEARN_STORE_LOADED:
+        return
+    if _jh_on_loop():   # Jarvis Home patch (2026-11-15): jh-loop-io - read in the executor (normally done at setup)
+        hass.async_add_executor_job(_learn_store_load, hass)
+        return
+    _LEARN_STORE_LOADED = True
+    try:
+        _LEARN_STORE_PATH = hass.config.path("jarvis", "capability_trust.json")
+        if os.path.exists(_LEARN_STORE_PATH):
+            with open(_LEARN_STORE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    try:
+                        _LEARN_STORE.setdefault(str(k), max(0.0, min(1.0, float(v))))   # jh-loop-io: a newer value wins
+                    except (TypeError, ValueError):
+                        pass
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _learn_store_save(hass, *, force: bool = False) -> None:
+    global _LEARN_LAST_SAVE
+    try:
+        now = time.time()
+        if not force and (now - _LEARN_LAST_SAVE) < _LEARN_SAVE_THROTTLE:
+            return
+        path = _LEARN_STORE_PATH or hass.config.path("jarvis", "capability_trust.json")
+        snapshot = dict(_LEARN_STORE)
+        _LEARN_LAST_SAVE = now
+        if _jh_on_loop():   # Jarvis Home patch (2026-11-15): jh-loop-io - write a copy in the executor
+            hass.async_add_executor_job(_jh_learn_write, path, snapshot)
+        else:
+            _jh_learn_write(path, snapshot)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_learning_enforce(oc, hass) -> None:
+    """Phase M enforce: fold this outcome into the capability's PERSISTED trust
+    (prior = the stored value, nudged by the kernel learner) and save it, so the
+    next adjustment builds on it — a closed loop. Does nothing and persists
+    nothing when the flip is off. Kill-switched + fail-safe; never raises."""
+    if not _learning_enforce_on() or hass is None:
+        return
+    try:
+        # Require a usable store path — never hold trust we can't persist.
+        try:
+            hass.config.path("jarvis", "capability_trust.json")
+        except Exception:
+            return
+        cap = getattr(oc, "capability", "") or ""
+        if not cap:
+            return
+        _learn_store_load(hass)
+        from .kernel import learning
+        cap_outcomes = [o for o in _recent_outcomes
+                        if (getattr(o, "capability", "") or "") == cap]
+        adj = learning.adjust(cap, learned_trust(cap), cap_outcomes)
+        if adj.samples == 0:
+            return
+        _LEARN_STORE[cap] = max(0.0, min(1.0, float(adj.proposed)))
+        _learn_store_save(hass)
+        _LOGGER.debug("learning(enforce): capability=%s trust->%.3f persisted (n=%d)",
+                      cap, _LEARN_STORE[cap], adj.samples)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# SHADOW (Phase N — Graduated Autonomy): per verified actuation, log the *would-be*
+# autonomy level this capability has earned from the same rolling outcome window —
+# a pure function of its track record (kernel.outcome.summarize) and its risk class
+# (kernel.autonomy.grant). Observe-only: nothing consumes the level, and the global
+# autonomy flag is untouched. Replacing that flag with the earned level is the
+# owner-gated GRADUATED_AUTONOMY_ENFORCE rung (fail-safe = the current single
+# setting). Set AUTONOMY_SHADOW = False to silence it.
+AUTONOMY_SHADOW = True
+
+
+def _emit_autonomy_shadow(oc) -> None:
+    """Phase N shadow: roll up recent outcomes for this outcome's capability and
+    log the would-be graduated-autonomy level kernel.autonomy would grant. Reads
+    the same rolling window, drives nothing. Best-effort, never raises."""
+    if not AUTONOMY_SHADOW:
+        return
+    try:
+        cap = getattr(oc, "capability", "") or ""
+        if not cap:
+            return
+        from .kernel import autonomy, outcome as _koutcome
+        cap_outcomes = [o for o in _recent_outcomes
+                        if (getattr(o, "capability", "") or "") == cap]
+        stats = _koutcome.summarize(cap_outcomes)
+        g = autonomy.grant(cap, stats)
+        _LOGGER.debug(
+            "autonomy(shadow): capability=%s risk=%s level=%s "
+            "(n=%d, rate=%.2f)%s", cap, g.risk, g.level, g.samples,
+            g.success_rate, " [pinned]" if g.pinned else "")
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# PARITY (Phase N): offline-compare whether the would-be *earned* autonomy level
+# for this capability would auto-execute (``AutonomyGrant.may_act``) against the
+# single blanket incumbent it refines — the active mode's auto-actions flag
+# (``modes.mode_allows_auto_actions``, "whether autonomy graduations may
+# auto-execute"). A divergence flags a capability whose per-capability earned
+# trust disagrees with the one-size-fits-all flag — exactly the divergence the
+# owner-gated earned-graduation rung now resolves: with `autonomy_earned_enforce`
+# on, cognitive_core._earned_autonomy_decision (reading capability_earned_grant
+# below) withholds auto-action from a non-safety capability whose earned level has
+# not reached ACT, in place of trusting the blanket flag. Per-proactive-pattern
+# trust stays with cognitive_core's AutonomyManager; this axis is the blanket flag
+# only. Observe-only; nothing consumes it. Set AUTONOMY_PARITY = False to silence it.
+AUTONOMY_PARITY = True
+
+
+def _emit_autonomy_parity(oc) -> None:
+    """Phase N parity: compare the would-be earned autonomy level's auto-execute
+    verdict for this capability against the blanket mode auto-actions flag and log
+    agreement. Best-effort, never raises; reads the same window, drives nothing."""
+    if not AUTONOMY_PARITY:
+        return
+    try:
+        cap = getattr(oc, "capability", "") or ""
+        if not cap:
+            return
+        from .kernel import autonomy, outcome as _koutcome
+        cap_outcomes = [o for o in _recent_outcomes
+                        if (getattr(o, "capability", "") or "") == cap]
+        stats = _koutcome.summarize(cap_outcomes)
+        g = autonomy.grant(cap, stats)
+        try:
+            from . import modes
+            auto_flag = bool(modes.mode_allows_auto_actions())
+        except Exception:   # pragma: no cover - defensive
+            return
+        earned_auto = g.may_act
+        agree = (earned_auto == auto_flag)
+        _LOGGER.debug(
+            "autonomy(parity): capability=%s earned=%s earned_auto=%s "
+            "mode_auto_flag=%s agree=%s (n=%d)", cap, g.level, earned_auto,
+            auto_flag, agree, g.samples)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def outcome(request, status: str, hass, entity_id: str, detail: str = "") -> None:
+    """Record the canonical ActuatorOutcome for a verified actuation (the
+    audit's point 18 — "the service returned success" is not "the world reached
+    the expected state"). Best-effort; never raises."""
+    observed = None
+    try:
+        from .kernel.actuator import ActuatorOutcome
+        st = hass.states.get(entity_id)
+        observed = (str(st.state) if st is not None else None)
+        oc = ActuatorOutcome(
+            request_id=(request.id if request is not None else f"{entity_id}:actuation"),
+            status=status,
+            observed=observed,
+            detail=detail)
+        _LOGGER.debug("actuator(outcome): %s", oc.to_dict())
+    except Exception:   # pragma: no cover - defensive
+        pass
+    # #237: emit the Epistemic-Fabric Outcome in shadow alongside the above.
+    if OUTCOME_SHADOW:
+        _record_outcome_shadow(request, status, observed, detail, hass)
+
+
+async def execute_actuator(hass, *, capability: str, entity_id: str,
+                           domain: str, service: str, data: dict,
+                           action: str = "", areq=None,
+                           area: Optional[str] = None, verify=None,
+                           blocking: bool = True):
+    """MCU Phase H (H1) — the **universal actuator seam**.
+
+    One authoritative place every consequential actuation converges on, composing
+    a single ActuatorRequest's **Execution → Event → (scheduled) Verification /
+    Outcome** — instead of each path re-assembling the envelope by hand. This is
+    the control_device golden path turned into the reusable framework the audit
+    asked for; migrating paths call this rather than open-coding plan-execute +
+    emit_event + verify.
+
+    - Execution routes **through** ``kernel.plan.aexecute_plan`` (the plan
+      contract: precondition → act), so the actuation genuinely passes the kernel
+      planner. ``domain``/``service``/``data`` are the HA service call it performs.
+    - On success the canonical actuation JarvisEvent is published (``emit_event``).
+    - ``verify`` — optional 0-arg coroutine factory — is *scheduled* (not awaited)
+      after a successful execute: the caller's verify-after-act, which records the
+      terminal ActuatorOutcome. ``None`` → no verify (non-deterministic actions).
+    - ``blocking`` — whether the HA service call waits for completion. Default
+      True (control_device's verify-after-act semantics); bulk/fan-out callers
+      pass False for fire-and-forget across many targets (no per-target verify).
+
+    Returns ``(ok: bool, detail: str)``; a failed/blocked plan yields
+    ``(False, detail)`` — the same error contract the inline path produced. Never
+    raises for control flow."""
+    try:   # jh-r4-switching (review round 4): every switching service, ids as Home Assistant reads them
+        from .local_engine import jh_switching_service as _jh_sw
+        _jh_switching = _jh_sw(domain, service)
+    except Exception:
+        _jh_switching = True
+    if _jh_switching:   # Jarvis Home patch (2026-11-15): jh-manual-heater
+        try:
+            from .local_engine import _jh_is_manual, _jh_manual_note, jh_norm_ids as _jh_ni
+            _jh_ids = _jh_ni(entity_id) + _jh_ni((data or {}).get("entity_id"))
+            if isinstance((data or {}).get("entities"), dict):   # scene.apply
+                _jh_ids += [str(k).strip().lower() for k in data["entities"]]
+            # (review round 2 jh_scene_members and round 6 jh-r6-seam are now part of jh_call_manual: scenes, groups, scripts)
+            from .local_engine import jh_call_manual as _jh_cm   # jh-r7-seam (review round 7): the one shared check
+            _jh_e = _jh_cm(hass, domain, service, _jh_ids)
+            if _jh_e:
+                _LOGGER.info("JARVIS: not switching manual heater %s", _jh_e)
+                return False, _jh_manual_note(hass, _jh_e)
+        except Exception as _jh_exc:   # review round 7: a check that cannot run blocks the call
+            _LOGGER.warning("JARVIS: manual heater check failed, %s.%s not run: %s", domain, service, _jh_exc)
+            return False, "Not run: JARVIS could not check whether this would switch a manual heater. Nothing was changed."
+    from .kernel import plan as _kplan
+    kp = _kplan.Plan(
+        goal=(f"{action} {entity_id}".strip() or capability),
+        steps=(_kplan.Step(
+            action=capability, params=dict(data),
+            preconditions=(f"exists:{entity_id}",),
+            idempotency_key=(f"{entity_id}:{action}" if action else None)),),
+        correlation_id=(getattr(areq, "correlation_id", None) or correlation_id()))
+
+    async def _run(_s):
+        await hass.services.async_call(domain, service, dict(data),
+                                       blocking=blocking)
+        return True
+
+    async def _chk(_c, _s):
+        return hass.states.get(entity_id) is not None
+
+    rep = await _kplan.aexecute_plan(kp, run_step=_run, check=_chk)
+    if not rep.ok:
+        det = (rep.outcomes[0].detail if rep.outcomes else "") or "action failed"
+        return False, det
+    if capability:
+        emit_event(hass, capability, entity_id, action=action, area=area,
+                   request=areq)
+    if verify is not None:
+        try:
+            hass.async_create_task(verify())
+        except Exception:   # pragma: no cover - defensive
+            pass
+    return True, ""
+
+
+# ── SAFETY policy-mode seam (MCU Phase H, H8) ───────────────────────────────────
+# Securing the home against a threat (intrusion lockdown, nighttime lockdown) is
+# the last actuator path that still called hass.services directly, bypassing the
+# universal seam. H8 routes it through execute_actuator too — but under a
+# FAIL-TOWARD-PROTECTION contract that is the opposite of the discretionary path:
+#
+#   * it must NEVER be blocked. It does not pass the agency-budget / loop-detect
+#     gates at all (those live in the proactive path, not in the seam), so a
+#     spent budget or a thrash verdict can never hold a safety response.
+#   * verification is mandatory (a securing action that silently didn't land is a
+#     safety failure), so it always schedules a verify-after-act + outcome.
+#   * on ANY seam/kernel fault — or any non-success — it FAILS OPEN to a direct
+#     hass.services call, so the home is still secured. lock / close_cover are
+#     idempotent (locking a locked lock, closing a closed cover are no-ops), so
+#     the backstop can never leave the home *less* secure than the direct call.
+#   * a one-line kill-switch reverts the whole path to the exact direct call it
+#     replaced.
+SAFETY_SEAM_ENFORCE = True
+
+# securing service -> the secured end-state we verify against
+_SAFETY_EXPECTED = {"lock": ("locked",), "close_cover": ("closed",)}
+
+
+async def _safety_verify(hass, areq, entity_id: str, service: str) -> None:
+    """Record the verified ActuatorOutcome for a securing action — did the entity
+    actually reach its secured state? Best-effort; never raises."""
+    try:
+        from .kernel.actuator import VERIFIED, MISMATCH
+    except Exception:   # pragma: no cover - defensive
+        VERIFIED, MISMATCH = "verified", "mismatch"
+    try:
+        expected = _SAFETY_EXPECTED.get(service, ())
+        st = hass.states.get(entity_id)
+        cur = str(st.state).lower() if st is not None else None
+        status = VERIFIED if (cur in expected) else MISMATCH
+        outcome(areq, status, hass, entity_id,
+                detail=f"safety:{service} -> {cur}")
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+def _emit_failure_shadow(*, recovered: bool) -> None:
+    """Phase AE (MCU Certification — shadow): observe a `failure` scenario (action →
+    HA failure → recovery) into the ONE shared certification ledger via
+    cognitive_core. Closed when the fail-open backstop recovered the securing
+    action; exercised-but-open when even the direct call failed. Observe-only;
+    kill-switched inside cognitive_core; never raises into the caller."""
+    try:
+        from . import cognitive_core
+        from .kernel import certification as CERT
+        cognitive_core.certification_observe(
+            CERT.FAILURE, closed_loop=bool(recovered),
+            note="failed securing action recovered via fail-open" if recovered
+                 else "securing action failed, direct recovery also failed")
+    except Exception:
+        pass
+
+
+async def execute_safety_actuator(hass, *, capability: str, entity_id: str,
+                                  domain: str, service: str,
+                                  data: Optional[dict] = None,
+                                  action: str = "") -> bool:
+    """Perform a SAFETY/securing actuation through the universal seam, with the
+    fail-toward-protection contract above. Returns True iff the securing action
+    was performed (through the seam or the direct fallback). Never raises."""
+    svc_data = dict(data or {"entity_id": entity_id})
+    try:   # jh-r5-safety-manual (review round 5): a manual heater is never "secured", not even by the fail-open fallback
+        from .local_engine import _jh_is_manual as _jh_im5, jh_norm_ids as _jh_ni5, jh_call_manual as _jh_cm8
+        if _jh_cm8(hass, domain, service, _jh_ni5(entity_id) + _jh_ni5(svc_data.get("entity_id"))):   # jh-r8-safety: the shared check
+            _LOGGER.info("JARVIS: safety action skipped on manual heater %s", entity_id)
+            return False
+    except Exception:   # a securing action fails toward protection (this contract), so a check that cannot run does not stop it
+        pass
+
+    async def _direct() -> bool:
+        await hass.services.async_call(domain, service, dict(svc_data),
+                                       blocking=True)
+        return True
+
+    # Kill-switch → the exact direct call this path replaced.
+    if not SAFETY_SEAM_ENFORCE:
+        return await _direct()
+
+    try:
+        areq = request(capability, entity_id, params=svc_data, action=action,
+                       expected=_SAFETY_EXPECTED.get(service))
+    except Exception:   # pragma: no cover - defensive
+        areq = None
+
+    try:
+        ok, _detail = await execute_actuator(
+            hass, capability=capability, entity_id=entity_id, domain=domain,
+            service=service, data=svc_data, action=action, areq=areq,
+            verify=(lambda: _safety_verify(hass, areq, entity_id, service)),
+            blocking=True)
+        if ok:
+            return True
+        _LOGGER.warning(
+            "safety seam did not secure %s (%s): %s — failing open to a direct "
+            "call", entity_id, capability, _detail)
+    except Exception as exc:
+        _LOGGER.warning(
+            "safety seam error on %s (%s): %s — failing open to a direct call",
+            entity_id, capability, exc)
+
+    # Fail toward protection: secure directly so a safety response is never
+    # blocked by a seam fault. Idempotent, so this cannot un-secure anything.
+    # Reaching here means the seam already failed — a `failure` certification
+    # scenario; it closes iff this fail-open recovery secures the home.
+    try:
+        _recovered = await _direct()
+        _emit_failure_shadow(recovered=_recovered)
+        return _recovered
+    except Exception as exc:   # pragma: no cover - defensive
+        _emit_failure_shadow(recovered=False)
+        _LOGGER.warning("safety direct call failed on %s (%s): %s",
+                        entity_id, capability, exc)
+        return False

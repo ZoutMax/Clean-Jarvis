@@ -1,0 +1,5529 @@
+"""
+JARVIS — Cognitive Core (v5.8.03).
+
+The autonomous AI brain. Runs continuously in the background,
+monitoring home state, managing safety, learning patterns, and making
+decisions — emulating Tony Stark's JARVIS from the MCU.
+
+Architecture:
+  - 30-second evaluation loop: reviews full home state each tick
+  - Safety manager: pipe freeze prevention, unauthorized entry,
+    nighttime lockdown
+  - Ignore system: honors "ignore X for Y duration" commands
+  - Outdoor event filter: only surfaces notable events
+  - State logger: records every meaningful state change for
+    pattern learning (separate module)
+  - Suggestion engine: proposes automations based on observed patterns
+
+Philosophy:
+  - Suggest, don't act (initially) — earn trust first
+  - Safety overrides: pipe freeze, intrusion → act immediately
+  - Nighttime lockdown: locks/doors → act automatically
+  - Everything else: observe, learn, suggest
+  - Approved suggestions become automations over time
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+try:   # jh-r23-tz (step 165, review round 23 #8)
+    from .const import jh_local_now as _jh_tz_now, jh_local_dt as _jh_tz_dt
+except ImportError:   # a stubbed const (tests): the process clock
+    _jh_tz_now, _jh_tz_dt = datetime.now, datetime.fromtimestamp
+from typing import Optional
+
+from homeassistant.core import HomeAssistant, Event, callback
+from homeassistant.util import dt as dt_util
+
+from .kernel.world_model import WorldModel
+from .paths import config_path_str
+from .sqlite_utils import ClosingConnection
+
+_LOGGER = logging.getLogger(__name__)
+
+TICK_INTERVAL = 30  # seconds between evaluations
+LOCKDOWN_CHECK_INTERVAL = 300  # 5 min between lockdown scans
+# Formal lockdown state
+ALARM_ARMED_STATES = {
+    "armed_home", "armed_away", "armed_night", "armed_vacation",
+    "armed_custom_bypass",
+}
+# Arming modes the user chose while HOME. A lockdown auto-engaged from one of
+# these, then held open through a later panel dropout, must NOT be read as "the
+# home is away" for intrusion — the user was home when they armed and the panel
+# simply never reported a disarm to lift it. (armed_away / armed_vacation are the
+# away modes, and keep inferring away through a hold.)
+_HOME_ARM_MODES = {"armed_home", "armed_night", "armed_custom_bypass"}
+LOCKDOWN_DOOR_COVER_CLASSES = {"door", "garage", "garage_door"}
+# ── Nighttime lockdown cover policy (issue #495) ────────────────────────────
+# Securing a house that is ASLEEP AND OCCUPIED is not the same as arming one
+# that is empty. Rolling a motorized shutter/blind/shade down over a patio door
+# or a bedroom window while people sleep behind it can block a fire-egress
+# route — a genuine life-safety hazard. So, by default, autonomous nighttime
+# closing is limited to the "perimeter opening" classes you would lock at night
+# (doors / garage / gate) and never touches window shutters, blinds, shades,
+# curtains or awnings. Operators who want the legacy "close every open cover"
+# behaviour opt in with nighttime_lockdown_covers="all"; "off" disables
+# autonomous cover-closing entirely. Operator entity exclusions (the LOTO
+# contract) are ALWAYS honored on top of whichever mode is chosen.
+NIGHTTIME_COVER_SECURE_CLASSES = {"door", "garage", "garage_door", "gate"}
+NIGHTTIME_COVER_MODE_DEFAULT = "secure"       # secure | all | off
+COVER_FEATURE_CLOSE = 2                        # homeassistant CoverEntityFeature.CLOSE bit
+LOCKDOWN_BREACH_COOLDOWN = 120  # seconds between repeat breach announcements
+LOCKDOWN_SECURE_VERIFY_DELAY = 25  # seconds to wait before confirming a close actually took (slow covers)
+LOCKDOWN_STATE_PATH = config_path_str("jarvis", "lockdown_state.json")  # survives reboots/reloads
+FREEZE_WARN_TEMP_F = 35  # outdoor temp (°F) that triggers pipe concern
+FREEZE_CRITICAL_TEMP_F = 20  # act immediately
+IGNORE_FILE = config_path_str(".jarvis_ignore_rules.json")
+
+# MCU Phase R (R2b) — freeze ENFORCE kill-switch. When True (default, owner
+# approved), the kernel freeze verdict is authoritative in _check_freeze (via a
+# fail-toward-alerting max-severity rule). Flip to False to revert to the pure
+# legacy inline thresholds on the next load — a one-line revert.
+HAZARD_SITUATION_ENFORCE = True
+
+# MCU Phase R (R3b) — intrusion entry-gate ENFORCE kill-switch. When True
+# (default), the kernel intrusion_gate is authoritative for whether a possible-
+# intrusion investigation opens, including its residents-tracked-home veto (an
+# awake, positively tracked-home resident never opens one — the fix for the
+# real-world false alarms where a resident on camera at home, under a degraded
+# confinement hold from an unavailable alarm panel, was investigated as an
+# intruder). Flip to False to revert to the pure legacy precondition on the next
+# load. The gate fails safe to the legacy decision on any kernel fault.
+INTRUSION_GATE_ENFORCE = True
+
+# MCU Phase R (R3c) — intrusion SITUATION-lifecycle ENFORCE kill-switch. When True
+# (default), a user "false alarm" call-off is honoured DURABLY across a reload:
+# the dismissal drives the kernel situation to BENIGN, and _check_intrusion reads
+# that lifecycle state back (intrusion.kernel_calloff_active_sync) so JARVIS does
+# not immediately re-alarm on the same benign motion after a restart that lost the
+# in-memory call-off window. ADDITIVE and fail-safe: a None/error read suppresses
+# nothing, so it only reduces false alarms and can never miss a real intrusion.
+# Flip to False to revert to the in-memory-only call-off window.
+INTRUSION_SITUATION_ENFORCE = True
+
+# Away false-alarm fix (8.69.0) — harden intrusion CONFIRMATION under a degraded
+# hold. When the home is "away" only because a lockdown is being HELD through an
+# unreadable alarm panel (a Cove/Alula cloud drop), a resident is very likely
+# still inside, so a blind "trust the camera" confirmation on an inconclusive /
+# unavailable vision check must NOT fire a critical intrusion alarm. With this on
+# (default), that degraded-hold case requires real corroboration instead — a
+# positive vision person-confirm or a genuine inward route through the house.
+# Genuine away (tracked-away / armed-away / a user-requested lockdown) is
+# unchanged: vision-inconclusive still fails toward alerting there. Flip to False
+# to revert to the prior always-fail-open behavior on the next load.
+INTRUSION_DEGRADED_CONFIRM_HARDEN = True
+
+# Away false-alarm root fix (8.70.0) — a HOME arming posture must not be read as
+# "away" for intrusion. With this on (default), when the confinement engaging
+# intrusion monitoring is a home posture — the panel is readably armed_home /
+# armed_night / armed_custom_bypass, OR a held auto-lockdown that began from one
+# of those modes (panel since gone unavailable) — the intrusion "away" branch is
+# NOT forced; presence falls back to tracked presence. So arming HOME (or a Cove
+# dropout holding a home-mode lockdown) no longer treats a resident moving through
+# the house as an intruder. An armed_away/vacation posture, genuine tracked-away,
+# or a user-requested lockdown still infers away as before. Night interior
+# monitoring is unaffected: it runs via the asleep path. Flip to False to revert.
+INTRUSION_HOME_ARM_NOT_AWAY = True
+
+# Freeze verdict severity order, so _check_freeze can take the MORE-SEVERE of the
+# kernel and legacy verdicts (fail toward alerting — never miss a freeze alert).
+_FREEZE_SEVERITY = {"critical": 3, "warning": 2, "clear": 1, "none": 0}
+
+
+def _more_severe_freeze(a: str, b: str) -> str:
+    """Return whichever freeze verdict is the more severe (alert-biased). Ties
+    and unknown labels fall back to ``a``."""
+    return a if _FREEZE_SEVERITY.get(a, 0) >= _FREEZE_SEVERITY.get(b, 0) else b
+
+
+def _temp_to_f(value: float, unit: str) -> float:
+    """A temperature already in ``unit`` (``°C`` or ``°F``) → Fahrenheit, so
+    threshold checks are unit-correct regardless of the home's unit system."""
+    return value * 9.0 / 5.0 + 32.0 if unit and "C" in unit.upper() else value
+
+
+def _f_to_unit(f_value: float, unit: str) -> float:
+    """Fahrenheit → ``unit`` (inverse of :func:`_temp_to_f`)."""
+    return (f_value - 32.0) * 5.0 / 9.0 if unit and "C" in unit.upper() else f_value
+
+
+def _fmt_temp(value: float, unit: str, decimals: int = 1) -> str:
+    """Render a temperature with its unit label (``18.3°C``)."""
+    return f"{value:.{decimals}f}{unit or '°'}"
+
+
+def _hass_lang(hass) -> str:
+    """Home Assistant's configured language ('en' fallback), for localized
+    safety notifications."""
+    try:
+        return getattr(hass.config, "language", None) or "en"
+    except Exception:
+        return "en"
+
+
+def _notify_i18n():
+    """Lazy import of the localized-notification table (keeps this heavy module's
+    import order unaffected)."""
+    from . import notify_i18n
+    return notify_i18n
+
+# ── Proactive intelligence (v5.9.07) ────────────────────────────────────────
+PROACTIVE_CHECK_INTERVAL = 120   # 2 min between comfort/efficiency scans
+PROACTIVE_OFFER_COOLDOWN = 1800  # 30 min before re-offering the same thing
+DARK_LUX_THRESHOLD = 15          # below this lux + occupancy → offer lights
+STALE_LIGHT_MINUTES = 90         # light on this long in an empty room → flag
+def _offer_area(hass, offer):
+    """Best-effort area for a proactive offer, from its action target entity.
+    Used to scope a room-bound mode's quiet to just that room. None if unknown."""
+    try:
+        ad = (offer.get("action_data") or {}) if isinstance(offer, dict) else {}
+        eid = ad.get("entity_id") or offer.get("entity_id")
+        if isinstance(eid, (list, tuple)):
+            eid = eid[0] if eid else None
+        if not eid:
+            return None
+        from . import audio_routing
+        return audio_routing.entity_area(hass, eid)
+    except Exception:
+        return None
+
+
+HIGH_TEMP_AWAY_F = 78            # cooling running while away → efficiency flag
+LOW_TEMP_AWAY_F = 62             # heating running while away → efficiency flag
+
+# ── Intrusion investigation (v6.33.0) ───────────────────────────────────────
+# One alert, then investigate silently until it's a confirmed intrusion or
+# confirmed benign — never a stream of "motion detected" repeats.
+INTRUSION_SPREAD_ZONES = 2       # motion in this many zones ⇒ someone moving through
+INTRUSION_INWARD_DEPTH = 2       # rooms deep from the breach motion must reach to
+                                 # confirm a real inward route (v6.74.0);
+                                 # configurable via intrusion_inward_depth
+INTRUSION_CLEAR_QUIET_SECS = 180 # motion quiet this long ⇒ nothing of note
+INTRUSION_MAX_INVESTIGATE_SECS = 600  # one zone this long, no spread ⇒ benign
+INTRUSION_SUSTAINED_SECS = 60    # multi-zone motion sustained this long (no breach location) ⇒ real
+# If the user doesn't respond to the initial "investigating" alert (neither
+# acknowledges nor calls it off) within this window AND the situation hasn't
+# cleared, escalate to a full alert anyway — an unanswered possible break-in
+# should fail toward alerting, not toward silently waiting. Configurable via
+# `intrusion_response_timeout` (v6.69.0).
+INTRUSION_RESPONSE_TIMEOUT_SECS = 120
+
+# ── Graduated autonomy (v5.9.07) ────────────────────────────────────────────
+# A suggestion that the user approves repeatedly earns the right to auto-apply.
+AUTONOMY_TRUST_THRESHOLD = 3     # approvals of same pattern → auto-execute tier
+AUTONOMY_MIN_CONFIDENCE = 0.80   # confidence floor for auto-execution
+AUTONOMY_FILE = config_path_str("jarvis", "autonomy_grants.json")
+
+
+# ── Ignore System ───────────────────────────────────────────────────────────
+
+@dataclass
+class IgnoreRule:
+    entity_pattern: str   # entity_id or glob pattern ("binary_sensor.garage*")
+    reason: str
+    expires_at: float     # unix timestamp, 0 = permanent until cleared
+    created_at: float = 0.0
+
+    def is_expired(self) -> bool:
+        if self.expires_at == 0:
+            return False
+        return time.time() > self.expires_at
+
+    def matches(self, entity_id: str) -> bool:
+        import fnmatch
+        return fnmatch.fnmatch(entity_id, self.entity_pattern)
+
+
+class IgnoreManager:
+    """Manages entity/event ignore rules with duration."""
+
+    def __init__(self):
+        self._rules: list[IgnoreRule] = []
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(IGNORE_FILE):
+                with open(IGNORE_FILE) as f:
+                    data = json.load(f)
+                self._rules = [
+                    IgnoreRule(**r) for r in data
+                    if not IgnoreRule(**r).is_expired()
+                ]
+        except Exception:
+            self._rules = []
+
+    def snapshot(self) -> list[dict]:
+        """Serializable copy of the live rules (taken on the caller's thread)."""
+        return [
+            {
+                "entity_pattern": r.entity_pattern,
+                "reason": r.reason,
+                "expires_at": r.expires_at,
+                "created_at": r.created_at,
+            }
+            for r in self._rules if not r.is_expired()
+        ]
+
+    @staticmethod
+    def write_snapshot(data: list[dict]) -> None:
+        """Blocking file write — call from an executor when on the event loop."""
+        try:
+            with open(IGNORE_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            _LOGGER.warning("Failed to save ignore rules: %s", exc)
+
+    def _save(self):
+        self.write_snapshot(self.snapshot())
+
+    def add(self, entity_pattern: str, duration_minutes: int = 0,
+            reason: str = "", save: bool = True) -> IgnoreRule:
+        expires = (time.time() + duration_minutes * 60) if duration_minutes > 0 else 0
+        rule = IgnoreRule(
+            entity_pattern=entity_pattern,
+            reason=reason,
+            expires_at=expires,
+            created_at=time.time(),
+        )
+        self._rules.append(rule)
+        if save:
+            self._save()
+        _LOGGER.info(
+            "Cognitive: ignore '%s' for %s (%s)",
+            entity_pattern,
+            f"{duration_minutes}min" if duration_minutes else "indefinitely",
+            reason,
+        )
+        return rule
+
+    def remove(self, entity_pattern: str, save: bool = True) -> bool:
+        before = len(self._rules)
+        self._rules = [r for r in self._rules if r.entity_pattern != entity_pattern]
+        if len(self._rules) < before:
+            if save:
+                self._save()
+            return True
+        return False
+
+    def clear_all(self):
+        self._rules.clear()
+        self._save()
+
+    def is_ignored(self, entity_id: str) -> bool:
+        self._rules = [r for r in self._rules if not r.is_expired()]
+        return any(r.matches(entity_id) for r in self._rules)
+
+    def list_rules(self) -> list[dict]:
+        self._rules = [r for r in self._rules if not r.is_expired()]
+        return [
+            {
+                "pattern": r.entity_pattern,
+                "reason": r.reason,
+                "expires_at": r.expires_at,
+                "remaining_min": max(0, int((r.expires_at - time.time()) / 60))
+                if r.expires_at > 0 else "permanent",
+            }
+            for r in self._rules
+        ]
+
+
+# ── Outdoor Event Filter ────────────────────────────────────────────────────
+# The classifier and notable-event policy live in outdoor.py (the single source
+# of truth — the intrusion paths below use it too). Thin delegates kept here for
+# import compatibility.
+
+def is_outdoor_notable(entity_id: str, area_name: str,
+                       detection_type: str = "motion") -> bool:
+    """Decide if an outdoor event is worth surfacing. Delegates to outdoor.py."""
+    from . import outdoor
+    return outdoor.notable(None, entity_id, detection_type, area_name=area_name)
+
+
+# ── Safety Manager ──────────────────────────────────────────────────────────
+
+class SafetyManager:
+    """Monitors for safety-critical conditions and acts."""
+
+    def __init__(self, hass: HomeAssistant, config: dict):
+        self.hass = hass
+        self.config = config
+        self._last_freeze_alert = 0.0
+        self._last_lockdown_check = 0.0
+        self._last_intrusion_alert = 0.0
+        self._investigation = None   # active intrusion investigation, or None
+        self._freeze_warned = False
+
+    async def tick(self, sleeping: bool, anyone_home: bool) -> list[dict]:
+        """Run all safety checks. Returns list of actions taken."""
+        actions = []
+        now = time.time()
+
+        # ── Pipe freeze prevention ──────────────────────────────────
+        freeze_action = await self._check_freeze()
+        if freeze_action:
+            actions.append(freeze_action)
+
+        # ── Unauthorized entry detection ────────────────────────────
+        # Default: auto-arm on confident-away (tracked away / armed-away) or
+        # asleep — never on the mere absence of occupancy, which falsely fires when
+        # someone is home but untracked.
+        # Opt-in (intrusion_requires_confinement): make an explicit "confinement"
+        # signal the master switch instead — a formal Lockdown OR an armed alarm
+        # panel. Monitoring runs only while confined, and clearing confinement
+        # stops it at once, dropping any active investigation (issue #111).
+        if self.config.get("intrusion_requires_confinement", False):
+            confined = is_lockdown() or self._alarm_armed()
+            if confined:
+                intrusion = await self._check_intrusion(
+                    anyone_home, sleeping, confined=True)
+                if intrusion:
+                    actions.append(intrusion)
+            elif self._investigation is not None:
+                self._investigation = None  # confinement off → stop immediately
+        elif self._residents_away() or sleeping or self._investigation is not None:
+            intrusion = await self._check_intrusion(anyone_home, sleeping)
+            if intrusion:
+                actions.append(intrusion)
+
+        # ── Nighttime lockdown ──────────────────────────────────────
+        # Skipped when a formal lockdown is already active (it handles securing).
+        if (sleeping and not is_lockdown()
+                and (now - self._last_lockdown_check) > LOCKDOWN_CHECK_INTERVAL):
+            self._last_lockdown_check = now
+            lockdown = await self._nighttime_lockdown()
+            if lockdown:
+                actions.extend(lockdown)
+
+        return actions
+
+    async def _check_freeze(self) -> Optional[dict]:
+        """Monitor outdoor temperature for pipe freeze risk.
+
+        Unit-aware: the value read is in Home Assistant's configured unit (°C on
+        a metric install), so it is converted to °F for the threshold comparison
+        and the message is rendered in the user's own unit. A metric home no
+        longer false-fires a freeze warning on a mild 18°C day.
+        """
+        now = time.time()
+        if (now - self._last_freeze_alert) < 3600:  # 1hr cooldown
+            return None
+
+        try:
+            default_unit = self.hass.config.units.temperature_unit
+        except Exception:
+            default_unit = "°F"
+
+        outdoor_temp = None
+        unit = default_unit
+        # Check weather entity
+        for state in self.hass.states.async_all("weather"):
+            temp = state.attributes.get("temperature")
+            if temp is not None:
+                try:
+                    outdoor_temp = float(temp)
+                except (ValueError, TypeError):
+                    continue
+                unit = state.attributes.get("temperature_unit") or default_unit
+                break
+
+        # Check outdoor temp sensors
+        if outdoor_temp is None:
+            for state in self.hass.states.async_all("sensor"):
+                if state.attributes.get("device_class") != "temperature":
+                    continue
+                eid = state.entity_id.lower()
+                fname = (state.attributes.get("friendly_name") or "").lower()
+                if "outdoor" in eid or "outside" in eid or "outdoor" in fname:
+                    try:
+                        outdoor_temp = float(state.state)
+                    except (ValueError, TypeError):
+                        pass
+                    else:
+                        unit = state.attributes.get("unit_of_measurement") or default_unit
+                    break
+
+        if outdoor_temp is None:
+            return None
+
+        temp_f = _temp_to_f(outdoor_temp, unit)
+        reading = _fmt_temp(outdoor_temp, unit)
+        honorific = self.config.get("honorific", "sir")
+        lang = _hass_lang(self.hass)
+
+        # The legacy inline threshold category (what the raw thresholds imply).
+        if temp_f <= FREEZE_CRITICAL_TEMP_F:
+            _legacy_fv = "critical"
+        elif temp_f <= FREEZE_WARN_TEMP_F:
+            _legacy_fv = "warning"
+        elif temp_f > FREEZE_WARN_TEMP_F + 5:
+            _legacy_fv = "clear"
+        else:
+            _legacy_fv = "none"
+
+        # MCU Phase R (R2b) — freeze ENFORCE, fail-TOWARD-alerting. The kernel
+        # verdict (kernel.situation.freeze_verdict) is authoritative, but we take
+        # the MORE-SEVERE of (kernel, legacy): a kernel fault can never yield a
+        # *less* severe outcome than the raw thresholds, so a freeze alert is
+        # never missed. On any kernel error we fall back to the legacy category,
+        # and the kill-switch (HAZARD_SITUATION_ENFORCE=False) reverts to pure
+        # legacy. Since R2a proved kernel == legacy on all temps, this is
+        # behaviour-identical; the max-severity rule is the safety belt.
+        verdict = _legacy_fv
+        if HAZARD_SITUATION_ENFORCE:
+            try:
+                from .kernel.situation import freeze_verdict as _kfv
+                kernel_fv = _kfv(temp_f, warn_f=FREEZE_WARN_TEMP_F,
+                                 critical_f=FREEZE_CRITICAL_TEMP_F)
+                verdict = _more_severe_freeze(kernel_fv, _legacy_fv)
+            except Exception:   # pragma: no cover - defensive, fail toward alert
+                verdict = _legacy_fv
+        # Parity log (best-effort), unchanged from R2a.
+        try:
+            from . import hazard_situation
+            hazard_situation.record_freeze_verdict_parity(
+                temp_f, _legacy_fv, warn_f=FREEZE_WARN_TEMP_F,
+                critical_f=FREEZE_CRITICAL_TEMP_F)
+        except Exception:   # pragma: no cover - defensive
+            pass
+
+        # R2c — durable WARNING de-dup. The in-memory _freeze_warned is lost on a
+        # reload, so a freeze already announced before a restart could re-warn.
+        # When the kernel situation store still holds an open freeze episode, adopt
+        # "already warned" so the duplicate warning is suppressed. CRITICAL is
+        # never suppressed below (it fails toward alerting); fail-safe — a
+        # None/error read leaves _freeze_warned as-is, so a warning still fires.
+        if (HAZARD_SITUATION_ENFORCE and verdict == "warning"
+                and not self._freeze_warned):
+            try:
+                from . import hazard_situation
+                if await self.hass.async_add_executor_job(
+                        hazard_situation.kernel_freeze_active_sync, self.hass):
+                    self._freeze_warned = True
+            except Exception:   # pragma: no cover - defensive, fail toward alert
+                pass
+
+        if verdict == "critical":
+            self._last_freeze_alert = now
+            await self._mirror_freeze_hazard("critical", reading)
+            set_to = _fmt_temp(_f_to_unit(55, unit), unit, decimals=0)
+            return {
+                "type": "freeze_critical",
+                "urgency": "critical",
+                "message": _notify_i18n().message(
+                    "freeze_critical", lang, honorific=honorific.title(),
+                    reading=reading, set_to=set_to),
+                "auto_act": True,  # Safety override — act without approval
+            }
+        elif verdict == "warning" and not self._freeze_warned:
+            self._freeze_warned = True
+            self._last_freeze_alert = now
+            await self._mirror_freeze_hazard("warning", reading)
+            return {
+                "type": "freeze_warning",
+                "urgency": "high",
+                "message": _notify_i18n().message(
+                    "freeze_warning", lang, honorific=honorific.title(),
+                    reading=reading),
+                "auto_act": False,
+            }
+        elif verdict == "clear":
+            self._freeze_warned = False
+            await self._mirror_freeze_hazard("cleared", reading)
+
+        return None
+
+    async def _mirror_freeze_hazard(self, action: str,
+                                    reading: Optional[str] = None) -> None:
+        """MCU Phase D (D2): best-effort, log-only mirror of the freeze hazard
+        lifecycle into the kernel Situation store (via the ``hazard_situation``
+        seam). Runs the SQLite write off-loop and swallows any failure — it never
+        affects freeze alerting."""
+        try:
+            from . import hazard_situation
+            await self.hass.async_add_executor_job(
+                hazard_situation.mirror_freeze_sync, self.hass, action, reading)
+        except Exception:
+            pass
+
+    def _alarm_armed(self) -> bool:
+        # MCU Phase C (C2): alarm context read through the WorldModel facade, which
+        # reads the same async_all("alarm_control_panel") source verbatim. Falls
+        # back to the raw sweep on any facade failure (safety read).
+        try:
+            alarms = [d["state"] for d in WorldModel(self.hass).devices(
+                domain="alarm_control_panel")]
+        except Exception:  # noqa: BLE001 — safety read must never raise
+            alarms = [st.state for st in self.hass.states.async_all("alarm_control_panel")]
+        return any(s in ALARM_ARMED_STATES for s in alarms)
+
+    def _friendly(self, eid: Optional[str]) -> Optional[str]:
+        if not eid:
+            return None
+        st = self.hass.states.get(eid)
+        return ((st.attributes.get("friendly_name") if st else None) or eid)
+
+    def _open_entry(self) -> Optional[str]:
+        """The entity_id of an exterior door/window that's currently open — the
+        breach point a real entry would come through. None if all are shut.
+        Property-perimeter openings (a driveway or side gate, a shed door) are
+        excluded: they aren't the house envelope, and an open yard gate must not
+        turn a curtain-flutter into a corroborated intrusion. The garage IS
+        envelope, so anything garage-named stays in."""
+        from . import outdoor
+
+        def _envelope(st) -> bool:
+            fname = st.attributes.get("friendly_name") or ""
+            if "garage" in (st.entity_id + " " + fname).lower():
+                return True
+            return not outdoor.is_outdoor(self.hass, st.entity_id, fname)
+
+        for st in self.hass.states.async_all("binary_sensor"):
+            if (st.attributes.get("device_class") in ("door", "window", "garage_door", "opening")
+                    and st.state == "on" and _envelope(st)):
+                return st.entity_id
+        for st in self.hass.states.async_all("cover"):
+            if (st.attributes.get("device_class") in ("door", "garage", "garage_door", "gate")
+                    and st.state in ("open", "opening") and _envelope(st)):
+                return st.entity_id
+        return None
+
+    def _breach_area(self, entry_eid: Optional[str]) -> Optional[str]:
+        """The HA area of the breach entity — where the intruder would enter."""
+        if not entry_eid:
+            return None
+        try:
+            from . import audio_routing
+            return audio_routing.entity_area(self.hass, entry_eid)
+        except Exception:
+            return None
+
+    def _motion_key(self, eid: str) -> str:
+        """A stable 'zone' key for a motion sensor — its area if resolvable,
+        else the entity id. Distinct zones ⇒ movement across the home."""
+        try:
+            from homeassistant.helpers import (
+                entity_registry as er, device_registry as dr,
+            )
+            ent = er.async_get(self.hass).async_get(eid)
+            if ent:
+                area = ent.area_id
+                if not area and ent.device_id:
+                    dev = dr.async_get(self.hass).async_get(ent.device_id)
+                    area = dev.area_id if dev else None
+                if area:
+                    return area
+        except Exception:
+            pass
+        return eid
+
+    def _qualifying_motion(self, sleeping: bool) -> list:
+        """Active indoor motion sensors worth considering — skips outdoor
+        sensors and (while asleep) bedroom sensors. Returns [(entity_id, name)]."""
+        from . import outdoor
+        out = []
+        bedroom_areas = self.config.get("bedroom_areas", []) if sleeping else []
+        for state in self.hass.states.async_all("binary_sensor"):
+            if state.attributes.get("device_class", "") not in ("motion", "occupancy", "presence"):
+                continue
+            if state.state != "on":
+                continue
+            eid = state.entity_id
+            fname = (state.attributes.get("friendly_name") or "")
+            # Outdoor motion never seeds or spreads an *indoor* intrusion — that
+            # is the outdoor filter's job to surface (if notable), not ours.
+            if outdoor.is_outdoor(self.hass, eid, fname):
+                continue
+            if sleeping and bedroom_areas and self._motion_key(eid) in bedroom_areas:
+                continue
+            out.append((eid, fname or eid))
+        return out
+
+    def _person_on_camera(self, indoor_only: bool = True) -> bool:
+        """Best-effort: a camera reports a person right now (e.g. Frigate's
+        binary_sensor.<cam>_person). With indoor_only (the default, and what
+        intrusion confirmation uses), OUTDOOR cameras are excluded — a delivery
+        driver on the driveway cam is a doorstep event, not proof someone is
+        inside the house."""
+        return self._person_camera_entity(indoor_only) is not None
+
+    def _person_camera_entity(self, indoor_only: bool = True) -> Optional[str]:
+        """Like _person_on_camera, but returns the CAMERA entity_id backing the
+        person-detecting binary_sensor (so we can snapshot it), or None. Maps
+        binary_sensor.<cam>_person → camera.<cam> when such a camera exists,
+        else returns the sensor's entity_id as a fallback handle."""
+        from . import outdoor
+        for st in self.hass.states.async_all("binary_sensor"):
+            if st.state != "on":
+                continue
+            fname = st.attributes.get("friendly_name") or ""
+            low = (st.entity_id + " " + fname).lower()
+            if "person" not in low:
+                continue
+            if st.attributes.get("device_class") not in (
+                    "occupancy", "motion", "presence", None):
+                continue
+            if indoor_only and outdoor.is_outdoor(self.hass, st.entity_id, fname):
+                continue
+            # derive a camera entity from the sensor slug, e.g.
+            # binary_sensor.dining_room_person → camera.dining_room
+            slug = st.entity_id.split(".", 1)[-1]
+            for suffix in ("_person", "_person_occupancy", "_occupancy"):
+                if slug.endswith(suffix):
+                    slug = slug[: -len(suffix)]
+                    break
+            cam = f"camera.{slug}"
+            if self.hass.states.get(cam) is not None:
+                return cam
+            # fall back: any camera whose name shares the area word
+            from .camera import active_camera_states
+            for cst in active_camera_states(self.hass):
+                if slug.split("_")[0] in cst.entity_id:
+                    return cst.entity_id
+            return cam        # best-effort handle even if not yet resolvable
+        return None
+
+    def _breach_camera(self, breach_area: Optional[str]) -> Optional[str]:
+        """The camera whose saved coverage best sees ``breach_area`` — so JARVIS
+        can get its OWN eyes on the point of entry — falling back to any
+        person-capable camera. None if nothing covers it. (Shared by the initial
+        intrusion gate and the mid-investigation vision confirm.)"""
+        cam = None
+        try:
+            if breach_area:
+                from . import camera_coverage as _cc
+                cam = _cc.camera_for_area(self.hass, breach_area)
+        except Exception:
+            cam = None
+        if not cam:
+            try:
+                cam = self._person_camera_entity()
+            except Exception:
+                cam = None
+        return cam
+
+    def _resident_on_camera(self) -> bool:
+        """Whether a flagged household resident was recognized on camera recently
+        (face whitelist, #140). Used to stand intrusion monitoring down when the
+        person JARVIS sees is known. False (no effect) when no residents are
+        flagged or recognition is unavailable. Never raises."""
+        try:
+            from . import recognition
+            return bool(recognition.resident_present(self.hass))
+        except Exception:
+            return False
+
+    def _log_standdown_reason(self, where: str) -> None:
+        """Diagnostic only: record WHY the face-recognition resident stand-down did
+        NOT suppress this intrusion alert, so a false 'unidentified person' alarm is
+        self-explaining in the LOGS tab (e.g. 'best match Sam 52% below 60%
+        threshold', 'not flagged as a resident', 'no fresh recognition'). Never
+        affects the decision; never raises."""
+        try:
+            from . import recognition
+            from .websocket import jarvis_log
+            reason = recognition.resident_standdown_reason(self.hass)
+            jarvis_log("SECURITY",
+                       f"intrusion alert at {where}: face stand-down not applied — {reason}")
+        except Exception:
+            pass
+
+    def _resident_tracked_home(self) -> bool:
+        """A household resident is POSITIVELY tracked home — a person or
+        device_tracker reading ``home`` (never motion/occupancy, which is what
+        intrusion judges). Used as the entry-gate veto: an awake tracked-home
+        resident means motion is them. Read through the WorldModel facade with a
+        raw fallback (safety read), mirroring ``_residents_away``."""
+        try:
+            wm = WorldModel(self.hass)
+            persons = [d["state"] for d in wm.devices(domain="person")]
+            trackers = [d["state"] for d in wm.devices(domain="device_tracker")]
+        except Exception:  # noqa: BLE001 — safety read must never raise
+            persons = [st.state for st in self.hass.states.async_all("person")]
+            trackers = [st.state for st in self.hass.states.async_all("device_tracker")]
+        return any(str(s).lower() == "home" for s in persons) \
+            or any(str(s).lower() == "home" for s in trackers)
+
+    def _confinement_degraded(self) -> bool:
+        """True when the home is being treated as 'away' ONLY because a lockdown
+        is being HELD through an unreadable alarm panel (a Cove/Alula cloud drop)
+        — not by a verified arm, a tracked-away / armed-away presence, or a
+        user-requested lockdown.
+
+        In that degraded state a resident is very likely still inside (the panel
+        simply never reported a ``disarmed`` to lift the auto-lockdown), so the
+        intrusion CONFIRMATION step must require real corroboration rather than
+        blindly trusting a camera on an inconclusive vision check. Genuine away is
+        deliberately excluded here so it keeps failing toward alerting. Never
+        raises — a fault returns False, leaving the prior fail-toward-safety
+        behavior intact."""
+        try:
+            # A resident positively tracked away, or an actually-readable armed
+            # panel, is genuine 'away' — never a degraded hold.
+            if self._residents_away():
+                return False
+            if self._alarm_armed():
+                return False
+            mgr = _CORE.lockdown_mgr
+            # No active lockdown, or a user-REQUESTED (manual) one, is not a
+            # degraded hold: a manual lockdown is a deliberate away-posture the
+            # user chose, so it keeps full confirmation strength.
+            if mgr is None or not mgr.active or not mgr.auto:
+                return False
+            # Auto (alarm-engaged) lockdown, no readable armed panel → degraded
+            # iff the panel is currently indeterminate (held through a dropout).
+            _armed, _disarm_confirmed, indeterminate = _alarm_state_view(self.hass)
+            return bool(indeterminate)
+        except Exception:  # noqa: BLE001 — safety read must never raise
+            return False
+
+    def _confinement_is_home_posture(self) -> bool:
+        """True when the confinement engaging intrusion monitoring is a HOME
+        posture, so the home must NOT be treated as 'away' (interior movement is
+        residents, not intruders). A home posture is:
+          * the panel is readably armed in a HOME mode (armed_home / armed_night /
+            armed_custom_bypass), OR
+          * no panel is readably armed but a held auto-lockdown was engaged from a
+            HOME mode (the Cove dropped out after an armed-home / armed-night arm).
+        NOT a home posture: genuine tracked-away or an armed_away/vacation panel
+        (``_residents_away`` wins), an away-mode held lockdown, or a user-requested
+        (manual) lockdown — all deliberate away postures that keep inferring away.
+        Night interior monitoring is unaffected: it runs via the asleep path, not
+        this away branch. Never raises — a fault returns False (prior behavior)."""
+        try:
+            # Genuinely away (tracked-away, or armed_away/vacation) is never a
+            # home posture.
+            if self._residents_away():
+                return False
+            # A readably-armed panel: home posture iff its mode is a home mode.
+            mode = _armed_mode(self.hass)
+            if mode:
+                return mode in _HOME_ARM_MODES
+            # No readable arm → consult a held auto-lockdown's captured mode.
+            mgr = _CORE.lockdown_mgr
+            if mgr is not None and mgr.active and mgr.auto:
+                return str(getattr(mgr, "arm_mode", "")).lower() in _HOME_ARM_MODES
+            return False
+        except Exception:  # noqa: BLE001 — safety read must never raise
+            return False
+
+    def _intrusion_entry_gate(self, *, away: bool, require_corroboration: bool,
+                              alarm_armed: bool, open_entry: bool,
+                              sleeping: bool, legacy_open: bool) -> bool:
+        """MCU Phase R (R3b): decide whether to open a possible-intrusion
+        investigation via the authoritative kernel gate. We only reach here with
+        qualifying motion present (``qualifying_motion=True``). Records the
+        parity log, then — under enforce — returns the kernel verdict (which adds
+        the residents-tracked-home veto); fails safe to the legacy precondition on
+        any kernel fault or with the kill-switch off. Never raises."""
+        residents_home = self._resident_tracked_home()
+        try:
+            from . import intrusion as _intr
+            _intr.record_gate_parity(
+                legacy_open, away=away, qualifying_motion=True,
+                require_corroboration=require_corroboration,
+                alarm_armed=alarm_armed, open_entry=open_entry,
+                residents_tracked_home=residents_home, sleeping=sleeping)
+        except Exception:   # pragma: no cover - defensive
+            pass
+        if not INTRUSION_GATE_ENFORCE:
+            return legacy_open
+        try:
+            from .kernel.situation import intrusion_gate
+            return intrusion_gate(
+                away=away, qualifying_motion=True,
+                require_corroboration=require_corroboration,
+                alarm_armed=alarm_armed, open_entry=open_entry,
+                residents_tracked_home=residents_home, sleeping=sleeping)
+        except Exception:   # pragma: no cover - defensive, fail safe to legacy
+            return legacy_open
+
+    async def _check_intrusion(self, anyone_home: bool,
+                                sleeping: bool, confined: bool = False) -> Optional[dict]:
+        """Detect unauthorized entry when away or asleep. Fires ONE alert, then
+        investigates silently until it's a confirmed intrusion (escalated to the
+        whole house + every device) or confirmed benign.
+
+        ``confined`` is set by the intrusion_requires_confinement gate: an
+        explicit Lockdown/alarm-armed signal engages the away-path monitoring
+        even when presence isn't tracked-away, so arming confinement while home
+        still watches for entry (issue #111).
+
+        Away false-alarm root fix (8.70.0): a HOME arming posture
+        (armed_home / armed_night, readable or held through a Cove dropout) does
+        NOT count as 'away' — the residents are inside, so their movement through
+        the house must not be treated as an intruder. Only genuine tracked-away,
+        an armed_away/vacation panel, a user-requested lockdown, or an away-mode
+        held lockdown infers away. Night interior monitoring still runs via the
+        asleep path below."""
+        now = time.time()
+        away = self._residents_away()
+        if not away and confined:
+            # Confinement engaged. Infer 'away' UNLESS it is a home arming posture
+            # (the fix for "Jarvis pinned it to away when I armed HOME").
+            if not (INTRUSION_HOME_ARM_NOT_AWAY
+                    and self._confinement_is_home_posture()):
+                away = True
+
+        # A recent user "false alarm" call-off suppresses new intrusion alerts.
+        try:
+            from . import intrusion as _intr
+            if _intr.is_called_off():
+                return None
+            # R3c — durable call-off: the in-memory window above is lost on a
+            # reload, so also honour a recent false-alarm dismissal recorded in the
+            # kernel situation store (a BENIGN intrusion episode). Additive and
+            # fail-safe: a None/error read suppresses nothing (never over-suppresses
+            # a real intrusion); kill-switch INTRUSION_SITUATION_ENFORCE.
+            if INTRUSION_SITUATION_ENFORCE:
+                if await self.hass.async_add_executor_job(
+                        _intr.kernel_calloff_active_sync, self.hass, now):
+                    return None
+        except Exception:
+            pass
+
+        # Mid-investigation: keep watching, escalate at most once, stay quiet
+        # otherwise. This is what stops the stream of repeat "motion" alerts.
+        if self._investigation is not None:
+            return await self._investigate_step(now, away, sleeping)
+
+        # A recognized household resident on camera → don't even raise the initial
+        # alert; the person being seen is known (#140). No-op without a whitelist.
+        if self._resident_on_camera():
+            return None
+
+        if (now - self._last_intrusion_alert) < 300:
+            return None
+
+        motion = self._qualifying_motion(sleeping)
+        # Breach-only (default; kill-switch intrusion_breach_only). Interior motion
+        # is residents/pets and never, on its own, opens an intrusion — only a real
+        # BREACH (an exterior door/window/garage open) OR a person positively on an
+        # indoor camera does. This is what stops the nuisance false alarms from
+        # pets/residents moving around. Set intrusion_breach_only=False to restore
+        # the legacy motion-seeded behavior. Once a genuine breach/person IS the
+        # trigger, the existing investigation + vision veto are unchanged — tracking
+        # movement after a real breach is sound, so this does NOT blind a break-in.
+        if self.config.get("intrusion_breach_only", True):
+            _breach = self._open_entry()
+            _person_cam = self._person_camera_entity(indoor_only=True)
+            if not (_breach or _person_cam):
+                return None
+            # Anchor on the motion zone when there IS qualifying indoor motion, so
+            # the investigation's route tracking is unchanged from the legacy path;
+            # only when there's no motion do we anchor on the breach entity, then on
+            # the camera showing the person.
+            if motion:
+                eid, where = motion[0]
+            elif _breach:
+                eid, where = _breach, (self._friendly(_breach) or "an entry point")
+            else:
+                eid, where = _person_cam, (self._friendly(_person_cam) or "inside the house")
+        else:
+            if not motion:
+                return None
+            eid, where = motion[0]
+        honorific = self.config.get("honorific", "sir")
+
+        if away:
+            armed = False
+            entry = None
+            _require_corr = self.config.get("intrusion_require_corroboration", True)
+            _breach_only = self.config.get("intrusion_breach_only", True)
+            if _require_corr or _breach_only:
+                armed = self._alarm_armed()
+                entry = self._open_entry()
+            # MCU Phase R (R3b) — the kernel intrusion entry-gate is authoritative.
+            # The legacy precondition would open iff corroboration is satisfied;
+            # the kernel gate adds the residents-tracked-home veto that stops a
+            # resident on camera at home (under a degraded confinement hold) from
+            # being investigated as an intruder. Fail-safe to the legacy decision
+            # on any kernel fault; kill-switch INTRUSION_GATE_ENFORCE.
+            if _breach_only:
+                # Breach-or-person is the trigger (established above). Feed it to the
+                # gate so the residents-tracked-home veto still applies, while the
+                # armed-alone / motion-alone shortcuts no longer open an alert.
+                _seed = bool(entry) or (self._person_camera_entity(indoor_only=True) is not None)
+                _gate_open_entry = _seed
+                _legacy_open = _seed
+            else:
+                _gate_open_entry = bool(entry)
+                _legacy_open = bool((not _require_corr) or armed or entry)
+            if not self._intrusion_entry_gate(
+                    away=away, require_corroboration=_require_corr,
+                    alarm_armed=armed, open_entry=_gate_open_entry,
+                    sleeping=sleeping, legacy_open=_legacy_open):
+                return None
+            breach_name = self._friendly(entry) if entry else None
+            breach_area = self._breach_area(entry)
+            # Anchor the search at the breach: the intruder enters there, so the
+            # breach room and the rooms adjacent to it are where a real entry
+            # first shows up. Motion elsewhere is still investigated, but not
+            # concluded to be an intrusion on its own — that discernment is what
+            # avoids false alarms.
+            connected = {breach_area} if breach_area else set()
+            hops = {}
+            try:
+                from . import residence_graph
+                connected |= residence_graph.adjacent_areas(
+                    self.hass, self.config, breach_area)
+                # Depth of every room from the breach, so we can tell inward
+                # (entry → deeper) motion from motion that lingers at the entry.
+                hops = residence_graph.hops_from_breach(
+                    self.hass, self.config, breach_area)
+            except Exception:
+                pass
+            # Phase Q (parity): check the kernel SpatialGraph reproduces the same
+            # breach-depth map — observe-only, drives nothing.
+            _emit_space_time_parity(self.hass, self.config, breach_area, hops)
+            # Phase Q (enforce, owner-gated, default OFF): let the kernel
+            # SpatialGraph own the breach-depth map authoritatively — adopted only
+            # when it exactly reproduces the incumbent; any divergence/error keeps
+            # the legacy map (fail-safe = residence_graph.hops_from_breach).
+            hops = _space_time_breach_hops(
+                self.hass, self.config, breach_area, hops)
+            connected.discard(None)
+            # ONE alert, then investigate. An intentionally-open window is still
+            # a valid entry point — alert once and watch, rather than ignore it.
+            self._last_intrusion_alert = now
+            start_zone = self._motion_key(eid)
+            # deepest room motion has reached so far (breach itself = 0)
+            start_depth = hops.get(start_zone, 0) if hops else 0
+            self._investigation = {
+                "start": now, "last_motion": now,
+                "zones": {start_zone}, "path": [start_zone], "escalated": False,
+                "breach_area": breach_area, "breach_name": breach_name,
+                "connected": connected,
+                "hops": hops, "max_depth": start_depth,
+            }
+            _i18n = _notify_i18n()
+            _lang = _hass_lang(self.hass)
+            if breach_name:
+                ctx = _i18n.message("intrusion_ctx_open", _lang, name=breach_name)
+            elif armed:
+                ctx = _i18n.message("intrusion_ctx_armed", _lang)
+            else:
+                ctx = ""
+            msg = _i18n.message(
+                "intrusion_alert", _lang, honorific=honorific.title(),
+                where=where, ctx=ctx)
+            # Decision Record (v7.39.0): log the proactive intrusion judgement. Best-effort;
+            # a logging failure must never affect the alert. The generation is
+            # captured before the executor job so a stale call-off cannot publish an
+            # old decision record after a newer intrusion cycle has started.
+            _dec_gen = None
+            try:
+                from . import decision_record, intrusion as _intr_rec
+                _dec_gen = _intr_rec.begin_decision_generation()
+                _record_job = self.hass.async_add_executor_job(
+                    lambda: decision_record.record(
+                        "intrusion",
+                        observation={"location": where, "breach": breach_name,
+                                     "alarm_armed": armed, "presence": "away"},
+                        interpretation={"assessment": "possible intrusion — investigating from the point of entry"},
+                        decision="raise initial intrusion alert and investigate silently",
+                        reason="motion while away with corroborating breach (open entry or armed alarm)",
+                    )
+                )
+                try:
+                    _rid = await asyncio.shield(_record_job)
+                except asyncio.CancelledError:
+                    _rid = await asyncio.shield(_record_job)
+                    _dismissed_rid = _intr_rec.set_last_decision_id(
+                        _rid, generation=_dec_gen
+                    )
+                    if _dismissed_rid is not None:
+                        await self.hass.async_add_executor_job(
+                            _intr_rec._persist_dismissal, _dismissed_rid
+                        )
+                    raise
+                try:  # so a later call-off attaches to this exact record
+                    _dismissed_rid = _intr_rec.set_last_decision_id(
+                        _rid, generation=_dec_gen
+                    )
+                    if _dismissed_rid is not None:
+                        await self.hass.async_add_executor_job(
+                            _intr_rec._persist_dismissal, _dismissed_rid
+                        )
+                except Exception:
+                    pass
+            except Exception:
+                if _dec_gen is not None:
+                    _intr_rec.set_last_decision_id(None, generation=_dec_gen)
+            finally:
+                if _dec_gen is not None:
+                    _intr_rec.clear_pending_generation(_dec_gen)
+            # Vision veto (the owner's rule: "if JARVIS has eyes on it and there
+            # is no problem, it shouldn't say there is"). Before even the initial
+            # low-confidence ping, get JARVIS's OWN eyes on the camera covering the
+            # breach: if it plainly shows NO person, stay QUIET and keep watching
+            # silently — a real person on any later tick still confirms and alarms
+            # (the investigation created above keeps running). Inconclusive vision
+            # or no covering camera never vetoes (fail toward safety → still
+            # alerts). Ever-vigilant by choice: intrusion_vision_veto (default on)
+            # turned off restores alerting on any unanswered activity.
+            vision_clear = False
+            if self.config.get("intrusion_vision_veto", True):
+                try:
+                    _bcam = self._breach_camera(breach_area)
+                    if _bcam:
+                        vision_clear = (
+                            await self._confirm_person_with_vision(_bcam)) is False
+                except Exception:
+                    vision_clear = False
+            # Learned damping (v6.76.0): if this location/time pattern has been
+            # repeatedly labelled a false alarm, stay QUIET on this initial
+            # low-confidence ping. The investigation still runs underneath, so a
+            # real inward route still confirms and alarms — learning can only
+            # silence the weak alert, never a confirmed intrusion.
+            damped = False
+            try:
+                from . import intrusion as _intr
+                await _intr.async_load(self.hass)
+                damped = _intr.should_damp_weak_alert(breach_area, None)
+                _init_reason = ("vision shows no one at the breach" if vision_clear
+                                else "damped (learned benign)" if damped
+                                else "motion while away")
+                await _intr.async_record_event(
+                    self.hass, "investigating", reason=_init_reason,
+                    breach=breach_name, breach_area=breach_area,
+                    zones=[start_zone], max_depth=start_depth)
+            except Exception:
+                pass
+            if damped or vision_clear:
+                _LOGGER.info(
+                    "intrusion: initial alert %s at %s (still investigating)",
+                    "vetoed by vision — no person seen" if vision_clear
+                    else "damped for learned-benign pattern", breach_area)
+                return None
+            self._log_standdown_reason(where)
+            return {
+                "type": "intrusion_investigating", "urgency": "high",
+                "message": msg, "auto_act": True, "entity_id": eid,
+            }
+
+        if sleeping:
+            self._last_intrusion_alert = now
+            # Under breach-only the seed is a real breach/person, not bare motion,
+            # so phrase it as a possible entry rather than "motion detected".
+            if self.config.get("intrusion_breach_only", True):
+                msg = (f"{honorific.title()}, a possible entry was detected at "
+                       f"{where} while the household is asleep. Investigating.")
+            else:
+                msg = (f"{honorific.title()}, motion detected at {where} "
+                       f"while the household is asleep. Investigating.")
+            self._log_standdown_reason(where)
+            return {
+                "type": "intrusion_sleep", "urgency": "high",
+                "message": msg, "auto_act": True, "entity_id": eid,
+            }
+
+        return None
+
+    async def _confirm_person_with_vision(self, cam_entity: str) -> Optional[bool]:
+        """Second opinion on Frigate's person detection (v6.73.0). Frigate's
+        person sensor is a good TRIGGER but false-positives (shadows, headlights,
+        reflections, pets), so before escalating to a full intrusion we snapshot
+        the camera and ask JARVIS's OWN vision model whether a person is actually
+        there. Returns:
+          True  — vision confirms a person (escalate)
+          False — vision says no person (Frigate false-positive; don't escalate)
+          None  — vision couldn't run/was inconclusive (fall back to prior
+                  behavior, so a broken vision path never SUPPRESSES a real alert)
+        """
+        if not cam_entity or not str(cam_entity).startswith("camera."):
+            return None
+        # Respect a config kill-switch: some users may want Frigate-only.
+        if not self.config.get("intrusion_vision_confirm", True):
+            return None
+        try:
+            from .camera import async_analyze_camera, _FakeCall
+            honorific = self.config.get("honorific", "sir")
+            prompt = (
+                "Security check. Look at this indoor camera frame. Is there a "
+                "PERSON (a human being) actually present in the frame right now? "
+                "Answer strictly: reply 'PERSON: YES' if a real person is clearly "
+                "visible, or 'PERSON: NO' if there is no person (e.g. it is an "
+                "empty room, a shadow, a light, a reflection, a pet, or an "
+                "object). Do not guess — if you cannot clearly see a person, "
+                "answer NO."
+            )
+            fc = _FakeCall({"entity_id": cam_entity, "prompt": prompt,
+                            "announce": False})
+            groq_client = getattr(self, "groq_client", None) or getattr(self, "_groq", None)
+            res = await async_analyze_camera(
+                self.hass, fc, groq_client, honorific, None, [], gate_announce=True)
+            text = ""
+            if isinstance(res, dict):
+                text = (res.get("analysis") or res.get("description")
+                        or res.get("message") or "")
+            text = str(text).lower()
+            if not text:
+                return None                       # inconclusive → fall back
+            # explicit signal first
+            if "person: yes" in text:
+                return True
+            if "person: no" in text:
+                return False
+            # heuristic fallback on the free text
+            neg = any(p in text for p in (
+                "no person", "not a person", "no one", "nobody", "empty",
+                "no people", "there is no", "cannot see a person",
+                "don't see a person", "no human"))
+            pos = any(p in text for p in (
+                "a person", "person is", "someone is", "an intruder",
+                "a man", "a woman", "a human", "people are"))
+            if neg and not pos:
+                return False
+            if pos and not neg:
+                return True
+            return None                           # ambiguous → fall back
+        except Exception as exc:
+            _LOGGER.debug("intrusion: vision confirm failed: %s", exc)
+            return None                           # never suppress on error
+
+    async def _investigate_step(self, now: float, away: bool,
+                                sleeping: bool) -> Optional[dict]:
+        """One tick of an active investigation: confirm, clear, or keep watching
+        silently. Escalates only when activity forms a coherent route from the
+        breach point (or a camera confirms a person). Motion unrelated to the
+        entry is watched, not concluded — that discernment avoids false alarms.
+        Returns an escalation action only on confirmation (once)."""
+        inv = self._investigation
+
+        # Residents came home / no longer away → stand down.
+        if not away:
+            self._investigation = None
+            return None
+
+        # A recognized household resident on camera → stand down. The person
+        # JARVIS is seeing is a known resident (face whitelist, #140), not an
+        # intruder. No-op when no residents are flagged, so default behavior is
+        # unchanged.
+        if self._resident_on_camera():
+            self._investigation = None
+            return None
+
+        active = {self._motion_key(eid) for eid, _ in self._qualifying_motion(sleeping)}
+        if active:
+            inv["last_motion"] = now
+            for z in active:
+                if z not in inv["zones"]:
+                    inv["path"].append(z)         # record the route, in order
+            inv["zones"] |= active
+            # Track how far INWARD from the breach motion has reached. A real
+            # intruder's motion propagates entry → deeper rooms; motion that just
+            # lingers at the entry never increases this. (v6.74.0)
+            hops = inv.get("hops") or {}
+            if hops:
+                for z in active:
+                    d = hops.get(z)
+                    if d is not None and d > inv.get("max_depth", 0):
+                        inv["max_depth"] = d
+
+        spread_needed = self.config.get("intrusion_spread_zones", INTRUSION_SPREAD_ZONES)
+        connected = inv.get("connected") or set()
+        near_breach = bool(inv["zones"] & connected)
+        spread = len(inv["zones"]) >= spread_needed
+        sustained = bool(active) and (now - inv["start"]) >= INTRUSION_SUSTAINED_SECS
+
+        # Breach-only (the owner's protocol, default on): a real intrusion must
+        # involve an actual BREACH (an exterior door/window/garage opening). When
+        # this investigation was NOT anchored on a breach — it was opened by a
+        # camera person-flag, which Frigate can false-positive on a resident, a
+        # pet or a shadow — motion alone, however sustained, must NOT confirm a
+        # critical intrusion. Only a person JARVIS positively sees on camera
+        # (the `vision is True` branch below) still escalates. This is exactly the
+        # "intrusion confirmed by movement, no breach" false alarm the protocol is
+        # meant to prevent. Kill-switch: intrusion_breach_only.
+        _breach_only = bool(self.config.get("intrusion_breach_only", True))
+        _had_breach = bool(inv.get("breach_name") or inv.get("breach_area"))
+        _motion_may_confirm = (not _breach_only) or _had_breach
+
+        # Directional inward progression (v6.74.0): a real intruder enters at the
+        # breach and moves INWARD to progressively deeper rooms. Motion that
+        # merely lingers at/near the entry (an AC unit in the open window, a
+        # curtain) never propagates inward, so it must NOT confirm. We require
+        # motion to have reached a configurable depth of rooms FROM the breach.
+        try:
+            need_depth = int(self.config.get("intrusion_inward_depth",
+                                             INTRUSION_INWARD_DEPTH))
+        except (ValueError, TypeError):
+            need_depth = INTRUSION_INWARD_DEPTH
+        hops = inv.get("hops") or {}
+        max_depth = inv.get("max_depth", 0)
+        # inward progression only means something if we have a room-depth map;
+        # when we do, require reaching need_depth rooms in. When we don't (no
+        # floor plan), fall back to the old spread+near_breach heuristic so a
+        # user without a mapped house still gets protection.
+        if hops:
+            inward = max_depth >= need_depth
+        else:
+            inward = spread and near_breach
+
+        # Prefer a camera whose saved coverage actually sees the breach area — lets
+        # JARVIS confirm a person via a camera in an adjacent room with a sightline
+        # (e.g. the dining camera seeing the living room through the open staircase),
+        # not only a camera physically in that room (v7.20.0).
+        cam_entity = self._breach_camera(
+            inv.get("breach_area") if isinstance(inv, dict) else None)
+        camera = cam_entity is not None
+
+        # Tracks a clear visual negative THIS tick (JARVIS's own eyes on the
+        # covering camera plainly showed no person). Used by the vision veto below
+        # so an unanswered timeout never cries wolf about a scene it can see is
+        # empty. Only an affirmative "no person" sets it — inconclusive/absent
+        # vision leaves it False (fail toward safety).
+        vision_saw_empty = False
+        if camera:
+            # Frigate flagged a person — but Frigate false-positives, so get a
+            # second opinion from JARVIS's OWN vision before escalating (v6.73.0).
+            vision = await self._confirm_person_with_vision(cam_entity)
+            if vision is True:
+                confirmed, reason = True, "a person is on camera (confirmed by vision)"
+            elif vision is False:
+                # JARVIS's OWN eyes checked the camera that covers the breach and
+                # saw NO person (an empty room — a shadow, a pet, a reflection, or
+                # the resident already gone). The camera is authoritative for the
+                # area it covers, so a motion-propagation heuristic must NOT
+                # override a clear visual negative and fire a CONFIRMED critical
+                # alarm. Doing so produced false "someone is moving inward"
+                # confirmations from a resident leaving, a garage-door motor or a
+                # pet while the covering camera plainly showed no one (bug: a
+                # driveway-side false alarm with an empty garage, camera-confirm on).
+                #
+                # Keep investigating instead of confirming: we still escalate the
+                # instant vision sees a real person on a later tick, and the
+                # no-response path below still sends a soft "couldn't reach you,
+                # please check" notice for an unanswered, ongoing event — without
+                # masquerading as a confirmed break-in. This honours the user's
+                # expectation that cameras confirm intrusions.
+                _LOGGER.info(
+                    "intrusion: breach cleared by vision on %s (no person visible) "
+                    "— not confirming on motion alone", cam_entity)
+                confirmed = False
+                vision_saw_empty = True
+                reason = "motion while away, but the covering camera shows no one"
+            elif (INTRUSION_DEGRADED_CONFIRM_HARDEN
+                  and self._confinement_degraded()):
+                # Vision inconclusive/unavailable AND the home is "away" only
+                # because a lockdown is held through an unreadable alarm panel
+                # (8.69.0). A resident is very likely still inside, so a blind
+                # "trust the camera" confirmation here is exactly what fired the
+                # false critical "intrusion confirmed" on a resident the vision
+                # model couldn't resolve. Require real corroboration instead — the
+                # same evidence the no-camera path uses: a genuine inward route
+                # from the breach, or sustained multi-room movement. (A positive
+                # vision person-confirm still escalates immediately on any later
+                # tick, via the `vision is True` branch above.)
+                if inv.get("breach_area"):
+                    confirmed = inward
+                    reason = ("someone is moving inward through the house from "
+                              "the point of entry")
+                else:
+                    confirmed = spread and sustained and _motion_may_confirm
+                    reason = ("sustained movement through the house while no one "
+                              "is home")
+            else:
+                # Vision inconclusive/unavailable under GENUINE away (tracked-away
+                # / armed-away / a user-requested lockdown) → normally fall back to
+                # trusting the camera so a broken vision path never suppresses a
+                # real alert. But in breach-only mode with NO breach, this "trust
+                # the camera" confirm fires on a Frigate person false-positive with
+                # no corroborating entry — the very false alarm the protocol is
+                # meant to stop — so hold instead. A later positive vision
+                # person-confirm still escalates.
+                if _breach_only and not _had_breach:
+                    confirmed = False
+                    reason = ("a camera flagged a person but vision is "
+                              "inconclusive and there is no breach — watching")
+                else:
+                    confirmed, reason = True, "a person is on camera"
+        elif inv.get("breach_area"):
+            # Entry point known: require motion to have travelled INWARD from the
+            # breach (a genuine intrusion route), not merely lingered near it.
+            confirmed = inward
+            reason = ("someone is moving inward through the house from the "
+                      "point of entry")
+        else:
+            # No location on the breach. In breach-only mode a real intrusion must
+            # involve an actual breach, so motion alone — however sustained — must
+            # NOT confirm (the pet / resident / camera false-positive the owner
+            # runs breach-only to suppress). A person positively seen by JARVIS's
+            # own vision still confirms via the branch above. Without breach-only,
+            # keep the legacy conservative sustained-movement heuristic.
+            confirmed = spread and sustained and _motion_may_confirm
+            reason = "sustained movement through the house while no one is home"
+
+        # User called it off as a false alarm → stand down, don't escalate.
+        try:
+            from . import intrusion as _intr
+            if _intr.is_called_off():
+                self._investigation = None
+                return None
+        except Exception:
+            pass
+
+        elapsed = now - inv["start"]
+
+        # Response-timeout escalation (v6.69.0): the initial "investigating"
+        # alert went out to notifications + voice. If the user hasn't responded
+        # (neither acknowledged nor called it off) within the response window,
+        # the situation is STILL ACTIVE (motion hasn't gone quiet), and it hasn't
+        # otherwise cleared, escalate anyway — an unanswered *ongoing* possible
+        # break-in fails toward alerting. Motion that started and then stopped
+        # still clears as benign below (a curtain flutter shouldn't escalate just
+        # because no one answered); the timeout only bites while something is
+        # actively still happening. An acknowledgement ("I'm looking") holds it;
+        # a false-alarm call-off (handled above) stops it entirely.
+        quiet_for = now - inv["last_motion"]
+        timed_out = False
+        if not inv["escalated"] and not confirmed:
+            try:
+                from . import intrusion as _intr
+                acknowledged = _intr.is_acknowledged()
+            except Exception:
+                acknowledged = False
+            try:
+                resp_timeout = float(self.config.get(
+                    "intrusion_response_timeout", INTRUSION_RESPONSE_TIMEOUT_SECS))
+            except (ValueError, TypeError):
+                resp_timeout = INTRUSION_RESPONSE_TIMEOUT_SECS
+            still_active = quiet_for < INTRUSION_CLEAR_QUIET_SECS
+            # Vision veto: if JARVIS's own eyes on the covering camera plainly
+            # showed no person this tick, an unanswered timeout must NOT
+            # manufacture a "please check" alert — it keeps watching silently and
+            # still escalates the instant vision sees a real person (the confirmed
+            # path above). Inconclusive/absent vision never vetoes. Ever-vigilant
+            # by choice: intrusion_vision_veto (default on) off restores the alert.
+            vetoed = (vision_saw_empty
+                      and self.config.get("intrusion_vision_veto", True))
+            if (not acknowledged and still_active
+                    and elapsed >= resp_timeout and not vetoed):
+                timed_out = True
+
+        # A confirmed intrusion (real inward route, or a person confirmed on
+        # camera) fires the full critical alarm. A timeout WITHOUT that evidence
+        # no longer masquerades as a confirmed intrusion — instead it sends a
+        # softer "couldn't reach you, please check" notice. This is the fix for
+        # false "intrusion confirmed" alerts firing on unanswered lingering
+        # motion with no real route through the house (v6.74.0).
+        if not inv["escalated"] and confirmed:
+            inv["escalated"] = True
+            honorific = self.config.get("honorific", "sir")
+            snap = None
+            if cam_entity:
+                try:
+                    from . import intrusion as _intr
+                    snap = await _intr.capture_snapshot(self.hass, cam_entity)
+                except Exception:
+                    snap = None
+            snap_note = " A snapshot is available." if snap else ""
+            msg = (f"{honorific.title()}, intrusion confirmed — {reason}.{snap_note} "
+                   f"Alerting the house and every device. Say 'it's a false alarm' "
+                   f"to call it off.")
+            action = {
+                "type": "intrusion_confirmed", "urgency": "critical",
+                "message": msg, "auto_act": True, "notify_all": True,
+                "can_dismiss": True,
+            }
+            if snap:
+                action["snapshot_url"] = snap.get("url")
+                action["snapshot_path"] = snap.get("path")
+                action["camera"] = snap.get("camera")
+            try:
+                self.hass.bus.async_fire("jarvis_intrusion_confirmed", {
+                    "reason": reason,
+                    "snapshot_url": (snap or {}).get("url"),
+                    "snapshot_path": (snap or {}).get("path"),
+                    "camera": (snap or {}).get("camera"),
+                })
+            except Exception:
+                pass
+            # Log it for review/labeling. A CONFIRMED intrusion is never damped
+            # by learning — it always alerts (v6.76.0).
+            try:
+                from . import intrusion as _intr
+                await _intr.async_record_event(
+                    self.hass, "confirmed", reason=reason,
+                    breach=inv.get("breach_name"), breach_area=inv.get("breach_area"),
+                    camera=cam_entity, snapshot=snap,
+                    zones=sorted(inv.get("zones") or []),
+                    max_depth=inv.get("max_depth"))
+            except Exception:
+                pass
+            return action
+
+        if not inv["escalated"] and timed_out:
+            # Unanswered, still some motion, but NO confirming inward route.
+            # Don't cry "intrusion confirmed" — send a soft check-in instead.
+            inv["escalated"] = True            # don't repeat this either
+            honorific = self.config.get("honorific", "sir")
+            # Learned damping applies here too: this is a LOW-CONFIDENCE alert
+            # (nothing was confirmed), so a pattern repeatedly labelled a false
+            # alarm stays quiet (v6.76.0).
+            damped_soft = False
+            try:
+                from . import intrusion as _intr
+                await _intr.async_load(self.hass)
+                damped_soft = _intr.should_damp_weak_alert(
+                    inv.get("breach_area"), cam_entity)
+            except Exception:
+                damped_soft = False
+            snap = None
+            if cam_entity:
+                try:
+                    from . import intrusion as _intr
+                    snap = await _intr.capture_snapshot(self.hass, cam_entity)
+                except Exception:
+                    snap = None
+            try:
+                from . import intrusion as _intr
+                await _intr.async_record_event(
+                    self.hass, "unresolved",
+                    reason=("damped (learned benign)" if damped_soft
+                            else "no response; unconfirmed activity"),
+                    breach=inv.get("breach_name"), breach_area=inv.get("breach_area"),
+                    camera=cam_entity, snapshot=snap,
+                    zones=sorted(inv.get("zones") or []),
+                    max_depth=inv.get("max_depth"))
+            except Exception:
+                pass
+            if damped_soft:
+                _LOGGER.info("intrusion: unresolved alert damped for "
+                             "learned-benign pattern at %s", inv.get("breach_area"))
+                return None
+            snap_note = " A snapshot is available." if snap else ""
+            where = inv.get("breach_name") or "the point of entry"
+            msg = (f"{honorific.title()}, I flagged possible activity near {where} "
+                   f"and couldn't reach you, but I have not confirmed anyone moving "
+                   f"through the house.{snap_note} Please check when you can — say "
+                   f"'it's a false alarm' to clear it.")
+            action = {
+                "type": "intrusion_unresolved", "urgency": "high",
+                "message": msg, "auto_act": True, "notify_all": True,
+                "can_dismiss": True,
+            }
+            if snap:
+                action["snapshot_url"] = snap.get("url")
+                action["snapshot_path"] = snap.get("path")
+                action["camera"] = snap.get("camera")
+            try:
+                self.hass.bus.async_fire("jarvis_intrusion_unresolved", {
+                    "reason": "no response; unconfirmed activity",
+                    "snapshot_url": (snap or {}).get("url"),
+                    "snapshot_path": (snap or {}).get("path"),
+                    "camera": (snap or {}).get("camera"),
+                })
+            except Exception:
+                pass
+            return action
+
+        if not inv["escalated"] and (quiet_for > INTRUSION_CLEAR_QUIET_SECS
+                                     or elapsed > INTRUSION_MAX_INVESTIGATE_SECS):
+            self._investigation = None            # nothing of note
+        elif inv["escalated"] and quiet_for > INTRUSION_CLEAR_QUIET_SECS:
+            self._investigation = None            # situation settled
+        return None
+
+    async def _nighttime_lockdown(self) -> list[dict]:
+        """Check and secure locks and doors during sleep.
+
+        Operator exclusions are honored ABSOLUTELY here (issue #495): an entity
+        the user placed on the exclusion list is never actuated, not even by the
+        safety seam, because nighttime lockdown is a convenience/butler action,
+        not an active-threat response. Cover closing follows the configured
+        ``nighttime_lockdown_covers`` policy — "secure" (default) closes only
+        perimeter openings (doors/garage/gate) and never egress shutters over
+        sleeping residents, "all" restores legacy "close every open cover", and
+        "off" disables autonomous cover-closing — and only acts on covers that
+        advertise a CLOSE service, mirroring the intrusion path's rigor.
+        """
+        from .entity_filter import is_excluded
+        actions = []
+        honorific = self.config.get("honorific", "sir")
+
+        # Check locks — skip any the operator has excluded (LOTO is absolute).
+        unlocked = []
+        for state in self.hass.states.async_all("lock"):
+            if state.state == "unlocked":
+                eid = state.entity_id
+                if is_excluded(self.hass, eid):
+                    _LOGGER.debug("Cognitive lockdown: %s excluded — not locking", eid)
+                    continue
+                fname = state.attributes.get("friendly_name", eid)
+                # Auto-lock — through the SAFETY seam (H8), which can never be
+                # blocked and fails open to a direct call.
+                try:
+                    from . import actuation
+                    ok = await actuation.execute_safety_actuator(
+                        self.hass, capability="lock.lock", entity_id=eid,
+                        domain="lock", service="lock",
+                        data={"entity_id": eid}, action="lock")
+                    if ok:
+                        unlocked.append(fname)
+                        _LOGGER.info("Cognitive lockdown: locked %s", eid)
+                except Exception as exc:
+                    _LOGGER.warning("Cognitive lockdown: failed to lock %s: %s", eid, exc)
+
+        # Check covers/garage — honor exclusions, obey the cover policy, and only
+        # close covers that actually advertise a CLOSE service.
+        open_covers = []
+        cover_mode = str(
+            self.config.get("nighttime_lockdown_covers", NIGHTTIME_COVER_MODE_DEFAULT)
+            or NIGHTTIME_COVER_MODE_DEFAULT
+        ).strip().lower()
+        if cover_mode not in ("secure", "all", "off"):
+            cover_mode = NIGHTTIME_COVER_MODE_DEFAULT
+        if cover_mode != "off":
+            for state in self.hass.states.async_all("cover"):
+                if state.state != "open":
+                    continue
+                eid = state.entity_id
+                if is_excluded(self.hass, eid):
+                    _LOGGER.debug("Cognitive lockdown: %s excluded — not closing", eid)
+                    continue
+                attrs = state.attributes or {}
+                dc = attrs.get("device_class")
+                # "secure" (default): only perimeter-opening classes; never roll
+                # a shutter/blind/shade down over a sleeping, occupied room.
+                # "all": legacy behaviour, any class.
+                if cover_mode == "secure" and dc not in NIGHTTIME_COVER_SECURE_CLASSES:
+                    continue
+                # Skip covers that report features but don't advertise CLOSE —
+                # trying anyway is a no-op that then nags "still open".
+                sf = attrs.get("supported_features")
+                if sf is not None:
+                    try:
+                        if not (int(sf) & COVER_FEATURE_CLOSE):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                fname = attrs.get("friendly_name", eid)
+                try:
+                    from . import actuation
+                    ok = await actuation.execute_safety_actuator(
+                        self.hass, capability="cover.close_cover", entity_id=eid,
+                        domain="cover", service="close_cover",
+                        data={"entity_id": eid}, action="close")
+                    if ok:
+                        open_covers.append(fname)
+                        _LOGGER.info("Cognitive lockdown: closed %s", eid)
+                except Exception as exc:
+                    _LOGGER.warning("Cognitive lockdown: failed to close %s: %s", eid, exc)
+
+        if unlocked or open_covers:
+            i18n = _notify_i18n()
+            lang = _hass_lang(self.hass)
+            parts = []
+            if unlocked:
+                parts.append(i18n.message("lockdown_locked", lang,
+                                          names=i18n.join_names(unlocked, lang)))
+            if open_covers:
+                parts.append(i18n.message("lockdown_closed", lang,
+                                          names=i18n.join_names(open_covers, lang)))
+            actions.append({
+                "type": "lockdown",
+                "urgency": "low",
+                "message": i18n.message(
+                    "lockdown_nighttime", lang,
+                    honorific=honorific.title(),
+                    body=i18n.join_names(parts, lang),
+                ),
+                "auto_act": True,
+            })
+
+        return actions
+
+    def _residents_away(self) -> bool:
+        """Confident 'the residents are away' — for intrusion only.
+
+        Based on tracked presence (person / device_tracker) or an explicitly
+        armed-away alarm, NEVER on motion/occupancy: intrusion exists to judge
+        motion, so motion cannot also be the signal that says whether anyone is
+        home. Crucially, the ABSENCE of tracking is not 'away' — with no person/
+        device_tracker entities we cannot claim the house is empty, so this returns
+        False and motion is never treated as an intruder. That is what prevents the
+        false "motion … while no one is home" alerts when someone is home but their
+        phone isn't tracked.
+
+        MCU Phase C (C2): the presence/alarm context is read through the kernel
+        WorldModel facade. ``WorldModel.devices(domain=X)`` reads the SAME
+        ``hass.states.async_all(X)`` source and preserves every entity's state
+        verbatim, so the away decision below is behaviour-identical (locked by
+        test_residents_away_worldmodel_parity). Because this is an intrusion-safety
+        read, any facade failure falls back to the raw state sweep so the legacy
+        decision always stands — an empty person/tracker list is a *meaningful*
+        'untracked' signal here, never treated as a facade failure."""
+        try:
+            wm = WorldModel(self.hass)
+            persons = [d["state"] for d in wm.devices(domain="person")]
+            trackers = [d["state"] for d in wm.devices(domain="device_tracker")]
+            alarms = [d["state"] for d in wm.devices(domain="alarm_control_panel")]
+        except Exception:  # noqa: BLE001 — safety read must never raise
+            persons = [st.state for st in self.hass.states.async_all("person")]
+            trackers = [st.state for st in self.hass.states.async_all("device_tracker")]
+            alarms = [st.state for st in self.hass.states.async_all("alarm_control_panel")]
+        # A resident's device/person reading 'home' wins outright.
+        for s in persons:
+            if str(s).lower() == "home":
+                return False
+        for s in trackers:
+            if str(s).lower() == "home":
+                return False
+        # An intentionally armed-away alarm is a strong 'away' signal.
+        for s in alarms:
+            if str(s).lower() in ("armed_away", "armed_vacation"):
+                return True
+        # Otherwise, only 'away' if presence is actually tracked and reads away.
+        tracked = False
+        for s in persons:
+            tracked = True
+        for s in trackers:
+            if str(s).lower() in ("home", "not_home", "away"):
+                tracked = True
+        return tracked
+
+
+# ── Lockdown (v5.9.36) ──────────────────────────────────────────────────────
+
+def build_lockdown_message(honorific: str, locked: list, closed: list,
+                           open_names: list, lang: str = "en") -> str:
+    """
+    Compose the lockdown-engaged announcement. Pure (no I/O) so it's unit-tested.
+
+    Three outcomes are reported distinctly: locks JARVIS locked, closeable
+    openings it closed (garage doors / motorized covers), and openings it can't
+    secure remotely (bare window contacts) — those are named and framed as the
+    gap to close by hand, never a footnote. The message never claims the home is
+    secure while something is open, and never announces a non-event.
+
+    Fully localized (v7.80.0): the composed variants are stitched from localized
+    verb phrases, a localized list join, and per-language wrappers, so a
+    non-English household gets the whole message — including the device list — in
+    their language. Device/area names pass through untranslated.
+    """
+    i18n = _notify_i18n()
+    h = (honorific or "sir").title()
+
+    actions = []
+    if locked:
+        actions.append(i18n.message("lockdown_locked", lang,
+                                    names=i18n.join_names(locked, lang)))
+    if closed:
+        actions.append(i18n.message("lockdown_closed", lang,
+                                    names=i18n.join_names(closed, lang)))
+    did = i18n.join_names(actions, lang)   # localized "locked X and closed Y"
+
+    def gap(names: list) -> str:
+        if len(names) == 1:
+            return i18n.message("lockdown_gap_one", lang,
+                                names=i18n.join_names(names, lang))
+        if len(names) <= 3:
+            return i18n.message("lockdown_gap_few", lang,
+                                names=i18n.join_names(names, lang))
+        return i18n.message("lockdown_gap_many", lang, count=len(names))
+
+    if did and open_names:
+        return i18n.message("lockdown_did_gap", lang, honorific=h, did=did,
+                            gap=gap(open_names))
+    if did:
+        return i18n.message("lockdown_did", lang, honorific=h, did=did)
+    if open_names:
+        return i18n.message("lockdown_gap_only", lang, honorific=h,
+                            gap=gap(open_names))
+    return i18n.message("lockdown_already_secured", lang, honorific=h)
+
+
+class LockdownManager:
+    """
+    Formal lockdown state — engaged when the alarm is armed or on explicit
+    request. On engage it LOCKS every lock and CLOSES every open door/garage
+    cover, and snapshots the windows that are already open so they're IGNORED
+    for the duration (knowingly left open). While active it actively re-secures
+    any door reopened or lock unlocked (a breach), and flags any NEW window that
+    opens (it can't close a window sensor, but it warns). Auto-disengages when
+    the alarm is disarmed — but only if it was the alarm that engaged it; a
+    manually-requested lockdown stays until explicitly lifted.
+    """
+
+    def __init__(self, hass: HomeAssistant, config: dict):
+        self.hass = hass
+        self.config = config
+        self.active = False
+        self.since = 0.0
+        self.reason = ""
+        self.auto = False                 # engaged by the alarm (auto-lift on disarm)
+        self.arm_mode = ""                # last readable armed mode that engaged/held this auto-lockdown
+        self.exempt_windows: set = set()   # openings open at engage / adopted as intentional (doors + windows)
+        self._secured_by_us: set = set()   # entities JARVIS closed/locked this lockdown (reopen ⇒ intentional)
+        self._alerted: set = set()         # entities already alerted about this lockdown
+        self._last_breach_alert = 0.0
+        # When the user manually lifts lockdown while the alarm is still armed,
+        # this suppresses auto re-engage until the alarm is disarmed and re-armed
+        # — so "exit lockdown" from the UI actually keeps you out.
+        self._auto_suppressed = False
+        # Restore across restarts so a pre-existing exempt window (or a manual
+        # exit) isn't lost on a reboot/integration reload.
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            if not os.path.exists(LOCKDOWN_STATE_PATH):
+                return
+            with open(LOCKDOWN_STATE_PATH) as f:
+                d = json.load(f)
+            self._auto_suppressed = bool(d.get("auto_suppressed", False))
+            if d.get("active"):
+                self.active = True
+                self.since = d.get("since", time.time())
+                self.reason = d.get("reason", "restored")
+                self.auto = bool(d.get("auto", False))
+                self.arm_mode = str(d.get("arm_mode", "") or "")
+                self.exempt_windows = set(d.get("exempt_windows", []))
+                _LOGGER.warning(
+                    "Lockdown state RESTORED (auto=%s, %d exempt windows)",
+                    self.auto, len(self.exempt_windows))
+        except Exception as exc:
+            _LOGGER.warning("Lockdown state restore failed: %s", exc)
+
+    def _persist_sync(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(LOCKDOWN_STATE_PATH), exist_ok=True)
+            tmp = LOCKDOWN_STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "active": self.active,
+                    "since": self.since,
+                    "reason": self.reason,
+                    "auto": self.auto,
+                    "arm_mode": self.arm_mode,
+                    "exempt_windows": sorted(self.exempt_windows),
+                    "auto_suppressed": self._auto_suppressed,
+                }, f)
+            os.replace(tmp, LOCKDOWN_STATE_PATH)
+        except Exception as exc:
+            _LOGGER.debug("Lockdown state persist failed: %s", exc)
+
+    async def _persist(self) -> None:
+        try:
+            await self.hass.async_add_executor_job(self._persist_sync)
+        except Exception:
+            pass
+
+    def status(self) -> dict:
+        return {
+            "active": self.active,
+            "since": self.since,
+            "reason": self.reason,
+            "auto": self.auto,
+            "arm_mode": self.arm_mode,
+            "exempt_windows": len(self.exempt_windows),
+        }
+
+    def _alarm_armed(self) -> bool:
+        # MCU Phase C (C2): alarm context read through the WorldModel facade, which
+        # reads the same async_all("alarm_control_panel") source verbatim. Falls
+        # back to the raw sweep on any facade failure (safety read).
+        try:
+            alarms = [d["state"] for d in WorldModel(self.hass).devices(
+                domain="alarm_control_panel")]
+        except Exception:  # noqa: BLE001 — safety read must never raise
+            alarms = [st.state for st in self.hass.states.async_all("alarm_control_panel")]
+        return any(s in ALARM_ARMED_STATES for s in alarms)
+
+    def _anyone_home(self) -> bool:
+        """True if anyone is home — by tracked presence OR live occupancy. Used by
+        lockdown / efficiency checks, where active occupancy legitimately means
+        'someone is home' (these checks are not motion-triggered, so counting
+        occupancy here is safe). Intrusion deliberately does NOT use this — it uses
+        _residents_away, because an intruder's own motion would otherwise mask the
+        alarm.
+
+        MCU Phase C (C2): presence/occupancy context read through the WorldModel
+        facade, which reads the same async_all(domain) sources and preserves each
+        entity's state and attributes verbatim — behaviour-identical. Falls back to
+        the raw sweep on any facade failure (safety-adjacent read)."""
+        try:
+            wm = WorldModel(self.hass)
+            persons = [d["state"] for d in wm.devices(domain="person")]
+            trackers = [d["state"] for d in wm.devices(domain="device_tracker")]
+            bsensors = [(d["state"], d["attributes"].get("device_class"))
+                        for d in wm.devices(domain="binary_sensor")]
+        except Exception:  # noqa: BLE001 — safety-adjacent read must never raise
+            persons = [st.state for st in self.hass.states.async_all("person")]
+            trackers = [st.state for st in self.hass.states.async_all("device_tracker")]
+            bsensors = [(st.state, st.attributes.get("device_class"))
+                        for st in self.hass.states.async_all("binary_sensor")]
+        for s in persons:
+            if str(s).lower() == "home":
+                return True
+        for s in trackers:
+            if str(s).lower() == "home":
+                return True
+        occ_on = ("on", "detected", "occupied", "home", "true")
+        for state, dc in bsensors:
+            if dc in ("occupancy", "motion", "presence") and str(state).lower() in occ_on:
+                return True
+        return False
+
+    # ── opening / secure-state model (doors + windows + locks) ──────────────
+    _DOOR_WINDOW_BS = ("door", "window", "garage_door", "opening")
+    _CLOSEABLE_COVERS = {"door", "garage", "garage_door", "window", "gate"}
+    # Motorized covers JARVIS must NEVER force closed in *reaction* to someone
+    # opening them while lockdown is active: a garage/gate coming down on a
+    # vehicle or a person is a physical-safety hazard, and one that opens
+    # mid-lockdown is overwhelmingly a resident (or their arrival automation),
+    # not an intruder. We alert once and leave it — the security signal is
+    # preserved, the door is not fought. (Closing a *genuinely* open one at
+    # engage, when the house is being armed empty, is still done.)
+    _NO_REACTIVE_CLOSE = {"garage", "garage_door", "gate"}
+    # States that mean "offline / not reported yet": we can neither trust them
+    # as open nor act on them. Cloud garage/lock integrations drop here
+    # routinely — treating `unavailable` as "open" made JARVIS try to "secure"
+    # an already-closed door and then nag that it "couldn't."
+    _INDETERMINATE = ("unavailable", "unknown", "none", "")
+    _COVER_FEATURE_CLOSE = 2   # homeassistant CoverEntityFeature.CLOSE bit
+
+    def _open_openings(self) -> set:
+        """Every door/window currently open right now (sensors + covers)."""
+        out = set()
+        for st in self.hass.states.async_all("binary_sensor"):
+            if st.attributes.get("device_class") in self._DOOR_WINDOW_BS and st.state == "on":
+                out.add(st.entity_id)
+        for st in self.hass.states.async_all("cover"):
+            if st.attributes.get("device_class") in self._CLOSEABLE_COVERS and st.state in ("open", "opening"):
+                out.add(st.entity_id)
+        return out
+
+    def _is_relevant(self, dom: str, dc) -> bool:
+        if dom == "lock":
+            return True
+        if dom == "cover":
+            return dc in self._CLOSEABLE_COVERS
+        if dom == "binary_sensor":
+            return dc in self._DOOR_WINDOW_BS
+        return False
+
+    def _is_indeterminate(self, state) -> bool:
+        """A state we can't act on: the device is offline or hasn't reported.
+        Cloud garage/lock integrations drop to `unavailable`/`unknown` all the
+        time; that is neither "open" nor "secure" — so it must never be treated
+        as a breach and never actuated against."""
+        return str(state).strip().lower() in self._INDETERMINATE
+
+    def _is_secure(self, dom: str, state) -> bool:
+        s = str(state).lower()
+        if dom == "lock":
+            return s == "locked"
+        if dom == "cover":
+            return s in ("closed", "closing")
+        if dom == "binary_sensor":
+            return s in ("off", "closed", "false")     # off ⇒ closed/secure
+        return True
+
+    def _can_secure(self, dom: str, dc, supported_features=None) -> bool:
+        """Can JARVIS actually close/lock this? A bare contact sensor cannot —
+        and neither can a cover that doesn't advertise a CLOSE service (a
+        status-only or one-way opener): trying anyway just yields a no-op close
+        and a false "still open" alert. We only rule a cover out when it
+        *reports* features and CLOSE is absent; a missing/None attribute means
+        "unknown," so we assume closeable and let the verify step catch a
+        genuine failure."""
+        if dom == "lock":
+            return True
+        if dom == "cover":
+            if dc not in self._CLOSEABLE_COVERS:
+                return False
+            if supported_features is not None:
+                try:
+                    return bool(int(supported_features) & self._COVER_FEATURE_CLOSE)
+                except (TypeError, ValueError):
+                    return True
+            return True
+        return False
+
+    async def _secure_entity(self, eid: str, dom: str) -> bool:
+        # Through the SAFETY seam (H8): never budget/loop-blocked, verified, and
+        # fails open to a direct call so a securing action is never withheld.
+        try:
+            from . import actuation
+            if dom == "lock":
+                return await actuation.execute_safety_actuator(
+                    self.hass, capability="lock.lock", entity_id=eid,
+                    domain="lock", service="lock",
+                    data={"entity_id": eid}, action="lock")
+            return await actuation.execute_safety_actuator(
+                self.hass, capability="cover.close_cover", entity_id=eid,
+                domain="cover", service="close_cover",
+                data={"entity_id": eid}, action="close")
+        except Exception as exc:
+            _LOGGER.warning("Lockdown: secure %s failed: %s", eid, exc)
+            return False
+
+    def _friendly(self, eid: str) -> str:
+        """Friendly name for an entity (falls back to its id)."""
+        st = self.hass.states.get(eid)
+        return ((st.attributes.get("friendly_name") if st else None) or eid)
+
+    async def _lock_all(self) -> list:
+        locked = []
+        for st in self.hass.states.async_all("lock"):
+            if st.state == "unlocked":
+                eid = st.entity_id
+                fname = st.attributes.get("friendly_name", eid)
+                try:
+                    from . import actuation
+                    ok = await actuation.execute_safety_actuator(
+                        self.hass, capability="lock.lock", entity_id=eid,
+                        domain="lock", service="lock",
+                        data={"entity_id": eid}, action="lock")
+                    if ok:
+                        locked.append(fname)
+                        _LOGGER.info("Lockdown: locked %s", eid)
+                except Exception as exc:
+                    _LOGGER.warning("Lockdown: failed to lock %s: %s", eid, exc)
+        return locked
+
+    async def engage(self, reason: str, auto: bool = False,
+                     announce: bool = True, arm_mode: str = "") -> Optional[dict]:
+        if self.active:
+            return None
+        self.active = True
+        self.since = time.time()
+        self.reason = reason
+        self.auto = auto
+        # Remember the arming mode that engaged an auto-lockdown (home vs away),
+        # so a later panel dropout holds with the correct mode — the away
+        # false-alarm root fix depends on it. Manual lockdowns carry no mode.
+        self.arm_mode = str(arm_mode or "") if auto else ""
+        self._secured_by_us = set()
+        self._alerted = set()
+        self._last_breach_alert = 0.0
+        honorific = self.config.get("honorific", "sir")
+
+        # 1) Lock every closed-but-unlocked lock.
+        locked = await self._lock_all()
+
+        # 2) Close every open *closeable* opening (garage doors / motorized
+        #    covers). These have safety sensors, so an obstruction simply fails
+        #    the close — the verify step catches that and surfaces it. Bare
+        #    contacts (windows) have no actuator and can't be closed.
+        closed: list = []
+        uncloseable: set = set()
+        for eid in self._open_openings():
+            dom = eid.split(".", 1)[0]
+            st = self.hass.states.get(eid)
+            dc = st.attributes.get("device_class") if st else None
+            sf = st.attributes.get("supported_features") if st else None
+            if self._can_secure(dom, dc, sf):
+                name = self._friendly(eid)
+                if await self._secure_entity(eid, dom):
+                    closed.append(name)
+                    self._secured_by_us.add(eid)
+                    self.hass.async_create_task(self._verify_secured(eid, dom, name))
+                else:
+                    uncloseable.add(eid)   # the close call failed outright
+            else:
+                uncloseable.add(eid)
+
+        # 3) What we can't secure is left as-is and adopted as intentional — the
+        #    user is alerted once here and not nagged afterwards (no action means
+        #    they meant to leave it open).
+        self.exempt_windows = uncloseable
+        open_names = sorted(self._friendly(eid) for eid in uncloseable)
+
+        message = build_lockdown_message(honorific, locked, closed, open_names,
+                                          lang=_hass_lang(self.hass))
+        _LOGGER.warning(
+            "Lockdown ENGAGED (%s): locked=%s closed=%s left-open=%d announce=%s",
+            reason, locked, closed, len(uncloseable), announce)
+        await self._persist()
+        if not announce:
+            return None
+        return {
+            "type": "lockdown_engaged",
+            "urgency": "high",
+            "message": message,
+            "auto_act": True,
+        }
+
+    async def disengage(self, reason: str, manual: bool = False) -> Optional[dict]:
+        if not self.active:
+            return None
+        # If the user manually lifts lockdown while the alarm is still armed,
+        # remember not to auto re-engage until the alarm is disarmed/re-armed.
+        if manual and self._alarm_armed():
+            self._auto_suppressed = True
+        self.active = False
+        self.reason = ""
+        self.auto = False
+        self.arm_mode = ""
+        self.exempt_windows = set()
+        self._secured_by_us = set()
+        self._alerted = set()
+        honorific = self.config.get("honorific", "sir")
+        _LOGGER.warning("Lockdown DISENGAGED (%s, manual=%s, auto_suppressed=%s)",
+                        reason, manual, self._auto_suppressed)
+        await self._persist()
+        return {
+            "type": "lockdown_disengaged",
+            "urgency": "low",
+            "message": _notify_i18n().message(
+                "lockdown_lifted", _hass_lang(self.hass), honorific=honorific.title()),
+            "auto_act": True,
+        }
+
+    async def handle_state_change(self, eid: str, old, new) -> Optional[dict]:
+        """
+        A door/window/lock changed while lockdown is active. Policy:
+          • ignore anything already open at engage (the exempt baseline);
+          • only react to a secure→unsecure transition;
+          • if JARVIS can close/lock it, do so — and if it doesn't take, alert;
+          • if it can't be closed (a bare contact sensor), assume it was opened
+            intentionally and leave it (no nagging);
+          • if something JARVIS closed gets reopened, the user means it — adopt it
+            and say so once.
+        Returns an alert action to announce, or None.
+        """
+        if not self.active or eid in self.exempt_windows:
+            return None
+        dom = eid.split(".", 1)[0]
+        dc = new.attributes.get("device_class")
+        if not self._is_relevant(dom, dc):
+            return None
+        # Offline / not-yet-reported ⇒ we can't tell if it's open and must not
+        # act. A closed garage dropping to `unavailable` is NOT a breach; acting
+        # on it is what produced the "I tried to secure … but it's still open"
+        # spam on already-secure doors.
+        if self._is_indeterminate(new.state):
+            return None
+        if self._is_secure(dom, new.state):
+            return None
+        if old is not None and not self._is_secure(dom, old.state):
+            return None  # was already unsecure — not a fresh transition
+        name = new.attributes.get("friendly_name", eid)
+        honorific = self.config.get("honorific", "sir")
+        sf = new.attributes.get("supported_features")
+
+        if not self._can_secure(dom, dc, sf):
+            # Nothing JARVIS can (or safely should) close — a bare contact
+            # sensor, or a cover with no CLOSE service → assume intentional.
+            self.exempt_windows.add(eid)
+            await self._persist()
+            _LOGGER.info("Lockdown: %s opened (not controllable) — treating as intentional", eid)
+            return None
+
+        if eid in self._secured_by_us:
+            # We shut it once and it's open again → the user wants it open.
+            self._secured_by_us.discard(eid)
+            self.exempt_windows.add(eid)
+            await self._persist()
+            if eid in self._alerted:
+                return None
+            self._alerted.add(eid)
+            return {
+                "type": "lockdown_breach", "urgency": "high", "auto_act": True,
+                "message": f"{honorific.title()}, {name} reopened after I secured it — I'll leave it open.",
+            }
+
+        if dom == "cover" and dc in self._NO_REACTIVE_CLOSE:
+            # A motorized garage/gate that OPENS during lockdown is almost
+            # always a resident or their arrival automation — and bringing one
+            # down on a vehicle or a person is a physical-safety hazard. Never
+            # fight it: note it, alert once, and leave it open. (This is what
+            # was blocking the user and their automation from opening the garage
+            # on arrival home.)
+            self.exempt_windows.add(eid)
+            await self._persist()
+            _LOGGER.info("Lockdown: %s opened — not force-closing a garage/gate (arrival/safety)", eid)
+            if eid in self._alerted:
+                return None
+            self._alerted.add(eid)
+            return {
+                "type": "lockdown_breach", "urgency": "high", "auto_act": True,
+                "message": f"{honorific.title()}, {name} opened during lockdown — I'll leave it, but you should know.",
+            }
+
+        _LOGGER.warning("Lockdown: securing %s after it opened", eid)
+        ok = await self._secure_entity(eid, dom)
+        if ok:
+            self._secured_by_us.add(eid)
+            # Confirm it actually shut (slow covers report late) and alert if not.
+            self.hass.async_create_task(self._verify_secured(eid, dom, name))
+            return None
+        if eid in self._alerted:
+            return None
+        self._alerted.add(eid)
+        return {
+            "type": "lockdown_breach", "urgency": "critical", "auto_act": True,
+            "message": f"{honorific.title()}, {name} opened during lockdown and I couldn't secure it.",
+        }
+
+    async def _verify_secured(self, eid: str, dom: str, name: str) -> None:
+        """After trying to close/lock something, make sure it actually took."""
+        try:
+            await asyncio.sleep(LOCKDOWN_SECURE_VERIFY_DELAY)
+            if not self.active or eid in self.exempt_windows:
+                return
+            st = self.hass.states.get(eid)
+            if st is None or self._is_indeterminate(st.state) or self._is_secure(dom, st.state):
+                return  # secure, offline, or gone — nothing to report
+            if eid in self._alerted:
+                return
+            self._alerted.add(eid)
+            honorific = self.config.get("honorific", "sir")
+            await _emit_action(self.hass, self.config, {
+                "type": "lockdown_breach", "urgency": "critical", "auto_act": True,
+                "message": f"{honorific.title()}, I tried to secure {name} during lockdown but it's still open.",
+            }, False)
+        except Exception as exc:
+            _LOGGER.debug("lockdown secure-verify error: %s", exc)
+
+    async def tick(self) -> list[dict]:
+        """Alarm-driven auto engage/disengage. Breach enforcement is event-driven
+        (handle_state_change), so it isn't repeated here."""
+        actions = []
+        armed = self._alarm_armed()
+        auto_on_arm = self.config.get("lockdown_auto_on_arm", True)
+
+        # Clear a manual-exit suppression once the alarm is disarmed again.
+        if not armed and self._auto_suppressed:
+            self._auto_suppressed = False
+            await self._persist()
+
+        if auto_on_arm and armed and not self.active and not self._auto_suppressed:
+            a = await self.engage("alarm armed", auto=True)
+            if a:
+                actions.append(a)
+        elif self.active and self.auto and not armed:
+            a = await self.disengage("alarm disarmed")
+            if a:
+                actions.append(a)
+        return actions
+
+
+# ── Proactive Intelligence (v5.9.07) ────────────────────────────────────────
+
+class ProactiveManager:
+    """
+    Pursues comfort & efficiency opportunities — not just safety.
+
+    Where SafetyManager prevents harm, ProactiveManager reduces friction:
+    it notices when a small action would help (dark room with someone in it,
+    a light left on in an empty room, HVAC fighting an empty house) and
+    OFFERS to act. It never forces — offers are spoken/pushed suggestions the
+    user can accept by voice. Graduated autonomy (see AutonomyManager) can
+    later promote a repeatedly-approved offer to silent auto-execution.
+
+    All offers respect: the global proactive kill-switch, quiet hours/sleep,
+    ignore rules, and a per-opportunity cooldown so JARVIS never nags.
+    """
+
+    def __init__(self, hass: HomeAssistant, config: dict):
+        self.hass = hass
+        self.config = config
+        self._last_check = 0.0
+        self._offer_cooldowns: dict[str, float] = {}  # opportunity_key -> ts
+
+    def _on_cooldown(self, key: str) -> bool:
+        last = self._offer_cooldowns.get(key, 0.0)
+        return (time.time() - last) < PROACTIVE_OFFER_COOLDOWN
+
+    def _mark_offered(self, key: str) -> None:
+        self._offer_cooldowns[key] = time.time()
+
+    async def tick(self, sleeping: bool, anyone_home: bool) -> list[dict]:
+        """
+        Evaluate comfort/efficiency opportunities. Returns a list of offer
+        actions (same dict shape SafetyManager uses, with offer=True).
+        """
+        now = time.time()
+        if (now - self._last_check) < PROACTIVE_CHECK_INTERVAL:
+            return []
+        self._last_check = now
+
+        # Proactive offers are silent during sleep — comfort can wait.
+        if sleeping:
+            return []
+
+        offers: list[dict] = []
+
+        try:
+            dark = await self._check_dark_occupied_room(anyone_home)
+            if dark:
+                offers.append(dark)
+        except Exception as exc:
+            _LOGGER.debug("Proactive dark-room check error: %s", exc)
+
+        try:
+            stale = await self._check_stale_lights(anyone_home)
+            if stale:
+                offers.append(stale)
+        except Exception as exc:
+            _LOGGER.debug("Proactive stale-light check error: %s", exc)
+
+        try:
+            hvac = await self._check_hvac_efficiency(anyone_home)
+            if hvac:
+                offers.append(hvac)
+        except Exception as exc:
+            _LOGGER.debug("Proactive HVAC check error: %s", exc)
+
+        return offers
+
+    async def _check_dark_occupied_room(self, anyone_home: bool) -> Optional[dict]:
+        """Someone present in a room that's dark and has lights off → offer."""
+        if not anyone_home:
+            return None
+        from homeassistant.helpers import entity_registry as er
+        ent_reg = er.async_get(self.hass)
+
+        # Find lux sensors that read dark
+        for s in self.hass.states.async_all("sensor"):
+            if s.attributes.get("device_class") != "illuminance":
+                continue
+            try:
+                lux = float(s.state)
+            except (ValueError, TypeError):
+                continue
+            if lux > DARK_LUX_THRESHOLD:
+                continue
+
+            # Determine the area of this sensor
+            entry = ent_reg.async_get(s.entity_id)
+            area_id = entry.area_id if entry else None
+            if not area_id:
+                continue
+
+            # Is there occupancy (motion/presence) in this area?
+            occupied = self._area_has_presence(area_id, ent_reg)
+            if not occupied:
+                continue
+
+            # Are the lights in this area already off?
+            lights = self._area_lights(area_id, ent_reg)
+            if not lights:
+                continue
+            if any(self.hass.states.get(l).state == "on" for l in lights if self.hass.states.get(l)):
+                continue  # already lit
+
+            key = f"dark:{area_id}"
+            if self._on_cooldown(key):
+                return None
+            # Cooldown is marked by the tick only when this offer is actually
+            # delivered (see _tick), so deferred offers re-surface naturally.
+
+            honorific = self.config.get("honorific", "sir")
+            area_name = self._area_name(area_id)
+            return {
+                "type": "proactive_lights",
+                "urgency": "low",
+                "offer": True,
+                "offer_key": key,
+                "message": (
+                    f"{honorific.title()}, it's quite dark in the {area_name} "
+                    f"and someone's in there. Shall I turn the lights on?"
+                ),
+                "action_data": {"domain": "light", "service": "turn_on",
+                                "entity_ids": lights},
+                "pattern_key": f"lights_on_when_dark:{area_id}",
+            }
+        return None
+
+    async def _check_stale_lights(self, anyone_home: bool) -> Optional[dict]:
+        """Light on a long time in an unoccupied area → offer to turn off."""
+        from homeassistant.helpers import entity_registry as er
+        ent_reg = er.async_get(self.hass)
+        now = dt_util.utcnow()
+
+        for s in self.hass.states.async_all("light"):
+            if s.state != "on":
+                continue
+            # How long has it been on?
+            last_changed = s.last_changed
+            if not last_changed:
+                continue
+            mins_on = (now - last_changed).total_seconds() / 60.0
+            if mins_on < STALE_LIGHT_MINUTES:
+                continue
+
+            entry = ent_reg.async_get(s.entity_id)
+            area_id = entry.area_id if entry else None
+            if not area_id:
+                continue
+
+            # Only flag if the area has NO presence
+            if self._area_has_presence(area_id, ent_reg):
+                continue
+
+            key = f"stale:{s.entity_id}"
+            if self._on_cooldown(key):
+                return None
+
+            honorific = self.config.get("honorific", "sir")
+            name = s.attributes.get("friendly_name", s.entity_id)
+            area_name = self._area_name(area_id)
+            return {
+                "type": "proactive_stale_light",
+                "urgency": "low",
+                "offer": True,
+                "offer_key": key,
+                "message": (
+                    f"{honorific.title()}, the {name} has been on for "
+                    f"{int(mins_on)} minutes in the {area_name}, which appears "
+                    f"empty. Shall I turn it off?"
+                ),
+                "action_data": {"domain": "light", "service": "turn_off",
+                                "entity_ids": [s.entity_id]},
+                "pattern_key": f"lights_off_when_empty:{area_id}",
+            }
+        return None
+
+    async def _check_hvac_efficiency(self, anyone_home: bool) -> Optional[dict]:
+        """Climate actively heating/cooling while the house is empty → flag."""
+        if anyone_home:
+            return None
+        for s in self.hass.states.async_all("climate"):
+            action = s.attributes.get("hvac_action")
+            if action not in ("heating", "cooling"):
+                continue
+
+            key = f"hvac:{s.entity_id}"
+            if self._on_cooldown(key):
+                return None
+
+            honorific = self.config.get("honorific", "sir")
+            name = s.attributes.get("friendly_name", s.entity_id)
+            return {
+                "type": "proactive_hvac",
+                "urgency": "low",
+                "offer": True,
+                "offer_key": key,
+                "message": (
+                    f"{honorific.title()}, the {name} is {action} but no one's "
+                    f"home. Would you like me to set it back to save energy?"
+                ),
+                "action_data": {"domain": "climate", "service": "set_preset_mode",
+                                "entity_ids": [s.entity_id],
+                                "service_data": {"preset_mode": "eco"}},
+                "pattern_key": "hvac_eco_when_away",
+            }
+        return None
+
+    # ── Area helpers ─────────────────────────────────────────────────
+    def _area_has_presence(self, area_id: str, ent_reg) -> bool:
+        """True if any motion/occupancy/presence sensor in the area is active."""
+        for s in self.hass.states.async_all("binary_sensor"):
+            dc = s.attributes.get("device_class")
+            if dc not in ("motion", "occupancy", "presence"):
+                continue
+            entry = ent_reg.async_get(s.entity_id)
+            if entry and entry.area_id == area_id and s.state == "on":
+                return True
+        return False
+
+    def _area_lights(self, area_id: str, ent_reg) -> list[str]:
+        """All light entity_ids in the given area."""
+        out = []
+        for s in self.hass.states.async_all("light"):
+            entry = ent_reg.async_get(s.entity_id)
+            if entry and entry.area_id == area_id:
+                out.append(s.entity_id)
+        return out
+
+    def _area_name(self, area_id: str) -> str:
+        try:
+            from homeassistant.helpers import area_registry as ar
+            reg = ar.async_get(self.hass)
+            area = reg.async_get_area(area_id)
+            return area.name if area else area_id
+        except Exception:
+            return area_id
+
+
+# ── Graduated Autonomy (v5.9.07) ────────────────────────────────────────────
+
+# Phase N — kernel.autonomy ENFORCE (owner-gated, opt-in via the panel's
+# confirmation screen → `autonomy_enforce`). When on, JARVIS's graduated-autonomy
+# auto-execute gate is governed by the kernel autonomy ladder's hard ceiling: a
+# granted pattern whose capability is SECURITY-class (unlock, disarm, lockdown
+# off) NEVER auto-acts — it always falls back to asking — no matter how often it
+# was approved. Default OFF (behaviour-preserving); fail-safe — any error leaves
+# the legacy gate (grant + mode flag) untouched. Safety (intrusion / freeze /
+# lockdown) never routes through this gate in the first place.
+GRADUATED_AUTONOMY_ENFORCE = False
+
+# Proactive-pattern key prefix → the kernel capability it actuates, for the
+# kernel risk-class lookup. Unknown prefixes fail safe (treated as non-security;
+# the per-pattern grant + mode flag still gate).
+_PATTERN_CAPABILITY = {
+    "lights_on_when_dark": "light",
+    "lights_off_when_empty": "light",
+    "hvac_eco_when_away": "climate",
+}
+
+
+def _graduated_autonomy_enforce_on() -> bool:
+    """True when the household has opted into kernel-governed autonomy
+    (`GRADUATED_AUTONOMY_ENFORCE` or the `autonomy_enforce` config key, the latter
+    written only after the panel's confirmation screen). Never raises."""
+    if GRADUATED_AUTONOMY_ENFORCE:
+        return True
+    try:
+        from . import jarvis_config
+        return bool(jarvis_config.get("autonomy_enforce", False))
+    except Exception:
+        return False
+
+
+# Phase AC — Advanced Autonomy (dynamic / contextual). Layers a CONTEXTUAL cap on
+# top of the earned per-capability level and the N ceiling: a restrictive context
+# (a non-resident in the home) tightens an otherwise-autonomous convenience action
+# to ask-first. Downward-only and safe-directional — it can only ever make JARVIS
+# more cautious, never free it, and never loosens the N gate (which runs first).
+# Owner-gated, DEFAULT-OFF (behaviour-preserving), kill-switched, fail-safe.
+CONTEXTUAL_AUTONOMY_ENFORCE = False
+
+
+def _contextual_autonomy_enforce_on() -> bool:
+    """True when the household has opted into contextual-autonomy tightening
+    (`CONTEXTUAL_AUTONOMY_ENFORCE` or the `contextual_autonomy_enforce` config
+    key). Never raises."""
+    if CONTEXTUAL_AUTONOMY_ENFORCE:
+        return True
+    try:
+        from . import jarvis_config
+        return bool(jarvis_config.get("contextual_autonomy_enforce", False))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+# Phase M→N — learned-trust autonomy damper. The closed learning loop
+# (actuation.LEARNING_ENFORCE, 9.2.0) persists a per-capability trust from real
+# verified outcomes; this is its first *consumer*. A granted convenience pattern
+# whose capability has a PROVEN poor track record — learned trust below a floor,
+# over enough evidence — falls back to asking instead of auto-acting. Bounded and
+# explainable: a fixed floor + a minimum-evidence gate, the decision logged with
+# its trust/sample numbers. Downward-only and safe-directional: it can only ever
+# withhold auto-action, never grant it; it runs AFTER the Phase N security ceiling
+# and the AC context gate, and safety events never route through is_autonomous at
+# all — so learning can never override authority or safety. Owner-gated,
+# DEFAULT-OFF (behaviour-preserving; shadow-logs the would-be decision regardless),
+# kill-switched, and fail-safe (any fault, or too little evidence, → act as today).
+# Recovery is automatic: the outcomes window is bounded, so stale failures age out
+# and trust climbs back as the loop sees fresh successes.
+AUTONOMY_TRUST_DAMPER = False
+AUTONOMY_TRUST_FLOOR = 0.35        # below this learned trust → damp (if enough evidence)
+AUTONOMY_TRUST_MIN_SAMPLES = 5     # min recent outcomes before trust may damp at all
+
+
+def _autonomy_trust_damper_on() -> bool:
+    """True when the household has opted into the learned-trust damper
+    (`AUTONOMY_TRUST_DAMPER` or the `autonomy_trust_damper` config key). Never
+    raises."""
+    if AUTONOMY_TRUST_DAMPER:
+        return True
+    try:
+        from . import jarvis_config
+        return bool(jarvis_config.get("autonomy_trust_damper", False))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _trust_damp_decision(pattern_key: str) -> tuple[bool, str]:
+    """Return ``(should_damp, reason)`` for the learned-trust damper. ``reason`` is
+    '' when the pattern has no derivable capability (nothing to judge). Pure read
+    of the persisted learned trust; never raises. Does not consult the enforce
+    flag — the caller shadow-logs the reason and only acts on ``should_damp`` when
+    the damper is switched on."""
+    cap = _PATTERN_CAPABILITY.get(str(pattern_key or "").split(":")[0])
+    if not cap:
+        return (False, "")
+    try:
+        from . import actuation
+        trust, samples = actuation.capability_reliability(cap)
+    except Exception:  # pragma: no cover - defensive
+        return (False, "")
+    if samples < AUTONOMY_TRUST_MIN_SAMPLES:
+        return (False, f"capability={cap} trust={trust:.2f} samples={samples} "
+                       f"(<{AUTONOMY_TRUST_MIN_SAMPLES} evidence → no damp)")
+    damp = trust < AUTONOMY_TRUST_FLOOR
+    return (damp, f"capability={cap} trust={trust:.2f} samples={samples} "
+                  f"floor={AUTONOMY_TRUST_FLOOR:.2f} → {'DAMP' if damp else 'ok'}")
+
+
+# Phase N enforce — EARNED graduation: the "replace the blanket flag with the
+# earned level" rung the kernel plan held for the owner. Atop the security ceiling
+# (above), a granted convenience pattern whose non-safety capability has NOT yet
+# EARNED the top autonomy rung (ACT) from its verified track record falls back to
+# asking — trust is earned per capability, not granted blanket by the mode flag.
+# The earned level comes from the SAME rolling outcome window as the Phase N
+# shadow/parity emit (actuation.capability_earned_grant → kernel.autonomy.grant).
+# Downward-only and safe-directional: it can only ever WITHHOLD auto-action, never
+# grant it. SAFE capabilities stay pinned at ACT (reads always act) and SECURITY is
+# already withheld by the ceiling above — so this bites SENSITIVE actuation that
+# has not proven itself. It is its OWN switch, independent of the security-ceiling
+# `autonomy_enforce`, so enabling it never changes what an already-opted-in
+# household's existing gate does. Owner-gated, DEFAULT-OFF (behaviour-preserving;
+# shadow-logs the would-be decision regardless), kill-switched, and fail-safe (no
+# derivable capability / any fault → act as today). Recovery is automatic: the
+# outcome window is bounded, so a capability climbs to ACT as the loop sees enough
+# clean verified outcomes, and demotes if its record lapses.
+AUTONOMY_EARNED_ENFORCE = False
+
+
+def _autonomy_earned_enforce_on() -> bool:
+    """True when the household has opted into earned-level graduated autonomy
+    (`AUTONOMY_EARNED_ENFORCE` or the `autonomy_earned_enforce` config key). Never
+    raises."""
+    if AUTONOMY_EARNED_ENFORCE:
+        return True
+    try:
+        from . import jarvis_config
+        return bool(jarvis_config.get("autonomy_earned_enforce", False))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _earned_autonomy_decision(pattern_key: str) -> tuple[bool, str]:
+    """Return ``(should_withhold, reason)`` for the earned-graduation gate. A
+    granted pattern whose capability is non-safety and has NOT earned ACT (its
+    verified record is thin or mediocre) is withheld — it asks instead. ``reason``
+    is '' when the pattern has no derivable capability (nothing to judge). Pure
+    read of the capability's earned grant; never raises; does not consult the
+    enforce flag (the caller gates on it), so the would-be decision can be
+    shadow-logged regardless of whether the flip is on."""
+    cap = _PATTERN_CAPABILITY.get(str(pattern_key or "").split(":")[0])
+    if not cap:
+        return (False, "")
+    try:
+        from . import actuation
+        g = actuation.capability_earned_grant(cap)
+    except Exception:  # pragma: no cover - defensive
+        return (False, "")
+    if g is None:
+        return (False, "")
+    if getattr(g, "pinned", False):
+        # SAFE (may_act True) always acts; SECURITY (may_act False) is already
+        # withheld by the ceiling gate. Pinned classes do not graduate.
+        return (False, f"capability={cap} risk={g.risk} pinned at {g.level}")
+    withhold = not g.may_act
+    return (withhold, f"capability={cap} risk={g.risk} level={g.level} "
+                      f"(n={g.samples}, rate={g.success_rate:.2f}) → "
+                      f"{'ASK (not yet earned ACT)' if withhold else 'act'}")
+
+
+def _guests_present(hass) -> bool:
+    """True when a recently-recognised face is a NON-resident — a named visitor,
+    or a name the roster does not know as a resident — i.e. a guest is in the
+    home. Best-effort; any error (or no recognitions) → False, so contextual
+    tightening only ever engages on a positive guest signal (fail-safe)."""
+    try:
+        from . import recognition, face_roster
+        for name in (recognition.who_is_where(hass) or {}).values():
+            if not name:
+                continue
+            if recognition._is_unknown(name) or not face_roster.is_resident(name):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _pattern_is_security(pattern_key: str) -> bool:
+    """True when a proactive pattern's capability is SECURITY-class per the kernel
+    (it must never auto-act). Fail-safe: an unknown / underivable capability
+    returns False, so the legacy grant + mode flag still gate it. Never raises."""
+    try:
+        cap = _PATTERN_CAPABILITY.get(str(pattern_key or "").split(":")[0])
+        if not cap:
+            return False
+        from .kernel import autonomy
+        # A SECURITY-class capability is pinned at CONFIRM by the kernel autonomy
+        # ladder — pinned with may_act False, regardless of track record — so it
+        # can never auto-act. (SAFE is pinned at ACT: pinned but may_act True.)
+        g = autonomy.grant(cap)
+        return bool(g.pinned and not g.may_act)
+    except Exception:
+        return False
+
+
+class AutonomyManager:
+    """
+    Tracks which proactive offers the user trusts JARVIS to perform alone.
+
+    Graduated trust model:
+      Tier 0 (default) — JARVIS OFFERS; user must accept each time.
+      Tier 1 (trusted) — after the user accepts the same offer
+                         AUTONOMY_TRUST_THRESHOLD times, JARVIS may perform
+                         it silently (still logs it; user can revoke).
+
+    A "pattern_key" identifies the kind of action (e.g.
+    'lights_on_when_dark:living_room'). Each acceptance increments a counter;
+    once it crosses the threshold the key is granted autonomy. Revoking
+    resets it to Tier 0. Grants persist across restarts.
+    """
+
+    def __init__(self):
+        self._grants: dict[str, dict] = {}  # pattern_key -> {approvals,granted,...}
+        self._async_lock = asyncio.Lock()
+        self._sync_lock = __import__("threading").RLock()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if os.path.exists(AUTONOMY_FILE):
+                with open(AUTONOMY_FILE, "r", encoding="utf-8") as f:
+                    self._grants = json.load(f) or {}
+        except Exception as exc:
+            _LOGGER.warning("Autonomy grants load failed: %s", exc)
+            self._grants = {}
+
+    @staticmethod
+    def _save_snapshot(grants: dict[str, dict]) -> None:
+        try:
+            directory = os.path.dirname(AUTONOMY_FILE) or "."
+            os.makedirs(directory, exist_ok=True)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=directory, prefix=".autonomy_", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(grants, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, AUTONOMY_FILE)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            _LOGGER.warning("Autonomy grants save failed: %s", exc)
+
+    def _save(self) -> None:
+        with self._sync_lock:
+            self._save_snapshot(self._grants)
+
+    async def _async_save(self, hass) -> None:
+        snapshot = {key: dict(value) for key, value in self._grants.items()}
+        await hass.async_add_executor_job(self._save_snapshot, snapshot)
+
+    def record_acceptance(self, pattern_key: str, confidence: float = 1.0,
+                          *, persist: bool = True) -> dict:
+        """
+        User accepted an offer. Increment its trust counter; may promote to
+        autonomous. Returns the updated grant record.
+        """
+        with self._sync_lock:
+            if not pattern_key:
+                return {}
+            g = self._grants.get(pattern_key, {
+                "approvals": 0, "granted": False, "confidence": confidence,
+                "first_seen": dt_util.utcnow().isoformat(),
+            })
+            g["approvals"] = g.get("approvals", 0) + 1
+            g["confidence"] = max(g.get("confidence", 0.0), confidence)
+            g["last_accepted"] = dt_util.utcnow().isoformat()
+            if (not g["granted"]
+                    and g["approvals"] >= AUTONOMY_TRUST_THRESHOLD
+                    and g["confidence"] >= AUTONOMY_MIN_CONFIDENCE):
+                g["granted"] = True
+                g["granted_at"] = dt_util.utcnow().isoformat()
+                _LOGGER.info(
+                    "Autonomy GRANTED for '%s' after %d acceptances",
+                    pattern_key, g["approvals"],
+                )
+            self._grants[pattern_key] = g
+            if persist:
+                self._save_snapshot(self._grants)
+            return g
+
+    async def async_record_acceptance(self, hass, pattern_key: str,
+                                      confidence: float = 1.0) -> dict:
+        async with self._async_lock:
+            grant = self.record_acceptance(pattern_key, confidence, persist=False)
+            save_task = asyncio.create_task(self._async_save(hass))
+            try:
+                await asyncio.shield(save_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(save_task)
+                raise
+            return grant
+
+    def record_rejection(self, pattern_key: str, *, persist: bool = True) -> None:
+        """User declined an offer — reset trust toward this pattern."""
+        with self._sync_lock:
+            if pattern_key in self._grants:
+                self._grants[pattern_key]["approvals"] = 0
+                self._grants[pattern_key]["granted"] = False
+                self._grants[pattern_key]["last_rejected"] = dt_util.utcnow().isoformat()
+                if persist:
+                    self._save_snapshot(self._grants)
+
+    async def async_record_rejection(self, hass, pattern_key: str) -> None:
+        async with self._async_lock:
+            self.record_rejection(pattern_key, persist=False)
+            save_task = asyncio.create_task(self._async_save(hass))
+            try:
+                await asyncio.shield(save_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(save_task)
+                raise
+
+    def is_autonomous(self, pattern_key: str, *, context=None) -> bool:
+        """True if JARVIS may perform this convenience action without asking.
+        The active operational mode can suppress convenience auto-actions
+        (party/movie/lab) — this only affects graduated convenience patterns;
+        safety events never route through here, so they act regardless of mode.
+
+        Phase N enforce (opt-in): when the household has explicitly enabled
+        kernel-governed autonomy (`autonomy_enforce`, confirmed in the panel), a
+        granted pattern whose capability is SECURITY-class never auto-acts — the
+        kernel autonomy ladder's hard ceiling — and always falls back to asking.
+
+        Phase N enforce (opt-in): atop the security ceiling, when earned-level
+        graduated autonomy is enabled (`autonomy_earned_enforce`), a granted
+        pattern whose non-safety capability has not yet EARNED the top rung (ACT)
+        from its verified track record falls back to asking — trust is earned per
+        capability, not blanket. Independent of the security-ceiling switch.
+
+        Phase AC enforce (opt-in): atop the N ceiling, a restrictive ``context``
+        (``kernel.autonomy.AutonomyContext`` — e.g. a guest in the home) tightens
+        an otherwise-autonomous convenience action to ask-first. Downward-only: it
+        can only withhold, never grant, and never loosens the N gate above. Both
+        default OFF (behaviour-preserving) and fail-safe to acting as today."""
+        g = self._grants.get(pattern_key)
+        if not (g and g.get("granted")):
+            return False
+        try:
+            from . import modes
+            if not modes.mode_allows_auto_actions():
+                return False
+        except Exception:
+            pass
+        if _graduated_autonomy_enforce_on() and _pattern_is_security(pattern_key):
+            return False
+        # Phase N enforce (opt-in) — EARNED graduation atop the security ceiling: a
+        # non-safety capability auto-acts only once its verified record has earned
+        # ACT; until then JARVIS asks. Its own switch; shadow-logs the would-be
+        # decision regardless. Downward-only, runs before the AC/trust gates, and
+        # fail-safe (any fault → act as today).
+        try:
+            withhold, reason = _earned_autonomy_decision(pattern_key)
+            if reason:
+                _LOGGER.debug("autonomy(earned-shadow): %s pattern=%s",
+                              reason, pattern_key)
+            if withhold and _autonomy_earned_enforce_on():
+                _LOGGER.info("autonomy(earned): withholding auto-action — %s "
+                             "pattern=%s", reason, pattern_key)
+                return False
+        except Exception:  # pragma: no cover - defensive, never block on the gate
+            pass
+        if context is not None and _contextual_autonomy_enforce_on():
+            try:
+                from .kernel import autonomy as _auto
+                if _auto.context_blocks_autonomy(context):
+                    return False
+            except Exception:
+                pass
+        # Phase M→N learned-trust damper (owner-gated, default OFF; shadow-logs
+        # always). Downward-only: withholds auto-action from a capability with a
+        # proven poor track record, never grants. Fail-safe — any fault acts as
+        # today. Runs last, so it can only tighten what the gates above allowed.
+        try:
+            damp, reason = _trust_damp_decision(pattern_key)
+            if reason:
+                _LOGGER.debug("autonomy(trust-shadow): %s pattern=%s",
+                              reason, pattern_key)
+            if damp and _autonomy_trust_damper_on():
+                _LOGGER.info("autonomy(trust): withholding auto-action — %s "
+                             "pattern=%s", reason, pattern_key)
+                return False
+        except Exception:  # pragma: no cover - defensive, never block on the damper
+            pass
+        return True
+
+    def revoke(self, pattern_key: str, *, persist: bool = True) -> bool:
+        """Manually revoke autonomy for a pattern (back to offer-only)."""
+        if pattern_key in self._grants:
+            self._grants[pattern_key]["granted"] = False
+            self._grants[pattern_key]["approvals"] = 0
+            self._grants[pattern_key]["revoked_at"] = dt_util.utcnow().isoformat()
+            if persist:
+                self._save()
+            return True
+        return False
+
+    async def async_revoke(self, hass, pattern_key: str) -> bool:
+        async with self._async_lock:
+            changed = self.revoke(pattern_key, persist=False)
+            if changed:
+                save_task = asyncio.create_task(self._async_save(hass))
+                try:
+                    await asyncio.shield(save_task)
+                except asyncio.CancelledError:
+                    await asyncio.shield(save_task)
+                    raise
+            return changed
+
+    def list_grants(self) -> list[dict]:
+        """All tracked patterns with their trust state."""
+        out = []
+        for key, g in self._grants.items():
+            out.append({
+                "pattern_key": key,
+                "approvals": g.get("approvals", 0),
+                "granted": g.get("granted", False),
+                "threshold": AUTONOMY_TRUST_THRESHOLD,
+                "confidence": round(g.get("confidence", 0.0), 2),
+            })
+        return out
+
+
+# ── State Change Logger ─────────────────────────────────────────────────────
+
+class StateLogger:
+    """Logs meaningful state changes for pattern learning."""
+
+    def __init__(self, db_path=None):
+        self._last_states: dict[str, str] = {}
+        self._db_path = db_path or config_path_str("jarvis", "patterns.db")
+        self._init_db()
+
+    def _init_db(self):
+        import sqlite3
+        from pathlib import Path
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS state_changes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        entity_id TEXT NOT NULL,
+                        domain TEXT NOT NULL,
+                        old_state TEXT,
+                        new_state TEXT NOT NULL,
+                        area_id TEXT,
+                        hour INTEGER,
+                        day_of_week INTEGER,
+                        triggered_by TEXT DEFAULT 'system',
+                        person TEXT DEFAULT 'unknown',
+                        person_confidence REAL DEFAULT 0.0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_sc_entity
+                        ON state_changes(entity_id);
+                    CREATE INDEX IF NOT EXISTS idx_sc_ts
+                        ON state_changes(timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_sc_hour_dow
+                        ON state_changes(hour, day_of_week);
+
+                    CREATE TABLE IF NOT EXISTS commands (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        handled_by TEXT DEFAULT 'agent',
+                        entity_ids TEXT DEFAULT '[]',
+                        person TEXT DEFAULT 'unknown',
+                        hour INTEGER,
+                        day_of_week INTEGER
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_cmd_ts
+                        ON commands(timestamp);
+
+                    CREATE TABLE IF NOT EXISTS suggestions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        automation_yaml TEXT,
+                        status TEXT DEFAULT 'pending',
+                        confidence REAL DEFAULT 0.0,
+                        pattern_count INTEGER DEFAULT 0,
+                        approved_at TEXT,
+                        dismissed_at TEXT,
+                        pattern_type TEXT DEFAULT '',
+                        entity_ids TEXT DEFAULT '',
+                        details TEXT DEFAULT '{}'
+                    );
+
+                    CREATE TABLE IF NOT EXISTS person_patterns (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        person TEXT NOT NULL,
+                        pattern_type TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        data TEXT DEFAULT '{}',
+                        confidence REAL DEFAULT 0.0,
+                        last_seen TEXT,
+                        occurrences INTEGER DEFAULT 1
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pp_person
+                        ON person_patterns(person);
+                """)
+                # v6.41.0: state_changes predates the person column — the
+                # CREATE TABLE IF NOT EXISTS above only helps fresh DBs.
+                # Existing installs need an explicit migration.
+                cols = {row[1] for row in
+                        conn.execute("PRAGMA table_info(state_changes)")}
+                if "person" not in cols:
+                    conn.execute(
+                        "ALTER TABLE state_changes "
+                        "ADD COLUMN person TEXT DEFAULT 'unknown'")
+                    conn.commit()
+                    _LOGGER.info("Pattern DB: migrated state_changes.person")
+                # v6.77.0: store HOW SURE we are of the attribution, so the
+                # analyzer can use probable matches instead of discarding
+                # everything that isn't certain.
+                if "person_confidence" not in cols:
+                    conn.execute("ALTER TABLE state_changes "
+                                 "ADD COLUMN person_confidence REAL DEFAULT 0.0")
+                    conn.commit()
+                    _LOGGER.info("Pattern DB: migrated state_changes.person_confidence")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sc_person "
+                    "ON state_changes(person)")
+                conn.commit()
+                # v6.80.0: carry the EVIDENCE behind a suggestion through to the
+                # panel — which pattern, which entities, and the observation
+                # details — so reviewing a suggestion shows *why*, not just what.
+                scols = {row[1] for row in
+                         conn.execute("PRAGMA table_info(suggestions)")}
+                for col, ddl in (("pattern_type", "TEXT DEFAULT ''"),
+                                 ("entity_ids", "TEXT DEFAULT ''"),
+                                 ("details", "TEXT DEFAULT '{}'")):
+                    if col not in scols:
+                        conn.execute(f"ALTER TABLE suggestions ADD COLUMN {col} {ddl}")
+                        conn.commit()
+                        _LOGGER.info("Pattern DB: migrated suggestions.%s", col)
+        except Exception as exc:
+            _LOGGER.warning("Pattern DB init failed: %s", exc)
+
+    def log_state_change(self, entity_id: str, old_state: str,
+                          new_state: str, area_id: str = "",
+                          triggered_by: str = "system",
+                          person: str = "unknown",
+                          person_confidence: float = 0.0,
+                          force_include: bool = False):
+        """Record a state change for pattern analysis."""
+        import sqlite3
+        domain = entity_id.split(".")[0]
+        if domain in ("automation", "script", "input_boolean", "input_number"):
+            return  # Meta entities, not useful for patterns
+        # scene is deliberately NOT skipped: a scene activation is a real,
+        # low-volume action worth learning as the target of "button → scene".
+
+        # Noisy domains are skipped for pattern learning UNLESS the user opted
+        # this entity/group in (e.g. garage door contacts, presence) — v7.11.0.
+        if not force_include and domain in ("sensor", "binary_sensor", "weather",
+                                            "sun", "update", "device_tracker",
+                                            "event"):
+            return  # Too noisy for pattern learning
+
+        now = _jh_tz_now()
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                conn.execute(
+                    "INSERT INTO state_changes "
+                    "(timestamp, entity_id, domain, old_state, new_state, "
+                    "area_id, hour, day_of_week, triggered_by, person, "
+                    "person_confidence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (now.isoformat(), entity_id, domain, old_state,
+                     new_state, area_id, now.hour, now.weekday(),
+                     triggered_by, person, float(person_confidence or 0.0)),
+                )
+        except Exception:
+            pass
+
+    def log_command(self, text: str, handled_by: str = "agent",
+                     entity_ids: list = None, person: str = "unknown"):
+        """Record a voice/text command for pattern analysis."""
+        import sqlite3
+        now = _jh_tz_now()
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                conn.execute(
+                    "INSERT INTO commands "
+                    "(timestamp, text, handled_by, entity_ids, person, "
+                    "hour, day_of_week) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (now.isoformat(), text, handled_by,
+                     json.dumps(entity_ids or []), person,
+                     now.hour, now.weekday()),
+                )
+        except Exception:
+            pass
+
+    def prune_old(self, days: int) -> int:
+        """Delete raw observation rows (``state_changes``, ``commands``) older than
+        ``days`` and VACUUM to reclaim disk, bounding patterns.db growth
+        (issue #491 — uncontrolled DB growth). The pattern miner only looks back a
+        week or two, so this never starves learning. ``days`` <= 0 is a no-op
+        (keep forever). Returns rows deleted; never raises into the caller."""
+        import sqlite3
+        try:
+            d = int(days)
+        except (TypeError, ValueError):
+            return 0
+        if d <= 0:
+            return 0                              # 0/negative = retain everything
+        cutoff = (_jh_tz_now() - timedelta(days=d)).isoformat()
+        deleted = 0
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                for tbl in ("state_changes", "commands"):
+                    try:
+                        cur = conn.execute(
+                            f"DELETE FROM {tbl} WHERE timestamp < ?", (cutoff,))
+                        deleted += cur.rowcount or 0
+                    except Exception:
+                        continue                 # table may not exist yet
+                conn.commit()
+            if deleted:
+                # VACUUM reclaims the freed pages (a plain DELETE leaves the file
+                # the same size); it must run outside a transaction.
+                try:
+                    with sqlite3.connect(self._db_path, isolation_level=None,
+                                         factory=ClosingConnection) as vac:
+                        vac.execute("VACUUM")
+                except Exception:
+                    pass
+        except Exception:
+            return 0
+        return deleted
+
+    def distinct_logged_entities(self) -> set:
+        """Entities already present in the pattern store — skipped on backfill so
+        importing history can't double-count what live logging already covers."""
+        import sqlite3
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                return {r[0] for r in conn.execute(
+                    "SELECT DISTINCT entity_id FROM state_changes")}
+        except Exception:
+            return set()
+
+    def bulk_insert_history(self, rows: list) -> int:
+        """Bulk-insert backfilled historical state changes. Each row is
+        (timestamp_iso, entity_id, domain, old_state, new_state); hour and
+        day_of_week are derived from the historical timestamp (not now), and the
+        source is tagged 'history'. Returns the number inserted."""
+        import sqlite3
+        prepared = []
+        for row in rows:
+            try:
+                ts, eid, dom, old, new = row
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            prepared.append((ts, eid, dom, old, new, "", dt.hour, dt.weekday(),
+                             "history", "unknown", 0.0))
+        if not prepared:
+            return 0
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                conn.executemany(
+                    "INSERT INTO state_changes "
+                    "(timestamp, entity_id, domain, old_state, new_state, "
+                    "area_id, hour, day_of_week, triggered_by, person, "
+                    "person_confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    prepared)
+            return len(prepared)
+        except Exception:
+            return 0
+
+    def get_pattern_stats(self) -> dict:
+        """Return learning statistics."""
+        import sqlite3
+        stats = {"state_changes": 0, "commands": 0, "suggestions": 0,
+                 "patterns": 0, "days_of_data": 0}
+        try:
+            with sqlite3.connect(self._db_path, factory=ClosingConnection) as conn:
+                stats["state_changes"] = conn.execute(
+                    "SELECT COUNT(*) FROM state_changes").fetchone()[0]
+                stats["commands"] = conn.execute(
+                    "SELECT COUNT(*) FROM commands").fetchone()[0]
+                stats["suggestions"] = conn.execute(
+                    "SELECT COUNT(*) FROM suggestions WHERE status='pending'"
+                ).fetchone()[0]
+                stats["patterns"] = conn.execute(
+                    "SELECT COUNT(*) FROM person_patterns").fetchone()[0]
+                oldest = conn.execute(
+                    "SELECT MIN(timestamp) FROM state_changes"
+                ).fetchone()[0]
+                if oldest:
+                    days = (_jh_tz_now() - datetime.fromisoformat(oldest)).days
+                    stats["days_of_data"] = days
+        except Exception:
+            pass
+        return stats
+
+
+# ── Core State ──────────────────────────────────────────────────────────────
+
+class _CoreState:
+    def __init__(self):
+        self.hass: Optional[HomeAssistant] = None
+        self.config: dict = {}
+        self.running: bool = False
+        self.task: Optional[asyncio.Task] = None
+        self.unsub: Optional[object] = None
+        self.alarm_unsub: Optional[object] = None  # alarm_control_panel → lockdown sync listener
+        self.ignore_mgr: Optional[IgnoreManager] = None
+        self.safety_mgr: Optional[SafetyManager] = None
+        self.lockdown_mgr: Optional["LockdownManager"] = None
+        self.proactive_mgr: Optional[ProactiveManager] = None
+        self.autonomy_mgr: Optional[AutonomyManager] = None
+        self.state_logger: Optional[StateLogger] = None
+        self.tick_count: int = 0
+        self.actions_taken: int = 0
+        self.offers_made: int = 0
+        self.autonomous_actions: int = 0
+        self.last_tick: float = 0.0
+        self.startup_time: float = 0.0
+        # Pending offer awaiting a yes/no from the user (set when an offer is
+        # spoken, consumed by the conversation layer on "yes"/"no").
+        self.pending_offer: Optional[dict] = None
+
+_CORE = _CoreState()
+
+
+# ── State Change Listener ──────────────────────────────────────────────────
+
+@callback
+def _pattern_opted_in(entity_id: str, device_class: str = "") -> bool:
+    """Whether a normally-excluded entity (door/window, presence) should still be
+    learned for routines — via a per-entity opt-in or a domain group toggle
+    (v7.11.0). Default is off; noisy domains stay filtered unless chosen."""
+    try:
+        from . import jarvis_config
+    except Exception:
+        return False
+    try:
+        incl = jarvis_config.get("pattern_include_entities", []) or []
+        if entity_id in incl:
+            return True
+        domain = entity_id.split(".")[0]
+        if domain == "binary_sensor" and jarvis_config.get("pattern_learn_doors", False):
+            return device_class in ("door", "window", "garage_door", "opening")
+        if domain == "binary_sensor" and jarvis_config.get("pattern_learn_motion", False):
+            # Motion/occupancy triggers — learnable for "when X, do Y" automations
+            # (motion → light). Chatty, so the class-aware rate limit below caps
+            # them hard; opt-in and off by default.
+            return device_class in ("motion", "occupancy", "presence", "moving")
+        if domain in ("device_tracker", "person") and jarvis_config.get("pattern_learn_presence", False):
+            return True
+        if domain == "event" and jarvis_config.get("pattern_learn_buttons", False):
+            # Button/remote presses surface as event.* entities; learnable for
+            # "press → scene/action" automations. Opt-in, off by default.
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Per-entity rate limit for pattern logging (v7.67.0): entity_id -> last logged
+# epoch. Caps a flapping / high-frequency actuator from flooding the store.
+_PATTERN_LOG_LAST: dict = {}
+
+# Device classes that pulse rapidly — capped far harder than the base interval
+# (see _pattern_log_interval) so re-including them as triggers can't re-flood.
+_HIGH_FREQ_CLASSES = {"motion", "occupancy", "presence", "moving", "vibration", "sound"}
+
+
+def _pattern_log_interval(device_class: str = "") -> float:
+    """Minimum seconds between logged pattern changes for the SAME entity.
+
+    Base is configurable via ``pattern_log_min_interval`` (0 disables). High-
+    frequency trigger classes (motion/occupancy/presence) use a much larger
+    floor (``pattern_motion_min_interval``, default 5 min) so re-including them
+    as triggers logs at most one "it fired in this window" marker — enough for
+    sequence detection, never a flood.
+    """
+    try:
+        base = max(0.0, float((_CORE.config or {}).get("pattern_log_min_interval", 60)))
+    except Exception:
+        base = 60.0
+    if device_class in _HIGH_FREQ_CLASSES:
+        try:
+            hf = float((_CORE.config or {}).get("pattern_motion_min_interval", 300))
+        except Exception:
+            hf = 300.0
+        return max(base, hf)
+    return base
+
+
+def _pattern_rate_ok(entity_id: str, now: float, device_class: str = "") -> bool:
+    """Per-entity rate gate for pattern logging. Returns True (and records the
+    time) when this entity may be logged now, False to drop it. Pure + testable
+    — a motion storm through this gate stays bounded to one log per interval."""
+    if (now - _PATTERN_LOG_LAST.get(entity_id, 0.0)) < _pattern_log_interval(device_class):
+        return False
+    _PATTERN_LOG_LAST[entity_id] = now
+    return True
+
+
+def _on_state_changed(event: Event) -> None:
+    """Log state changes and check ignore rules."""
+    if not _CORE.running:
+        return
+
+    entity_id = event.data.get("entity_id", "")
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+
+    if not new_state:
+        return
+
+    # Check ignore rules
+    if _CORE.ignore_mgr and _CORE.ignore_mgr.is_ignored(entity_id):
+        return
+
+    # User exclusion (specific entities / domains / labels) — don't monitor,
+    # log, or learn from it at all.
+    try:
+        from .entity_filter import is_excluded
+        if is_excluded(_CORE.hass, entity_id):
+            return
+    except Exception:
+        pass
+
+    old_val = old_state.state if old_state else "unknown"
+    new_val = new_state.state
+
+    # Skip unavailable/unknown transitions
+    if new_val in ("unavailable", "unknown") or old_val == new_val:
+        return
+
+    _dc = ""
+    try:
+        _dc = new_state.attributes.get("device_class") or ""
+    except Exception:
+        _dc = ""
+
+    # Event entities are stateless pulses — HA puts a timestamp in `.state`, but
+    # the meaningful value is the `event_type` attribute (e.g. "single",
+    # "double"). Substitute it so "button single-press → scene" is minable, and
+    # drop fires that carry no type. Scenes are similar: `.state` is a timestamp
+    # that changes on each activation, so record a stable "activated" marker.
+    _dom0 = entity_id.split(".", 1)[0]
+    if _dom0 == "event":
+        try:
+            _et = new_state.attributes.get("event_type") or ""
+        except Exception:
+            _et = ""
+        if not _et:
+            return
+        new_val = _et
+        old_val = ""
+    elif _dom0 == "scene":
+        new_val = "activated"
+        old_val = ""
+
+    # Per-entity rate limit for pattern logging. A high-frequency source — a
+    # streaming media_player flipping playing/buffering/paused, or a motion
+    # sensor pulsing every few seconds — would otherwise flood the pattern store
+    # with tens of thousands of near-worthless rows that bloat every analysis
+    # pass. The gate caps each entity to one logged change per interval (motion/
+    # occupancy far harder, see _pattern_log_interval): infrequent routine
+    # transitions are unaffected, entities are independent so cross-entity
+    # sequences still record, and dropped churn skips the area/person lookups.
+    if not _pattern_rate_ok(entity_id, time.time(), _dc):
+        return
+
+    # Get area
+    area_id = ""
+    try:
+        from homeassistant.helpers import entity_registry as er, device_registry as dr
+        ent_reg = er.async_get(_CORE.hass)
+        dev_reg = dr.async_get(_CORE.hass)
+        entry = ent_reg.async_get(entity_id)
+        if entry:
+            area_id = entry.area_id or ""
+            if not area_id and entry.device_id:
+                device = dev_reg.async_get(entry.device_id)
+                area_id = device.area_id if device else ""
+    except Exception:
+        pass
+
+    # Log for pattern learning. v6.41.0: stamp the sole-occupant person when
+    # unambiguous (cheap presence check — the full face/voice resolver is
+    # too costly to run on every state event; commands already get that
+    # treatment on the much lower-volume conversation path).
+    if _CORE.state_logger:
+        person = "unknown"
+        person_conf = 0.0
+        try:
+            from . import identity
+            # v6.77.0: room-aware — pass the area the event happened in so
+            # room-scoped presence/recognition and proximity can attribute it
+            # even when several people are home.
+            ident = identity.quick_identify(_CORE.hass, area_id)
+            person = ident.person
+            person_conf = ident.confidence
+            # Best-guess attribution (v7.9.0): if no single person cleared the
+            # certainty bar, record the LEADING candidate anyway — with a
+            # confidence scaled by how decisively it leads — instead of dropping
+            # the event to 'unknown'. This lets per-person routines accumulate and
+            # their owner firm up as recognition improves (the pattern analyzer
+            # weights occurrences by this confidence). The strict threshold still
+            # gates high-certainty ACTIONS via identity.resolve(), not this
+            # high-volume telemetry. A genuine tie (no clear leader) stays unknown.
+            if person == identity.UNKNOWN and ident.candidates:
+                ranked = sorted(ident.candidates.items(),
+                                key=lambda kv: kv[1], reverse=True)
+                top = float(ranked[0][1])
+                second = float(ranked[1][1]) if len(ranked) > 1 else 0.0
+                lead = (top - second) / top if top > 0 else 0.0
+                # Record the leader when it CLEARLY leads (looser than the old
+                # 1.5x gate, so more per-person routines accumulate) — but a genuine
+                # near-tie coin-flip stays 'unknown'; we don't invent attribution.
+                if top > 0 and (len(ranked) == 1 or lead >= 0.2):
+                    person = ranked[0][0]
+                    person_conf = round(min(0.44, top * (0.4 + 0.6 * lead)), 3)
+        except Exception:
+            pass
+        _fi = False
+        try:
+            _fi = _pattern_opted_in(entity_id, _dc)
+        except Exception:
+            _fi = False
+        _CORE.state_logger.log_state_change(
+            entity_id, old_val, new_val, area_id, person=person,
+            person_confidence=person_conf,
+            force_include=_fi,
+        )
+
+
+# ── Space & time shadow (roadmap Phase Q, Embodied JARVIS) ──────────────────
+# Observe-only: build the kernel space/time model (floor-plan graph + current
+# daypart) alongside the tick and log a one-line summary. Nothing reads the
+# model yet — the current per-feature mapping (residence_graph, camera_coverage,
+# the briefing schedule) stays authoritative. Set SPACE_TIME_SHADOW = False to
+# silence it; the tick behaves identically either way. Advancing it to parity
+# (camera↔sensor mapping, cf. #140) then enforce behind SPACE_TIME_ENFORCE is a
+# later rung and the household's call.
+SPACE_TIME_SHADOW = True
+
+# Phase Q parity: alongside the intrusion investigator's existing
+# residence_graph.hops_from_breach, compute the same breach-depth map from the
+# kernel SpatialGraph and log whether they AGREE — observe-only, drives nothing.
+# Both derive from the same floor-plan adjacency (residence_graph.room_adjacency),
+# so this isolates the kernel BFS (SpatialGraph.hops_from) as a faithful
+# re-implementation of the incumbent before any enforce rung reads the model. Set
+# SPACE_TIME_PARITY = False to silence it. (It deliberately does NOT touch the
+# camera↔sensor mapping, cf. #140 — that parity + the SPACE_TIME_ENFORCE flip are
+# later, owner-gated rungs.)
+SPACE_TIME_PARITY = True
+
+
+def _emit_space_time_parity(hass, config, breach_area, legacy_hops) -> None:
+    """Phase Q — parity. Compare the kernel SpatialGraph's breach-depth BFS with
+    the incumbent ``residence_graph.hops_from_breach`` result (``legacy_hops``,
+    ``{area_id: hops}``) at the room-slug level, and log AGREEMENT/DIVERGENCE.
+    Best-effort, never raises; the investigation is unchanged either way."""
+    if not SPACE_TIME_PARITY or not breach_area:
+        return
+    try:
+        from . import residence_graph
+        from .kernel.world_model import WorldModel
+        g = WorldModel(hass, config or {}).spatial_graph()
+        if g.is_empty():
+            return
+        start = residence_graph._area_slug(hass, breach_area)
+        kernel_slug_hops = g.hops_from(start)           # {slug: depth}
+        legacy_slug_hops = {
+            residence_graph._area_slug(hass, aid): d
+            for aid, d in (legacy_hops or {}).items()
+        }
+        agree = kernel_slug_hops == legacy_slug_hops
+        _LOGGER.debug(
+            "space_time(parity): breach-depth agree=%s "
+            "(kernel=%d room(s), legacy=%d room(s))",
+            agree, len(kernel_slug_hops), len(legacy_slug_hops))
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# ENFORCE (Phase Q): the kernel SpatialGraph owns the breach-depth map that the
+# intrusion investigation reasons over (inward-vs-entry motion). Behind
+# SPACE_TIME_ENFORCE (or the owner-gated `space_time_enforce` config key,
+# DEFAULT-OFF) the investigation consumes the kernel-derived depth map instead of
+# residence_graph's — but ONLY when the kernel exactly reproduces the incumbent
+# at room-slug level (the parity rung's agreement test). The kernel map is slug-
+# keyed; the consumer expects area-id keys, so it is keyed back using the legacy
+# map's own area-ids. Any divergence, an empty graph, a key that does not map
+# back, or any error → the incumbent residence_graph.hops_from_breach map stands
+# untouched (fail-safe). Since adoption requires exact slug-level equality, the
+# map handed downstream is identical to today's — this makes the kernel the
+# authoritative producer without changing the safety behaviour. Kill-switched.
+SPACE_TIME_ENFORCE = False
+
+
+def _space_time_enforce_on() -> bool:
+    """True when the household has opted the kernel space/time model into the
+    authoritative breach-depth path (`SPACE_TIME_ENFORCE` or the
+    `space_time_enforce` config key). Never raises."""
+    if SPACE_TIME_ENFORCE:
+        return True
+    try:
+        from . import jarvis_config
+        return bool(jarvis_config.get("space_time_enforce", False))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _space_time_breach_hops(hass, config, breach_area, legacy_hops):
+    """Phase Q enforce — the breach-depth map, kernel-owned when it is safe to be.
+
+    Returns the kernel SpatialGraph's ``{area_id: depth}`` breach-depth map when
+    enforce is on AND the kernel reproduces the incumbent map exactly at room-slug
+    level; otherwise returns ``legacy_hops`` unchanged (fail-safe =
+    residence_graph.hops_from_breach). Best-effort; any error → ``legacy_hops``."""
+    if not breach_area or not _space_time_enforce_on():
+        return legacy_hops
+    try:
+        from . import residence_graph
+        from .kernel.world_model import WorldModel
+        g = WorldModel(hass, config or {}).spatial_graph()
+        if g.is_empty():
+            return legacy_hops
+        start = residence_graph._area_slug(hass, breach_area)
+        kernel_slug_hops = g.hops_from(start)                 # {slug: depth}
+        slug_to_aid, legacy_slug_hops = {}, {}
+        for aid, d in (legacy_hops or {}).items():
+            s = residence_graph._area_slug(hass, aid)
+            slug_to_aid[s] = aid
+            legacy_slug_hops[s] = d
+        # Adopt only on exact agreement with the incumbent (the parity test) and
+        # only when every kernel slug maps back to a known area-id. Otherwise the
+        # incumbent map stays authoritative.
+        if (kernel_slug_hops != legacy_slug_hops
+                or not set(kernel_slug_hops) <= set(slug_to_aid)):
+            return legacy_hops
+        return {slug_to_aid[s]: d for s, d in kernel_slug_hops.items()}
+    except Exception:   # pragma: no cover - defensive
+        return legacy_hops
+
+
+def _emit_space_time_shadow(hass, config) -> None:
+    """Phase Q — shadow. Build the ``WorldModel`` space/time views (the floor-plan
+    ``SpatialGraph`` + the current ``TemporalFrame``) and log a one-line summary.
+    Best-effort, never raises; the tick is unchanged whether this runs or not."""
+    if not SPACE_TIME_SHADOW:
+        return
+    try:
+        from .kernel.world_model import WorldModel
+        from .kernel import space_time as ST  # Phase Q owner reference
+        wm = WorldModel(hass, config or {})
+        g = wm.spatial_graph()
+        frame = wm.temporal_frame()
+        daypart = frame.daypart or ST.daypart_of(frame.hour) or "unknown"
+        if g.is_empty() and not frame.is_known:
+            return
+        _LOGGER.debug(
+            "space_time(shadow): %d area(s), %d adjacency(ies); daypart=%s",
+            len(g.areas), len(g.edges), daypart)
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# Phase Q camera↔sensor coverage parity (owner decision: corroborate with BOTH
+# cameras AND sensors). Observe-only: for the areas the space_time model knows,
+# count how many a camera covers (static, camera_coverage) and how many a
+# presence sensor reports occupied right now (live, audio_routing), plus the
+# overlap where a sensor-occupied area is also camera-corroborated. Nothing reads
+# it; the current per-feature mapping stays authoritative and space_time stays at
+# parity. Set SPACE_TIME_COVERAGE_PARITY = False to silence it. The
+# SPACE_TIME_ENFORCE behaviour flip remains the household's call.
+SPACE_TIME_COVERAGE_PARITY = True
+
+
+def _emit_space_time_coverage_parity(hass, config) -> None:
+    """Phase Q — parity (camera↔sensor mapping). Corroborate the space_time
+    model's areas against the combined camera + presence-sensor mapping and log a
+    one-line coverage summary. Best-effort, never raises; drives nothing."""
+    if not SPACE_TIME_COVERAGE_PARITY:
+        return
+    try:
+        from .kernel.world_model import WorldModel
+        from . import camera_coverage, audio_routing, residence_graph
+        g = WorldModel(hass, config or {}).spatial_graph()
+        if g.is_empty():
+            return
+        model_slugs = {residence_graph.slug(a.name) for a in g.areas}
+
+        def _has_cam(slug: str) -> bool:
+            # the camera matcher is name-based + substring, so de-slug first
+            return bool(camera_coverage.camera_for_area(hass, slug.replace("_", " ")))
+
+        cam_covered = {s for s in model_slugs if _has_cam(s)}
+        try:
+            occupied = audio_routing.currently_occupied_areas(hass) or []
+        except Exception:
+            occupied = []
+        occ_slugs = {residence_graph._area_slug(hass, a) for a in occupied}
+        occ_in_model = occ_slugs & model_slugs
+        occ_cam = {s for s in occ_in_model if _has_cam(s)}
+        _LOGGER.debug(
+            "space_time(parity): model=%d area(s), cam-covered=%d; "
+            "occupied-now=%d (in-model=%d, cam-corroborated=%d)",
+            len(model_slugs), len(cam_covered),
+            len(occ_slugs), len(occ_in_model), len(occ_cam))
+    except Exception:   # pragma: no cover - defensive
+        pass
+
+
+# ── Main Evaluation Loop ───────────────────────────────────────────────────
+
+async def _tick():
+    """Single evaluation tick — reviews home state and decides actions."""
+    hass = _CORE.hass
+    config = _CORE.config
+    _CORE.tick_count += 1
+    _CORE.last_tick = time.time()
+
+    # Phase R (integration shadow): signals for this pass's loop trace. perceive
+    # is always true below (we read the world); predict/learn are set where they
+    # genuinely happen; act is derived from what dispatched. _auto_before snapshots
+    # the autonomous-action total so a fresh autonomous act (which records an
+    # outcome → learning) this tick counts as the loop's LEARN stage.
+    _loop_predicted = False
+    _loop_learned = False
+    _auto_before = getattr(_CORE, "autonomous_actions", 0)
+
+    # Determine home state (MCU Phase C, C1): read through the kernel WorldModel
+    # facade — the canonical context authority — instead of a bare states sweep.
+    # WorldModel.devices("person") reads the same person entities, so this is
+    # behaviour-identical; it just routes cognition's presence context through
+    # the facade. Best-effort: falls back to the raw sweep if the facade yields
+    # nothing. (The intrusion-safety away-check is migrated separately in C2.)
+    from .kernel.world_model import WorldModel
+    _people = WorldModel(hass).devices(domain="person")
+    if _people:
+        anyone_home = any(d["state"] == "home" for d in _people)
+    else:
+        anyone_home = any(
+            s.state == "home" for s in hass.states.async_all("person"))
+
+    # Phase Q (shadow): observe the kernel space/time model alongside the tick.
+    # Observe-only, kill-switched — nothing reads it yet.
+    _emit_space_time_shadow(hass, config)
+    # Phase Q (parity): corroborate the model's areas against the combined
+    # camera + presence-sensor mapping — observe-only, drives nothing.
+    _emit_space_time_coverage_parity(hass, config)
+
+    from . import sleep_detection
+    bedroom_areas = config.get("bedroom_areas", []) or []
+    # (offer-area resolution for room-scoped modes lives in _offer_area, below.)
+    sleeping, _ = sleep_detection.is_sleeping(
+        hass,
+        bedroom_area_ids=bedroom_areas,
+        quiet_start=config.get("observer_quiet_start", "22:00"),
+        quiet_end=config.get("observer_quiet_end", "07:00"),
+    )
+
+    # Lockdown runs first so the nighttime sweep can defer to it when active.
+    actions = []
+    if _CORE.lockdown_mgr:
+        try:
+            actions.extend(await _CORE.lockdown_mgr.tick())
+        except Exception as exc:
+            _LOGGER.debug("Lockdown tick error: %s", exc)
+
+    # Auto operational-mode (v7.14.0): keep AWAY/NORMAL in step with occupancy
+    # unless the user has chosen hands-on control. Never affects safety. Runs
+    # via executor job like the manual set_mode() callers in agent.py/websocket.py;
+    # modes.py serializes the shared state/persistence across all of them.
+    try:
+        from . import modes as _auto_modes
+        await hass.async_add_executor_job(_auto_modes.auto_evaluate, anyone_home)
+    except Exception as exc:
+        _LOGGER.debug("auto-mode eval error: %s", exc)
+
+    # Run safety checks
+    actions.extend(await _CORE.safety_mgr.tick(sleeping, anyone_home))
+
+    # ── Proactive comfort/efficiency offers (v5.9.07) ───────────────
+    # Gated by the global proactive kill-switch AND the active operational mode
+    # (a mode like party/movie/lab can silence convenience offers). Safety always
+    # runs regardless — mode never gates SafetyManager.
+    proactive_enabled = _CORE.config.get("observer_proactive", True)
+    mode_scope_areas = []
+    try:
+        from . import modes
+        mode_scope_areas = modes.mode_scoped_to_areas()
+        # A room-scoped mode (lab/movie bound to rooms) keeps the house proactive;
+        # only offers about the bound rooms are dropped in the loop below. An
+        # unscoped suppressing mode still silences proactivity house-wide.
+        if not mode_scope_areas and not modes.mode_allows_proactive():
+            proactive_enabled = False
+    except Exception:
+        pass
+    if proactive_enabled and _CORE.proactive_mgr:
+        try:
+            offers = await _CORE.proactive_mgr.tick(sleeping, anyone_home)
+            spoke_offer = False  # only ONE spoken offer per tick (avoid stacking
+                                 # questions when only one pending_offer is tracked)
+            # Phase AC (contextual autonomy, owner-gated, default OFF): when
+            # enabled, build the live autonomy context once per tick so a granted
+            # convenience action is held to ask-first while a guest is in the home.
+            # Downward-only, atop the N ceiling; nothing built when enforce is off.
+            _ac_ctx = None
+            if _contextual_autonomy_enforce_on():
+                try:
+                    from .kernel import autonomy as _auto
+                    _ac_ctx = _auto.AutonomyContext(
+                        guests_present=_guests_present(_CORE.hass))
+                except Exception:
+                    _ac_ctx = None
+            for offer in offers:
+                # Room-scoped mode: stay quiet about the focused room(s) only.
+                if mode_scope_areas:
+                    _oa = _offer_area(_CORE.hass, offer)
+                    if _oa and _oa in mode_scope_areas:
+                        continue
+                pkey = offer.get("pattern_key", "")
+                # Graduated autonomy: trusted actions execute silently — all of
+                # them, since they don't need a yes/no.
+                if pkey and _CORE.autonomy_mgr and _CORE.autonomy_mgr.is_autonomous(pkey, context=_ac_ctx):
+                    ok = await _execute_action_data(_CORE.hass, offer.get("action_data", {}))
+                    if ok:
+                        _CORE.autonomous_actions += 1
+                        # Mark cooldown so the same autonomous action doesn't
+                        # re-fire every proactive cycle.
+                        okey = offer.get("offer_key")
+                        if okey:
+                            _CORE.proactive_mgr._mark_offered(okey)
+                        done_msg = _autonomous_done_message(offer)
+                        actions.append({
+                            "type": offer.get("type", "proactive") + "_auto",
+                            "urgency": "low",
+                            "message": done_msg,
+                            "auto_act": True,
+                        })
+                        from .websocket import jarvis_log
+                        jarvis_log("AUTO", f"autonomous: {pkey} → {done_msg[:60]}")
+                elif not spoke_offer:
+                    # Offer the FIRST non-autonomous opportunity; remaining ones
+                    # wait for a later tick (their cooldown isn't marked, so they
+                    # re-surface naturally next cycle).
+                    _CORE.offers_made += 1
+                    _CORE.pending_offer = offer
+                    _CORE.pending_offer_at = time.time()   # Clean Jarvis review round 3: an offer is answerable for a while only
+                    _CORE.pending_offer_origin = None   # jh-r15-offer: set where it is spoken (the speakers' rooms)
+                    okey = offer.get("offer_key")
+                    if okey:
+                        _CORE.proactive_mgr._mark_offered(okey)
+                    actions.append(offer)
+                    spoke_offer = True
+        except Exception as exc:
+            _LOGGER.debug("Proactive tick error: %s", exc)
+
+    # ── Energy management (v6.62.0) ─────────────────────────────────
+    # Same gating as proactive offers (kill-switch + mode). Surfaces high-draw
+    # situations; at higher agency levels may propose/auto-defer a load. Never
+    # sheds a critical load (handled inside energy.evaluate_for_proactive).
+    if proactive_enabled:
+        try:
+            from . import energy
+            e_offer = energy.evaluate_for_proactive(hass)
+            if e_offer:
+                actions.append(e_offer)
+        except Exception as exc:
+            _LOGGER.debug("Energy tick error: %s", exc)
+
+    # Run pattern analysis periodically
+    try:
+        from .pattern_analyzer import get_analyzer, set_thresholds
+        analyzer = get_analyzer()
+        if await hass.async_add_executor_job(analyzer.should_analyze):
+            # Loosened-reins defaults (occurrences 4, confidence 0.55) — API spend
+            # is no longer the constraint; user can tune via panel-saved keys.
+            try:
+                _occ = int(config.get("pattern_min_occurrences", 4) or 4)
+            except Exception:
+                _occ = 4
+            try:
+                _conf = float(config.get("pattern_confidence", 0.55) or 0.55)
+            except Exception:
+                _conf = 0.55
+            set_thresholds(_occ, _conf)
+            patterns = await analyzer.analyze(hass)
+            if patterns:
+                from .websocket import jarvis_log
+                jarvis_log("LEARN", f"Pattern analysis: {len(patterns)} patterns found")
+                # Notify about new high-confidence suggestions
+                pending = await hass.async_add_executor_job(
+                    analyzer.get_pending_suggestions
+                )
+                if pending:
+                    honorific = config.get("honorific", "sir")
+                    jarvis_log(
+                        "LEARN",
+                        f"{len(pending)} automation suggestion(s) pending review",
+                    )
+    except Exception as exc:
+        _LOGGER.debug("Pattern analysis tick error: %s", exc)
+
+    # ── Local cognition: anticipation (v5.9.30) ─────────────────────────────
+    # Every ~15 min, sample occupancy and flag entities in a state that's
+    # unusual for this time of day ("garage usually closed by now"). Gated by
+    # the proactive kill-switch + the cognition toggle. Predictions are appended
+    # as actions and flow through the same gated announce path below (so they
+    # push-instead-of-speak while you're asleep). Model is persisted each cycle.
+    try:
+        from . import cognition
+        cog_on = True
+        try:
+            from . import observer as _obs
+            cog_on = _obs._cognition_enabled()
+        except Exception:
+            cog_on = bool(config.get("cognition_enabled", True))
+
+        if proactive_enabled and cog_on:
+            now_t = time.time()
+            if now_t - getattr(_CORE, "_last_cog_cycle", 0.0) >= cognition.OCC_SAMPLE_INTERVAL:
+                _CORE._last_cog_cycle = now_t
+                cognition.sample_occupancy(hass, now_t)
+                cognition.sample_presence(hass, now_t)
+                preds = (cognition.predict(hass, now_t)
+                         + await cognition.async_predict_overdue(hass, now_t)
+                         + await cognition.async_predict_presence(hass, now_t)
+                         + cognition.predict_proximity(hass, now_t)
+                         + await cognition.async_predict_routine_start(hass, now_t))
+                preds += await cognition.predict_departure(hass, now_t)
+                for pred in preds:
+                    actions.append(pred)
+                    from .websocket import jarvis_log
+                    jarvis_log("LEARN", f"anticipation: {pred.get('message','')[:80]}")
+                _loop_predicted = bool(preds)   # Phase R: PREDICT stage ran
+                await hass.async_add_executor_job(
+                    cognition.save_to_db,
+                    config_path_str("jarvis", "patterns.db", hass=hass),
+                )
+                _loop_learned = True            # Phase R: learned model updated
+    except Exception as exc:
+        _LOGGER.debug("Cognition anticipation tick error: %s", exc)
+
+    # v6.38: Execute the agent's self-scheduled follow-ups. The agent queued
+    # these itself ("check the garage actually closed in 5 minutes") — running
+    # them back through its own brain closes the loop across time. Results join
+    # the normal action flow so quiet hours / urgency routing apply.
+    try:
+        from . import followups as _fu
+        actions.extend(await _fu.async_process_due(
+            hass, config, runner=_make_followup_runner(hass, config)))
+    except Exception as exc:
+        _LOGGER.debug("Follow-up tick error: %s", exc)
+
+    # v6.40: Engage due goals — outcomes JARVIS is pursuing across time. Same
+    # headless brain as follow-ups; quiet while working, speaks on completion.
+    try:
+        from . import goals as _goals
+        actions.extend(await _goals.async_process_due(
+            hass, config, runner=_make_followup_runner(hass, config)))
+    except Exception as exc:
+        _LOGGER.debug("Goal tick error: %s", exc)
+
+    # Process actions. Under the J4 enforce flip the proactive dispatch plan is
+    # produced by the kernel CognitiveCycle's DECIDE phase — this subsystem's loop
+    # genuinely IS the cycle — then performed here (ACT). Default OFF (the plan is
+    # just `actions`); fail-safe — any cycle error falls back to the legacy order;
+    # dispatch runs exactly once over the chosen plan, so there is no double-fire.
+    # Safety (intrusion/freeze/lockdown) never routes through this proactive loop.
+    plan = actions
+    if _cognitive_cycle_enforce_on():
+        try:
+            plan = _cognitive_cycle_plan(
+                actions, people=len(_people), anyone_home=anyone_home, sleeping=sleeping)
+        except Exception as exc:
+            _LOGGER.warning("cognitive-cycle enforce failed; using legacy order: %s", exc)
+            plan = actions
+    emitted = 0
+    for action in plan:
+        await _emit_action(hass, config, action, sleeping)
+        emitted += 1
+
+    # ── Phase J (J3, parity): unified cognitive cycle, observe-only ──────────
+    # Run the kernel CognitiveCycle over this same pass and compare its view to
+    # what the loop actually did: the cycle's DECIDE count must equal the number
+    # of actions the loop dispatched (ACT). It still drives nothing — the real
+    # decisions above stand — but now it logs an AGREEMENT flag over real
+    # traffic, the parity bar before a subsystem's loop IS the cycle (enforce
+    # J4). Fully fail-safe + kill-switched; any error is swallowed so it can
+    # never affect the loop.
+    try:
+        _run_cognitive_cycle_shadow(
+            anyone_home=anyone_home,
+            sleeping=sleeping,
+            people=len(_people),
+            decided=len(actions),
+            emitted=emitted,
+        )
+    except Exception as exc:
+        _LOGGER.debug("cognitive-cycle parity error: %s", exc)
+
+    # ── Phase K (shadow): populate the kernel working memory, observe-only ────
+    # Fold this tick's cognitive context into the decaying kernel working set and
+    # log its bounded snapshot. Independent of the cycle switch above and drives
+    # nothing — the ladder's parity rung (attention consults it) and enforce rung
+    # come later. Fully fail-safe + kill-switched.
+    try:
+        _populate_working_memory_shadow(
+            people=len(_people),
+            anyone_home=anyone_home,
+            sleeping=sleeping,
+            decided=len(actions),
+            emitted=emitted,
+        )
+    except Exception as exc:
+        _LOGGER.debug("working-memory shadow error: %s", exc)
+
+    # ── Phase R (shadow): trace this pass as one perceive→predict→decide→act→
+    # learn loop and log whether it closed. Observe-only; never affects the tick.
+    try:
+        _acted_auto = getattr(_CORE, "autonomous_actions", 0) > _auto_before
+        _emit_integration_loop_shadow(
+            perceived=True,
+            predicted=_loop_predicted,
+            decided=bool(actions),
+            acted=bool(emitted),
+            learned=_loop_learned or _acted_auto,
+            correlation_id=f"tick-{getattr(_CORE, 'tick_count', 0)}",
+        )
+    except Exception as exc:
+        _LOGGER.debug("integration loop shadow emit error: %s", exc)
+
+    # ── Phase AE (shadow): fold this pass into the rolling certification tally as
+    # a `proactive` scenario observation. Observe-only; never affects the tick.
+    try:
+        _emit_certification_shadow(
+            perceived=True,
+            predicted=_loop_predicted,
+            decided=bool(actions),
+            acted=bool(emitted),
+            learned=_loop_learned or _acted_auto,
+        )
+    except Exception as exc:
+        _LOGGER.debug("certification shadow emit error: %s", exc)
+
+
+# Phase J (J4): ENFORCE — the proactive dispatch loop IS the kernel
+# CognitiveCycle. When on, `_cognitive_cycle_plan` runs the canonical
+# PERCEIVE→INTERPRET→DECIDE→ACT→REFLECT cycle whose DECIDE phase produces the
+# ordered proactive dispatch plan `_tick` then performs — making one (non-safety)
+# subsystem's loop genuinely the cycle. Kill-switched (COGNITIVE_CYCLE_ENFORCE /
+# the `cognitive_cycle_enforce` config key); default OFF so shipping is
+# behaviour-preserving (the plan is just `actions`); fail-safe — any cycle error
+# raises and the caller falls back to the legacy order. The J3 parity log below
+# is the real-traffic evidence the household watches before flipping this on.
+COGNITIVE_CYCLE_ENFORCE = False
+
+
+def _cognitive_cycle_enforce_on() -> bool:
+    """True when the J4 enforce flip is active (module flag or the
+    `cognitive_cycle_enforce` config key). Never raises."""
+    if COGNITIVE_CYCLE_ENFORCE:
+        return True
+    try:
+        if _CORE and _CORE.config and _CORE.config.get("cognitive_cycle_enforce", False):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cognitive_cycle_plan(actions, *, people: int, anyone_home: bool, sleeping: bool):
+    """Run the kernel CognitiveCycle so its DECIDE phase owns the ordered proactive
+    dispatch plan (J4 enforce) — the proactive loop genuinely becomes the cycle.
+    Returns the ordered action list (== ``actions`` on the happy path). Raises on
+    cycle failure so the caller falls back to the legacy order. Builds nothing
+    safety-related — the proactive dispatch carries no intrusion/freeze/lockdown
+    action."""
+    from .kernel import cycle
+    decided = {"plan": list(actions)}
+
+    def _perceive(ctx):
+        ctx["people"] = people
+        ctx["anyone_home"] = anyone_home
+        ctx["sleeping"] = sleeping
+
+    def _interpret(ctx):
+        ctx["candidate"] = len(actions)
+
+    def _decide(ctx):
+        ctx["plan"] = list(actions)      # the cycle owns the ordered plan
+        decided["plan"] = ctx["plan"]
+
+    def _act(ctx):
+        ctx["dispatched"] = len(decided["plan"])
+
+    def _reflect(ctx):
+        ctx["ok"] = True
+
+    trace = cycle.standard_cycle({
+        cycle.PERCEIVE: _perceive,
+        cycle.INTERPRET: _interpret,
+        cycle.DECIDE: _decide,
+        cycle.ACT: _act,
+        cycle.REFLECT: _reflect,
+    }).tick()
+    if not trace.ok:
+        raise RuntimeError("cognitive cycle did not complete")
+    return decided["plan"]
+
+
+# Phase J (J2): kill-switch for the observe-only cognitive cycle. A module
+# constant AND a config key ("cognitive_cycle_shadow") both gate it; either off
+# disables it. Shadow only — it never changes behaviour.
+COGNITIVE_CYCLE_SHADOW = True
+
+
+def _run_cognitive_cycle_shadow(*, anyone_home: bool, sleeping: bool,
+                                people: int, decided: int,
+                                emitted: int) -> None:
+    """Run the kernel cognitive cycle alongside ``_tick`` (J3, parity).
+
+    Builds a :class:`kernel.cycle.CycleTrace` over the canonical phases from
+    what this tick computed, then compares the cycle's DECIDE count against the
+    number of actions the loop actually dispatched (``emitted``) and logs the
+    AGREEMENT. Drives nothing. Kill-switched via :data:`COGNITIVE_CYCLE_SHADOW`
+    and the ``cognitive_cycle_shadow`` config key. Never raises into the caller.
+    """
+    if not COGNITIVE_CYCLE_SHADOW:
+        return
+    try:
+        if _CORE and _CORE.config and not _CORE.config.get("cognitive_cycle_shadow", True):
+            return
+    except Exception:
+        pass
+    from .kernel import cycle
+
+    tick_count = getattr(_CORE, "tick_count", 0)
+    autonomous = getattr(_CORE, "autonomous_actions", 0)
+
+    def _perceive(ctx):
+        ctx["people"] = people
+        ctx["anyone_home"] = anyone_home
+        ctx["sleeping"] = sleeping
+
+    def _interpret(ctx):
+        ctx["tick"] = tick_count
+
+    def _decide(ctx):
+        ctx["decided"] = decided
+
+    def _act(ctx):
+        ctx["emitted"] = emitted
+
+    def _reflect(ctx):
+        ctx["autonomous_total"] = autonomous
+        # Parity: the cycle's decision count must match what the loop dispatched.
+        ctx["agree"] = (decided == emitted)
+
+    trace = cycle.standard_cycle(
+        {
+            cycle.PERCEIVE: _perceive,
+            cycle.INTERPRET: _interpret,
+            cycle.DECIDE: _decide,
+            cycle.ACT: _act,
+            cycle.REFLECT: _reflect,
+        }
+    ).tick()
+
+    agree = decided == emitted
+    try:
+        from .websocket import jarvis_log
+        jarvis_log(
+            "CYCLE",
+            f"parity {trace.cycle_id[:8]}: {'→'.join(trace.names)} "
+            f"ok={trace.ok} agree={agree} decided={decided} emitted={emitted}",
+        )
+        if not agree:
+            jarvis_log(
+                "CYCLE",
+                f"parity MISS {trace.cycle_id[:8]}: decided={decided} "
+                f"emitted={emitted}",
+            )
+    except Exception:
+        _LOGGER.debug("cognitive cycle parity trace: %s", trace.to_dict())
+
+
+# Phase R (Integration Gate — shadow → PARITY). Trace one full perceive → predict
+# → decide → act → learn pass as a single kernel.integration.LoopTrace, under the
+# tick's correlation id, log whether the loop CLOSED (all five stages ran) or how
+# far it got, AND fold it into a rolling LoopAccumulator so the closed-loop RATE
+# and the stall distribution are quantified over real traffic — the parity bar R
+# needs before anything gates on closure (enforce: the loop owns one end-to-end
+# scenario + a CI gate against open-loop regressions). This is the "can the
+# architecture operate as one?" question made measurable: cognition (J–M) and
+# agency (N–V) as one correlated, journal-reconstructable chain. Observe-only;
+# nothing reads the rate yet. Kill-switched (INTEGRATION_LOOP_SHADOW + the
+# integration_loop_shadow config key); never raises into the tick.
+INTEGRATION_LOOP_SHADOW = True
+_INTEGRATION_DASHBOARD_EVERY = 20       # log the rolling rate every N passes
+_LOOP_STATS = None                      # kernel.integration.LoopAccumulator, lazy
+
+
+def _emit_integration_loop_shadow(*, perceived: bool, predicted: bool,
+                                  decided: bool, acted: bool, learned: bool,
+                                  correlation_id: Optional[str] = None) -> None:
+    """Assemble + log the Phase R closed-loop trace for this tick, and fold it
+    into the rolling closed-loop-rate dashboard (parity). Observe-only; drives
+    nothing. Never raises into the caller."""
+    global _LOOP_STATS
+    if not INTEGRATION_LOOP_SHADOW:
+        return
+    try:
+        if _CORE and _CORE.config and not _CORE.config.get("integration_loop_shadow", True):
+            return
+    except Exception:
+        pass
+    try:
+        import time as _time
+        from .kernel import integration as II
+        try:
+            from .kernel import correlation as _corr
+            cid = correlation_id or _corr.current()
+        except Exception:
+            cid = correlation_id
+        cid = cid or f"tick-{getattr(_CORE, 'tick_count', 0)}"
+        tr = II.from_flags(
+            cid, started_ts=_time.time(), perceive=perceived, predict=predicted,
+            decide=decided, act=acted, learn=learned)
+        # Parity: fold the pass into the rolling tally and, every N passes, log
+        # the closed-loop rate + stall distribution.
+        if _LOOP_STATS is None:
+            _LOOP_STATS = II.LoopAccumulator()
+        _LOOP_STATS.record(tr)
+        try:
+            from .websocket import jarvis_log
+            jarvis_log("LOOP", f"integration(shadow): {tr.summary()}")
+            if _LOOP_STATS.total % _INTEGRATION_DASHBOARD_EVERY == 0:
+                jarvis_log("LOOP", f"integration(parity): {_LOOP_STATS.summary()}")
+        except Exception:
+            _LOGGER.debug("integration(shadow): %s", tr.to_dict())
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOGGER.debug("integration loop shadow error: %s", exc)
+
+
+# Phase AE (MCU Certification — SHADOW). Fold each live cognitive pass into a
+# rolling certification tally — the shared dashboard every scenario class reports
+# into. The integration loop's perceive→predict→decide→act→learn IS the
+# `proactive` certification scenario's shape (observation → prediction →
+# suggestion → response), so a pass that PREDICTED an anticipation exercises the
+# proactive class and one that ran end-to-end CLOSES it. Other live surfaces
+# (agent.py for `conversational`, …) fold their own classes into the SAME ledger
+# via certification_observe() so the dashboard reflects the whole system.
+# Observe-only; nothing reads the tally. Kill-switched (CERTIFICATION_SHADOW + the
+# certification_shadow config key); never raises into the caller.
+CERTIFICATION_SHADOW = True
+_CERT_DASHBOARD_EVERY = 20          # log the rolling certification tally every N obs
+_CERT_LEDGER = None                 # kernel.certification.CertificationLedger, lazy
+
+
+def certification_ledger():
+    """The ONE shared certification tally (kernel.certification.CertificationLedger),
+    lazily created. Every live certification observer folds into this single ledger
+    so the dashboard reflects the whole system. Returns None only if the kernel
+    import fails."""
+    global _CERT_LEDGER
+    if _CERT_LEDGER is None:
+        try:
+            from .kernel import certification as CERT
+            _CERT_LEDGER = CERT.CertificationLedger()
+        except Exception:
+            return None
+    return _CERT_LEDGER
+
+
+def _certification_enabled() -> bool:
+    if not CERTIFICATION_SHADOW:
+        return False
+    try:
+        if _CORE and _CORE.config and not _CORE.config.get("certification_shadow", True):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def certification_observe(scenario: str, *, closed_loop: bool = False,
+                          note: str = "") -> None:
+    """Record ONE scenario-class observation into the shared certification ledger
+    (sticky-best per class) and, every N observations, log the rolling dashboard.
+    The single entry point any live surface calls. Observe-only; drives nothing,
+    reads nothing back. Kill-switched (CERTIFICATION_SHADOW / the
+    certification_shadow config key); never raises into the caller."""
+    if not _certification_enabled():
+        return
+    try:
+        led = certification_ledger()
+        if led is None:
+            return
+        led.observe(scenario, closed_loop=closed_loop, note=note)
+        try:
+            from .websocket import jarvis_log
+            if led.observations % _CERT_DASHBOARD_EVERY == 0:
+                jarvis_log("CERT", f"certification(shadow): {led.summary()}")
+        except Exception:
+            _LOGGER.debug("certification(shadow): %s", led.to_dict())
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOGGER.debug("certification observe error: %s", exc)
+
+
+def certification_report() -> dict:
+    """Phase AE PARITY — the MCU certification dashboard, read-only.
+
+    The shared ledger's rolling report: ``coverage`` (classes exercised / 10),
+    ``closed_loop_rate`` (of those exercised, how many closed), the ``closed`` /
+    ``missing`` class lists, ``is_certified``, and the ``observations`` count. This
+    is the quantified "does the whole JARVIS behave as one?" surface — nothing
+    gates on it; it only reports what the live surfaces have demonstrated. Returns
+    a zero-observation report before anything is observed; never raises."""
+    try:
+        led = _CERT_LEDGER
+        if led is not None:
+            return led.to_dict()
+        from .kernel import certification as CERT
+        d = CERT.CertificationReport().to_dict()
+        d["observations"] = 0
+        return d
+    except Exception:
+        return {}
+
+
+def _emit_certification_shadow(*, perceived: bool, predicted: bool,
+                               decided: bool, acted: bool, learned: bool) -> None:
+    """Observe this tick as a `proactive` certification scenario (observation →
+    prediction → suggestion → response). A pass without a prediction is not a
+    proactive scenario, so it is not observed. Observe-only; never raises."""
+    if not predicted:
+        return
+    from .kernel import certification as CERT
+    closed = bool(perceived and predicted and decided and acted and learned)
+    certification_observe(
+        CERT.PROACTIVE, closed_loop=closed,
+        note="integration loop closed" if closed else "open proactive pass")
+
+
+# Phase K (shadow): populate the ONE canonical kernel working set (the shared
+# singleton every loop reads — kernel.working_memory.shared()). A module constant
+# AND a config key ("working_memory_shadow") gate it; either off disables it. The
+# set decays across ticks — the whole point of a working memory — rather than
+# being a single frame. Shadow only: cognitive_core writes it, nothing gates on it.
+WORKING_MEMORY_SHADOW = True
+
+
+def _populate_working_memory_shadow(*, people: int, anyone_home: bool,
+                                    sleeping: bool, decided: int,
+                                    emitted: int) -> None:
+    """Phase K shadow: fold this tick's cognitive context into the shared kernel
+    working set and log its bounded snapshot. Best-effort, never raises; reads
+    nothing back, drives nothing. Only genuinely-present context is remembered —
+    a quiet tick refreshes little, so the set decays to reflect what is actually
+    in mind.
+    """
+    if not WORKING_MEMORY_SHADOW:
+        return
+    try:
+        if _CORE and _CORE.config and not _CORE.config.get("working_memory_shadow", True):
+            return
+    except Exception:
+        pass
+    try:
+        from .kernel import working_memory as wm
+        mem = wm.shared()
+        now = time.time()
+        # Current situation: home occupancy / sleep — the frame everything else
+        # is read against, so it carries a high base salience.
+        occ = "occupied" if anyone_home else "empty"
+        if sleeping:
+            occ += ", household asleep"
+        mem.remember(wm.KIND_SITUATION, "home_occupancy", content=occ,
+                     salience=0.8, now=now, source="cognitive_core")
+        # People in play (more people → more salient).
+        mem.remember(wm.KIND_OBSERVATION, "people_present", content=str(people),
+                     salience=min(1.0, 0.3 + 0.1 * max(0, people)), now=now,
+                     source="cognitive_core")
+        # Actions this tick — only when something happened, so a quiet tick lets
+        # the entry decay out rather than refreshing noise.
+        if decided:
+            mem.remember(wm.KIND_ACTION, "tick_decisions", content=str(decided),
+                         salience=0.6, now=now, source="cognitive_core")
+        snap = mem.snapshot(now=now)
+        try:
+            from .websocket import jarvis_log
+            jarvis_log("WORKING_MEMORY", f"shadow: {snap.summary()}")
+        except Exception:
+            _LOGGER.debug("working-memory shadow snapshot: %s", snap.summary())
+    except Exception:
+        _LOGGER.debug("working-memory shadow populate failed", exc_info=True)
+
+
+def _provider_api_key(config: dict, provider_name: str) -> str:
+    """Each provider has its own credential field, read straight from
+    secrets.yaml — the only place they live now."""
+    from . import ha_secrets
+    return ha_secrets.get_provider_key_sync(provider_name)
+
+
+def _make_followup_runner(hass, config):
+    """A headless agent invocation for self-scheduled follow-ups: same brain,
+    same tools, no user turn. The persona tells the model it queued this work
+    itself, so replies read as JARVIS reporting back, not answering a question."""
+    async def _run(instruction: str, context: str, owner=None) -> str:
+        from .agent import run_agent
+        from .const import resolve_provider_base_url
+        try:
+            from .const import CONF_MODEL, DEFAULT_MODEL
+            model = config.get(CONF_MODEL, DEFAULT_MODEL)
+        except Exception:
+            model = config.get("model", "")
+        honorific = config.get("honorific", "sir")
+        persona = (
+            f"You are JARVIS. You scheduled this follow-up yourself earlier and "
+            f"it is now due. Carry it out with your tools (check states, act if "
+            f"needed, verify), then report the outcome to {honorific} in one or "
+            f"two spoken-style sentences. If everything is fine, say so briefly."
+            + (f"\nContext you saved with it: {context}" if context else "")
+        )
+        return await run_agent(
+            hass,
+            messages=[{"role": "user", "content": instruction}],
+            persona=persona,
+            provider_name=config.get("llm_provider", "groq"),
+            api_key=await hass.async_add_executor_job(
+                _provider_api_key, config, config.get("llm_provider", "groq")),
+            model=model,
+            base_url=resolve_provider_base_url(config, config.get("llm_provider", "groq")),
+            temperature=0.4,
+            config=config,
+            # Jarvis Home patch (2026-11-06): the person who asked keeps their limits later on. "?" is no real login, so
+            # a row with an unknown owner gets the limits of an unknown login. "" is voice with no login, as when it was asked.
+            jh_owner="?" if owner is None else owner,
+        )
+    return _run
+
+
+def _awareness_push_wanted(action, *, pushed, routed, enabled):
+    """Issue #265 — whether a push-eligible low-urgency action should ALSO reach
+    the phone as an awareness push.
+
+    True only when the household opted in (``enabled``), the action declares
+    itself push-eligible (``action["push"]``), and no earlier branch already
+    pushed (``pushed``) or routed it to the car (``routed``). So it is default-off
+    (behaviour-preserving) and can never double-notify. Pure — no I/O — so the
+    guarantee is unit-testable.
+    """
+    return bool(action.get("push")) and bool(enabled) and not pushed and not routed
+
+
+async def _emit_action(hass, config, action, sleeping):
+    """Announce / push a single cognitive action via the standard routing."""
+    _CORE.actions_taken += 1
+    message = action.get("message", "")
+    urgency = action.get("urgency", "medium")
+    action_type = action.get("type", "unknown")
+    notify_all = bool(action.get("notify_all", False))
+
+    _LOGGER.info(
+        "Cognitive action [%s] urgency=%s: %s",
+        action_type, urgency, message[:100],
+    )
+
+    # ── Driving Mode (v7.89.0) ──────────────────────────────────────────────
+    # If the phone is projecting to the car, a spoken heads-up to the (empty)
+    # house is useless — route this alert to the car screen as a car_ui push
+    # instead, and by default skip the home announcement. Only fires when the
+    # feature is on, this category is opted in, and a head-unit sensor is live.
+    _routed = False
+    _pushed = False   # tracks whether this action already reached a phone, so the
+                      # opt-in awareness push (issue #265) never double-notifies.
+    try:
+        from . import driving_mode
+        if driving_mode.should_route(hass, config, driving_mode.category_for(action_type)):
+            _routed = True
+            _snap = action.get("snapshot_url")
+            if notify_all:
+                await _notify_all_devices(hass, config, message, action_type, _snap)
+            else:
+                await _push_notification(hass, config, message, action_type, _snap)
+            _pushed = True
+            if driving_mode.suppress_home_audio(config):
+                return
+    except Exception as exc:
+        _LOGGER.debug("Driving mode routing skipped: %s", exc)
+
+    # Route announcement
+    try:
+        from .tts_helper import resolve_tts_for_context, async_announce
+        from .audio_routing import observer_speak_target
+
+        # Quiet hours: only CRITICAL may speak. Non-critical → phone push only.
+        # Time-based (independent of bedroom presence), so nothing slips through.
+        in_quiet = False
+        try:
+            from . import sleep_detection
+            in_quiet = sleep_detection._in_quiet_hours(
+                config.get("observer_quiet_start", "22:00"),
+                config.get("observer_quiet_end", "07:00"),
+            )
+        except Exception:
+            in_quiet = False
+
+        if (sleeping or in_quiet) and urgency != "critical" and not _routed:
+            # Push to phone only (no spoken announcement)
+            _snap_url = action.get("snapshot_url")
+            if notify_all:
+                await _notify_all_devices(hass, config, message, action_type, _snap_url)
+            else:
+                await _push_notification(hass, config, message, action_type, _snap_url)
+            _pushed = True
+        else:
+            # Get announcement speakers from config
+            ann_speakers = None
+            try:
+                from .const import DOMAIN
+                for eid, data in hass.data.get(DOMAIN, {}).items():
+                    if isinstance(data, dict):
+                        rc = data.get("runtime_config", {})
+                        raw = rc.get("announcement_speakers")
+                        if raw:
+                            parsed = json.loads(raw) if isinstance(raw, str) else raw
+                            if isinstance(parsed, list) and parsed:
+                                ann_speakers = parsed
+                                break
+            except Exception:
+                pass
+
+            broadcast_group = config.get("broadcast_group") or None
+            targets, mode = observer_speak_target(
+                hass, urgency=urgency,
+                broadcast_group=broadcast_group,
+                announcement_speakers=ann_speakers,
+                is_sleeping=sleeping,
+            )
+
+            if targets and mode not in ("suppressed",):
+                tts_entity = resolve_tts_for_context(
+                    hass, "sentinel",
+                    config.get("tts_engine", "auto"),
+                    config.get("tts_premium_engine") or None,
+                    config.get("tts_premium_contexts") or [],
+                )
+                if tts_entity:
+                    await async_announce(
+                        hass, message, tts_entity, targets,
+                        context="sentinel",
+                    )
+                    if action.get("offer") and action is _CORE.pending_offer:   # jh-r15-offer (review round 15)
+                        _CORE.pending_offer_origin = {"areas": _jh_areas_of(hass, targets), "at": time.time()}
+
+            # Also push critical/high alerts to phones (unless Driving Mode
+            # already pushed this one to the car screen above).
+            if urgency in ("critical", "high") and not _routed:
+                _snap_url = action.get("snapshot_url")
+                if notify_all:
+                    await _notify_all_devices(hass, config, message, action_type, _snap_url)
+                else:
+                    await _push_notification(hass, config, message, action_type, _snap_url)
+                _pushed = True
+
+        # ── Opt-in awareness push (issue #265) ──────────────────────────────
+        # A low-urgency action flagged push-eligible — "someone is heading home"
+        # being the motivating case — reaches the phone when the household opts
+        # in, even while awake: the whole point is to know before you're home.
+        # Default OFF (behaviour-preserving); `_awareness_push_wanted` also guards
+        # against a double notification when a branch above already pushed/routed.
+        try:
+            from . import jarvis_config
+            _arrival_on = bool(jarvis_config.get("arrival_push_enabled", False))
+        except Exception:
+            _arrival_on = False
+        if _awareness_push_wanted(action, pushed=_pushed, routed=_routed,
+                                  enabled=_arrival_on):
+            _snap_url = action.get("snapshot_url")
+            if notify_all:
+                await _notify_all_devices(hass, config, message, action_type, _snap_url)
+            else:
+                await _push_notification(hass, config, message, action_type, _snap_url)
+
+    except Exception as exc:
+        _LOGGER.warning("Cognitive: action routing failed: %s", exc)
+
+
+def is_lockdown() -> bool:
+    """True if a formal lockdown is currently active."""
+    return bool(_CORE.lockdown_mgr and _CORE.lockdown_mgr.active)
+
+
+def intrusion_status() -> dict:
+    """Snapshot of any active intrusion investigation, for the panel — where the
+    search started (the breach) and which rooms activity has reached, so the
+    Residence view can show the intruder's route."""
+    mgr = _CORE.safety_mgr
+    inv = getattr(mgr, "_investigation", None) if mgr else None
+    if not inv:
+        return {"active": False, "confirmed": False}
+    return {
+        "active": True,
+        "confirmed": bool(inv.get("escalated")),
+        "breach_area": inv.get("breach_area"),
+        "breach_name": inv.get("breach_name"),
+        "path": list(inv.get("path", [])),
+        "zones": sorted(str(z) for z in inv.get("zones", set())),
+    }
+
+
+def lockdown_status() -> dict:
+    """Lockdown state snapshot for the panel / observability."""
+    if _CORE.lockdown_mgr:
+        return _CORE.lockdown_mgr.status()
+    return {"active": False, "since": 0.0, "reason": "", "auto": False, "exempt_windows": 0}
+
+
+def _ensure_lockdown_mgr(hass: HomeAssistant = None) -> Optional["LockdownManager"]:
+    """
+    Return the lockdown manager, creating it on demand. Lockdown is a security
+    feature, so it must not depend on the cognitive-core loop having started
+    cleanly — if start() was interrupted (and swallowed as non-fatal), the
+    manager is created here the first time it's needed.
+    """
+    if _CORE.lockdown_mgr is None:
+        h = _CORE.hass or hass
+        if h is None:
+            return None
+        try:
+            _CORE.lockdown_mgr = LockdownManager(h, _CORE.config or {})
+            if _CORE.hass is None:
+                _CORE.hass = h
+            _LOGGER.warning("Lockdown manager created on demand (core start had not initialised it)")
+        except Exception as exc:
+            _LOGGER.error("Lockdown manager create failed: %s", exc)
+            return None
+    return _CORE.lockdown_mgr
+
+
+async def ensure_lockdown(hass: HomeAssistant, config: dict) -> None:
+    """
+    Wire lockdown up independently of the observer / cognitive loop: make sure
+    the manager exists, register an event-driven alarm→lockdown sync, and apply
+    the current alarm state immediately (so a reboot while the alarm is armed
+    re-engages lockdown). Idempotent — safe to call from setup and from start().
+    """
+    if _CORE.hass is None:
+        _CORE.hass = hass
+    if not _CORE.config:
+        _CORE.config = config or {}
+    _ensure_lockdown_mgr(hass)
+    if _CORE.alarm_unsub is None:
+        _CORE.alarm_unsub = hass.bus.async_listen("state_changed", _on_lockdown_state)
+        _LOGGER.info("Lockdown listener registered (alarm sync + breach enforcement)")
+    # Startup: adopt the current alarm state silently. Re-announcing "lockdown
+    # engaged" on every reboot/reload (when nothing actually changed) was the
+    # source of the repeated notifications — a fresh arm is announced via the
+    # event path below, not here.
+    await _sync_lockdown_to_alarm("startup", announce=False)
+
+
+async def _on_lockdown_state(event) -> None:
+    """One listener for everything lockdown cares about: alarm arm/disarm sync,
+    plus securing doors/windows/locks that go unsecure while lockdown is active."""
+    try:
+        eid = event.data.get("entity_id", "")
+        dom = eid.split(".", 1)[0]
+        if dom == "alarm_control_panel":
+            old = event.data.get("old_state")
+            # A real arm is disarmed→armed. Entity initialisation on startup
+            # (None / unknown / unavailable → armed) is NOT a fresh arm — adopt
+            # it silently so reboots don't re-announce.
+            genuine = bool(old) and str(getattr(old, "state", "")).lower() not in (
+                "unknown", "unavailable", "none", "")
+            await _sync_lockdown_to_alarm("alarm " + eid, announce=genuine)
+            return
+        mgr = _CORE.lockdown_mgr
+        if mgr is None or not mgr.active or dom not in ("binary_sensor", "cover", "lock"):
+            return
+        new = event.data.get("new_state")
+        if new is None:
+            return
+        action = await mgr.handle_state_change(eid, event.data.get("old_state"), new)
+        if action and _CORE.hass:
+            await _emit_action(_CORE.hass, _CORE.config or {}, action, False)
+    except Exception as exc:
+        _LOGGER.debug("lockdown state handler error: %s", exc)
+
+
+async def _sync_lockdown_to_alarm(reason: str, announce: bool = True) -> None:
+    """
+    Engage lockdown when any alarm is armed, lift it (if it was the alarm that
+    engaged it) when all alarms report a CONFIRMED disarm. Honours
+    lockdown_auto_on_arm and the manual-exit suppression. Event-driven, so it
+    does not depend on the loop. `announce=False` adopts an already-armed
+    state silently (startup / reboot).
+
+    v6.47.2: `unavailable`/`unknown` is neither armed nor disarmed — it's the
+    alarm integration losing its cloud (Cove/Alula drops were LIFTING an
+    armed-night lockdown as "alarm disarmed"). Indeterminate state now HOLDS
+    the current lockdown, with a throttled SAFETY log so the dropout is
+    visible. Only an actual 'disarmed' report lifts an auto-engaged lockdown.
+    """
+    mgr = _CORE.lockdown_mgr
+    if mgr is None or _CORE.hass is None:
+        return
+    if not (_CORE.config or {}).get("lockdown_auto_on_arm", True):
+        return
+    try:
+        armed, disarm_confirmed, indeterminate = _alarm_state_view(_CORE.hass)
+    except Exception:
+        return
+    if indeterminate:
+        # Jarvis Home patch (2026-11-07): a home with no alarm panel at all has no alarm fault. Still hold (a panel may load
+        # later), but only a panel that exists and cannot be read is a SAFETY warning.
+        if _CORE.hass.states.async_all("alarm_control_panel"):
+            _log_alarm_indeterminate(reason, lockdown_active=mgr.active)
+        else:
+            _LOGGER.debug("Lockdown: no alarm panel in Home Assistant (%s), holding lockdown state", reason)
+        return  # hold everything — no engage, no lift, no suppression reset
+    if not armed and mgr._auto_suppressed:
+        mgr._auto_suppressed = False
+        await mgr._persist()
+    # Keep the last readable armed mode fresh on the manager while the panel is
+    # readable+armed, so a later dropout holds with the correct home/away mode
+    # captured (the away false-alarm root fix reads it). Harmless when inactive.
+    mode = _armed_mode(_CORE.hass) if armed else ""
+    if armed and mode and mgr.auto and getattr(mgr, "arm_mode", "") != mode:
+        mgr.arm_mode = mode
+        await mgr._persist()
+    action = None
+    if armed and not mgr.active and not mgr._auto_suppressed:
+        action = await mgr.engage("alarm armed", auto=True, announce=announce,
+                                  arm_mode=mode)
+    elif mgr.active and mgr.auto and disarm_confirmed:
+        action = await mgr.disengage("alarm disarmed")
+    if action and _CORE.hass:
+        try:
+            await _emit_action(_CORE.hass, _CORE.config or {}, action, False)
+        except Exception as exc:
+            _LOGGER.debug("lockdown alarm-sync emit failed: %s", exc)
+
+
+_ALARM_INDET_STATES = {"unavailable", "unknown", "none", ""}
+_ALARM_INDET_LOG_TS = 0.0
+
+
+def _alarm_state_view(hass) -> tuple:
+    """(armed, disarm_confirmed, indeterminate) across all alarm panels.
+    armed: any panel in an armed state. disarm_confirmed: no panel armed AND
+    at least one affirmatively reports 'disarmed'. indeterminate: no panel
+    armed and none disarmed either (all unavailable/unknown, or no panels) —
+    the integration is down, not the alarm off."""
+    armed = False
+    disarmed = False
+    for st in hass.states.async_all("alarm_control_panel"):
+        s = str(st.state).lower()
+        if s in ALARM_ARMED_STATES:
+            armed = True
+        elif s == "disarmed":
+            disarmed = True
+    if armed:
+        return True, False, False
+    if disarmed:
+        return False, True, False
+    return False, False, True
+
+
+def _armed_mode(hass) -> str:
+    """The state of the first readably-armed alarm panel (e.g. 'armed_home',
+    'armed_away'), or '' when no panel is readably armed. Used to tell a HOME
+    arming posture from an AWAY one for intrusion."""
+    try:
+        for st in hass.states.async_all("alarm_control_panel"):
+            s = str(st.state).lower()
+            if s in ALARM_ARMED_STATES:
+                return s
+    except Exception:  # noqa: BLE001 — safety read must never raise
+        pass
+    return ""
+
+
+def _log_alarm_indeterminate(reason: str, lockdown_active: bool) -> None:
+    """SAFETY-log the alarm integration being unreadable, at most once per
+    10 minutes — a Cove/Alula cloud drop shouldn't spam, but must be seen."""
+    global _ALARM_INDET_LOG_TS
+    now = time.time()
+    if now - _ALARM_INDET_LOG_TS < 600:
+        return
+    _ALARM_INDET_LOG_TS = now
+    msg = ("alarm panel unavailable/unknown (%s) — holding lockdown %s; "
+           "only a confirmed disarm lifts it" %
+           (reason, "ACTIVE" if lockdown_active else "state"))
+    _LOGGER.warning("Lockdown: %s", msg)
+    try:
+        from .websocket import jarvis_log
+        jarvis_log("SAFETY", f"Lockdown: {msg}")
+    except Exception:
+        pass
+
+
+async def request_lockdown(on: bool, reason: str = "requested", hass: HomeAssistant = None) -> bool:
+    """
+    Manual lockdown entry point (service / voice / panel). Engages or lifts the
+    lockdown and announces the result. Creates the manager on demand if needed,
+    so it works even if the cognitive core didn't initialise it. Returns True if
+    the request was handled.
+    """
+    mgr = _ensure_lockdown_mgr(hass)
+    h = _CORE.hass or hass
+    if mgr is None or h is None:
+        _LOGGER.warning("Lockdown %s request ignored — manager/hass unavailable",
+                        "engage" if on else "lift")
+        return False
+    action = await (mgr.engage(reason, auto=False) if on else mgr.disengage(reason, manual=True))
+    _LOGGER.info("Lockdown %s requested (%s) → active=%s",
+                 "engage" if on else "lift", reason, mgr.active)
+    if action:
+        try:
+            from . import sleep_detection
+            cfg = _CORE.config or {}
+            sleeping, _ = sleep_detection.is_sleeping(
+                h,
+                bedroom_area_ids=cfg.get("bedroom_areas", []) or [],
+                quiet_start=cfg.get("observer_quiet_start", "22:00"),
+                quiet_end=cfg.get("observer_quiet_end", "07:00"),
+            )
+        except Exception:
+            sleeping = False
+        await _emit_action(h, _CORE.config or {}, action, sleeping)
+    return True
+
+
+async def _push_notification(hass, config, message, action_type, snapshot_url=None, household=False):
+    """Push notification to phone, with an optional snapshot image (v6.69.0)."""
+    notify_svc = config.get("notify_service", "")
+    if not notify_svc:
+        return
+    try:
+        svc_domain, svc_name = notify_svc.split(".", 1)
+        data = {"message": message,
+                "title": _notify_i18n().title(action_type, _hass_lang(hass))}
+        img_data = _notification_image_data(hass, snapshot_url)
+        try:
+            from . import driving_mode
+            merged = driving_mode.augment_data(hass, config, action_type, img_data)
+        except Exception:
+            merged = img_data
+        if merged:
+            data["data"] = merged
+        # jh-notify-private (step 158, C3): what the cognitive core infers about people is private, admin phones by default
+        from . import jh_notify
+        # jh-r18-household (step 160): a household alert (an intrusion with no phone app to reach) is never held as private
+        if household or not await jh_notify.send_private(hass, notify_svc, data):
+            await hass.services.async_call(svc_domain, svc_name, data, blocking=False)
+    except Exception as exc:
+        _LOGGER.debug("Cognitive: push notification failed: %s", exc)
+
+
+def _notification_image_data(hass, snapshot_url):
+    """Build the mobile_app notification `data` block that attaches an image.
+    iOS uses `attachment.url`; Android uses `image`. We set both so whichever
+    platform receives it renders the snapshot. Returns {} if no snapshot."""
+    if not snapshot_url:
+        return {}
+    # Make the /local path absolute so the companion app can fetch it off-LAN.
+    url = snapshot_url
+    try:
+        if url.startswith("/"):
+            base = ""
+            try:
+                base = str(hass.config.external_url or hass.config.internal_url or "").rstrip("/")
+            except Exception:
+                base = ""
+            if base:
+                url = base + url
+    except Exception:
+        pass
+    return {
+        "image": url,                       # Android
+        "attachment": {"url": url},         # iOS
+    }
+
+
+async def _notify_all_devices(hass, config, message, action_type, snapshot_url=None):
+    """Push to EVERY connected device — every `notify.mobile_app_*` service the
+    HA companion app registered — plus a persistent notification for confirmed
+    intrusions. Attaches a snapshot image when provided (v6.69.0). Falls back to
+    the single configured service if no per-device services exist."""
+    title = _notify_i18n().title(action_type, _hass_lang(hass))
+    img_data = _notification_image_data(hass, snapshot_url)
+    try:
+        from . import driving_mode
+        merged = driving_mode.augment_data(hass, config, action_type, img_data)
+    except Exception:
+        merged = img_data
+    sent = 0
+    try:
+        services = hass.services.async_services().get("notify", {})
+        for name in list(services):
+            if not name.startswith("mobile_app_"):
+                continue
+            try:
+                payload = {"message": message, "title": title}
+                if merged:
+                    payload["data"] = merged
+                await hass.services.async_call("notify", name, payload, blocking=False)
+                sent += 1
+            except Exception as exc:
+                _LOGGER.debug("notify.%s failed: %s", name, exc)
+    except Exception as exc:
+        _LOGGER.debug("Cognitive: enumerate notify services failed: %s", exc)
+
+    # Fall back to the configured single service if nothing device-specific fired.
+    if sent == 0:
+        await _push_notification(hass, config, message, action_type, snapshot_url, household=True)   # jh-r18-household
+
+    # Always-visible catch-all for a confirmed intrusion.
+    if action_type == "intrusion_confirmed":
+        try:
+            await hass.services.async_call(
+                "persistent_notification", "create",
+                {"message": message, "title": title,
+                 "notification_id": "jarvis_intrusion"},
+                blocking=False)
+        except Exception as exc:
+            _LOGGER.warning("JARVIS: intrusion notification failed to post: %s", exc)
+
+
+# ── Proactive verify-after-act (MCU Phase A, extended to the autonomous path) ──
+# When JARVIS acts of its OWN accord, it should confirm the world actually
+# reached the expected state and record the canonical ActuatorOutcome — the
+# audit's point 18 ("the service returned success" is not "the world reached the
+# expected state"), which matters *most* for actions no human asked for and is
+# watching. Expected end-states for the deterministic services the autonomous
+# path actuates; a service not listed is non-deterministic (no verify, same as
+# control_device). The read-back sleep is a module attr so tests can neutralize
+# it.
+_PROACTIVE_EXPECTED = {
+    "turn_on": ("on",), "turn_off": ("off",),
+    "lock": ("locked",), "unlock": ("unlocked",),
+    "open": ("open",), "close": ("closed",),
+    "open_cover": ("open",), "close_cover": ("closed",),
+}
+_PROACTIVE_TRANSITIONAL = ("opening", "closing", "locking", "unlocking")
+_PROACTIVE_VERIFY_DELAY = 2.0
+_PROACTIVE_VERIFY_SLEEP = asyncio.sleep
+try:
+    from .kernel.actuator import VERIFIED as _P_VERIFIED, MISMATCH as _P_MISMATCH
+except Exception:   # pragma: no cover - defensive, stdlib fallback
+    _P_VERIFIED, _P_MISMATCH = "verified", "mismatch"
+
+
+def _proactive_verify_factory(hass, entity_id: str, expected: tuple, areq):
+    """A 0-arg coroutine factory for ``execute_actuator``'s scheduled verify:
+    after a short delay, read the target back and record the canonical
+    ActuatorOutcome — VERIFIED when the world reached ``expected``, MISMATCH when
+    it did not. An autonomous action does NOT silently re-fire on a mismatch
+    (that would re-actuate the home off-loop without re-checking the agency
+    gates); the mismatch is recorded and surfaced instead. Best-effort; a verify
+    fault never raises into the actuation."""
+    async def _verify() -> None:
+        try:
+            from . import actuation
+            await _PROACTIVE_VERIFY_SLEEP(_PROACTIVE_VERIFY_DELAY)
+            st = hass.states.get(entity_id)
+            s = str(st.state).lower() if st is not None else None
+            if s in _PROACTIVE_TRANSITIONAL:          # still moving — one grace read
+                await _PROACTIVE_VERIFY_SLEEP(_PROACTIVE_VERIFY_DELAY)
+                st = hass.states.get(entity_id)
+                s = str(st.state).lower() if st is not None else None
+            if s is not None and s in expected:
+                actuation.outcome(areq, _P_VERIFIED, hass, entity_id,
+                                  "proactive action reached the expected state")
+            else:
+                actuation.outcome(
+                    areq, _P_MISMATCH, hass, entity_id,
+                    f"proactive action did not reach {'/'.join(expected)} "
+                    f"(state: {s or 'unknown'})")
+                _LOGGER.info(
+                    "proactive verify: %s did not reach %s (state: %s) — "
+                    "recorded a mismatch, not re-firing", entity_id,
+                    "/".join(expected), s or "unknown")
+        except Exception as exc:   # pragma: no cover - best-effort
+            _LOGGER.debug("proactive verify failed for %s: %s", entity_id, exc)
+    return _verify
+
+
+async def _execute_action_data(hass, action_data: dict) -> bool:
+    """
+    Execute a proactive action's service call.
+
+    action_data shape:
+      {"domain": "light", "service": "turn_on",
+       "entity_ids": ["light.x", ...], "service_data": {...optional...}}
+    """
+    if not action_data:
+        return False
+    domain = action_data.get("domain")
+    service = action_data.get("service")
+    entity_ids = action_data.get("entity_ids", [])
+    extra = action_data.get("service_data", {}) or {}
+    if not domain or not service or not entity_ids:
+        return False
+    # MCU Phase G — enforce gates for the *discretionary autonomous* path. This
+    # is JARVIS acting on a learned/trusted pattern of its own accord (never a
+    # user request, never a safety response — those paths do not reach here).
+    # Both gates are best-effort, fail open, and honor their kill-switches.
+    try:
+        from . import actuation
+        # G2 — loop-detect ENFORCE: suppress a thrashing/self-triggering action
+        # (checked first, so a thrash doesn't even consume a budget slot).
+        _key = f"{domain}.{service}:{','.join(str(e) for e in entity_ids)}"
+        loop_ok, _reason = actuation.loop_detect_check(_key)
+        if not loop_ok:
+            _LOGGER.warning(
+                "Proactive action suppressed by loop detector (%s.%s on %s) — "
+                "%s", domain, service, entity_ids, _reason)
+            return False
+        # G1 — agency budget ENFORCE: gate against the self-imposed hourly
+        # ceiling so a feedback loop or over-eager pattern can't flood the house.
+        allowed, _rem = actuation.agency_budget_check()
+        if not allowed:
+            _LOGGER.warning(
+                "Proactive action suppressed by agency budget (%s.%s on %s) — "
+                "autonomous-action ceiling reached", domain, service, entity_ids)
+            return False
+        # MCU Phase H — safety-situation suppression: while an intrusion or hazard
+        # situation is actively being handled (tracked off the situation event
+        # stream by the bus reactor), pause this discretionary autonomy so routine
+        # learned automations don't fire into or interfere with the security /
+        # safety response. Fails open; reversible via
+        # SITUATION_AUTONOMY_SUPPRESS_ENFORCE. Never affects user requests or
+        # safety responses — those do not reach this path.
+        _safety_active, _skinds = actuation.safety_situation_active()
+        if _safety_active:
+            _LOGGER.info(
+                "Proactive action suppressed — a safety situation is active "
+                "(%s): %s.%s on %s", "/".join(_skinds), domain, service, entity_ids)
+            # Phase AE (conflicting_priorities — convenience vs. safety): a
+            # discretionary (convenience/household-tier) action was about to run,
+            # but an active safety situation outranks it on the priority ladder, so
+            # it is withheld. That IS the convenience-vs-safety scenario resolving
+            # in safety's favour — a closed loop (situation elevated → priority
+            # ladder → convenience suppressed), reconstructable from the situation
+            # stream. Observe-only; never affects the suppression decision.
+            try:
+                from .kernel import certification as CERT
+                certification_observe(
+                    CERT.CONFLICTING_PRIORITIES, closed_loop=True,
+                    note=f"convenience withheld; safety situation active "
+                         f"({'/'.join(_skinds) or 'safety'})")
+            except Exception:  # pragma: no cover - defensive, observe-only
+                pass
+            return False
+    except Exception:   # pragma: no cover - defensive, fail open
+        pass
+    # MCU Phase H (H5): route the proactive actuation through the UNIVERSAL
+    # ACTUATOR SEAM (actuation.execute_actuator) — the same Execution (kernel
+    # planner) -> Event path control_device/bulk_control/scenes use — per target,
+    # instead of a direct multi-entity hass.services call. The G1/G2 gates above
+    # still decide WHETHER the proactive action runs; the seam decides HOW it is
+    # executed and recorded. Best-effort: returns True if at least one target
+    # actuated (so a wholly-failed action makes no "I did it" claim).
+    capability = f"{domain}.{service}"
+    # Verify-after-act for the deterministic services JARVIS actuates of its own
+    # accord (turn_on/off, lock/unlock, open/close): confirm the world reached
+    # the expected state and record the canonical outcome. Non-deterministic
+    # services get no verify (expected is None), exactly like control_device.
+    _expected = _PROACTIVE_EXPECTED.get(service)
+    successes = 0
+    for eid in entity_ids:
+        # Authority ENFORCE (MCU Phase G4b): the kernel engine's verdict gates this
+        # *discretionary autonomous* actuation per target, max-restriction. G1/G2
+        # already decided WHETHER to proceed (legacy allow); the engine can only
+        # tighten that. A held verdict means JARVIS does NOT act of its own accord
+        # on this target — there is no one to confirm an autonomous action, so it
+        # FAILS CLOSED and skips (the engine never lets an autonomous security
+        # action through). Fail-safe to the legacy allow on any engine fault.
+        try:
+            from . import authority_bridge
+            _eff_ok, _authz = authority_bridge.enforced_decision(
+                hass, domain, service, legacy_ok=True, scope=eid,
+                intent="proactive")
+        except Exception:   # pragma: no cover - fail-safe to legacy allow
+            _eff_ok = True
+        if not _eff_ok:
+            _LOGGER.info("Proactive action held by the authority engine, "
+                         "skipped: %s.%s on %s", domain, service, eid)
+            continue
+        # MCU Phase H — cross-path thrash gate: the event-bus reactor has been
+        # fed this target's actuations from EVERY path (not just this one), so a
+        # system-wide oscillation the per-path G2 gate can't see shows up here.
+        # Back off this target on confirmed cross-path thrash. Fails open.
+        try:
+            from . import actuation
+            _stream_ok, _sreason = actuation.stream_thrash_check(f"{capability}:{eid}")
+        except Exception:   # pragma: no cover - fail open
+            _stream_ok = True
+        if not _stream_ok:
+            _LOGGER.warning("Proactive action suppressed by cross-path thrash "
+                            "(%s on %s) — %s", capability, eid, _sreason)
+            continue
+        try:
+            from . import actuation
+            data = {"entity_id": eid, **extra}
+            # Pre-action context snapshot through the WorldModel facade — the
+            # canonical context authority — so the autonomous actuation is read,
+            # area-tagged and recorded the same way control_device / run_scene do
+            # (world_model parity), rather than acting blind on raw state.
+            _ctx = actuation.context(hass, eid)
+            areq = actuation.request(capability, eid, params=data, action=service,
+                                     expected=_expected)
+            _verify = (_proactive_verify_factory(hass, eid, _expected, areq)
+                       if _expected else None)
+            ok, _detail = await actuation.execute_actuator(
+                hass, capability=capability, entity_id=eid, domain=domain,
+                service=service, data=data, action=service, areq=areq,
+                area=(_ctx or {}).get("area"), verify=_verify, blocking=True)
+            if ok:
+                successes += 1
+        except Exception as exc:   # pragma: no cover - defensive
+            _LOGGER.warning("Proactive action failed (%s.%s on %s): %s",
+                            domain, service, eid, exc)
+    return successes > 0
+
+
+def _autonomous_done_message(offer: dict) -> str:
+    """Convert an offer into a past-tense 'I did this' notification."""
+    t = offer.get("type", "")
+    ad = offer.get("action_data", {})
+    n = len(ad.get("entity_ids", []))
+    if t == "proactive_lights":
+        return "I turned the lights on for you — it was dark and you were there."
+    if t == "proactive_stale_light":
+        return "I turned off a light left on in an empty room to save energy."
+    if t == "proactive_hvac":
+        return "I set the climate back to eco — no one's home."
+    return f"I handled {n} device(s) for you automatically."
+
+
+async def _loop():
+    """Main cognitive loop — runs every TICK_INTERVAL seconds."""
+    _LOGGER.info("Cognitive Core loop started")
+    # Yield before the first tick. Even as a background task, running a full
+    # state-scanning tick synchronously at entry would do real work while HA is
+    # still bringing entities up — both wasteful (state is incomplete) and
+    # needless load during boot. A short delay lets startup settle first.
+    try:
+        await asyncio.sleep(min(TICK_INTERVAL, 30))
+    except asyncio.CancelledError:
+        return
+    while _CORE.running:
+        try:
+            await _tick()
+        except Exception as exc:
+            _LOGGER.warning("Cognitive tick error: %s", exc)
+        await asyncio.sleep(TICK_INTERVAL)
+
+
+# ── Public API ──────────────────────────────────────────────────────────────
+
+def ignore(entity_pattern: str, duration_minutes: int = 0,
+           reason: str = "") -> dict:
+    """Add an ignore rule. Called by the agent's 'ignore' tool."""
+    if _CORE.ignore_mgr:
+        rule = _CORE.ignore_mgr.add(entity_pattern, duration_minutes, reason)
+        return {
+            "success": True,
+            "pattern": rule.entity_pattern,
+            "duration": duration_minutes,
+            "reason": reason,
+        }
+    return {"success": False, "error": "Cognitive core not running"}
+
+
+def unignore(entity_pattern: str) -> dict:
+    """Remove an ignore rule."""
+    if _CORE.ignore_mgr:
+        removed = _CORE.ignore_mgr.remove(entity_pattern)
+        return {"success": removed, "pattern": entity_pattern}
+    return {"success": False, "error": "Cognitive core not running"}
+
+
+async def async_ignore(hass, entity_pattern: str, duration_minutes: int = 0,
+                       reason: str = "") -> dict:
+    """:func:`ignore` for event-loop callers: mutate the rules on the loop (where
+    the cognition tick reads them) and write the file in the executor."""
+    mgr = _CORE.ignore_mgr
+    if not mgr:
+        return {"success": False, "error": "Cognitive core not running"}
+    rule = mgr.add(entity_pattern, duration_minutes, reason, save=False)
+    await hass.async_add_executor_job(mgr.write_snapshot, mgr.snapshot())
+    return {"success": True, "pattern": rule.entity_pattern,
+            "duration": duration_minutes, "reason": reason}
+
+
+async def async_unignore(hass, entity_pattern: str) -> dict:
+    """:func:`unignore` for event-loop callers (file write in the executor)."""
+    mgr = _CORE.ignore_mgr
+    if not mgr:
+        return {"success": False, "error": "Cognitive core not running"}
+    removed = mgr.remove(entity_pattern, save=False)
+    if removed:
+        await hass.async_add_executor_job(mgr.write_snapshot, mgr.snapshot())
+    return {"success": removed, "pattern": entity_pattern}
+
+
+def list_ignores() -> list[dict]:
+    """List all active ignore rules."""
+    if _CORE.ignore_mgr:
+        return _CORE.ignore_mgr.list_rules()
+    return []
+
+
+def is_ignored(entity_id: str) -> bool:
+    """Check if an entity is currently ignored."""
+    if _CORE.ignore_mgr:
+        return _CORE.ignore_mgr.is_ignored(entity_id)
+    return False
+
+
+def log_command(text: str, handled_by: str = "agent",
+                entity_ids: list = None, person: str = "unknown"):
+    """Record a command for pattern learning."""
+    if _CORE.state_logger:
+        _CORE.state_logger.log_command(text, handled_by, entity_ids, person)
+
+
+def status() -> dict:
+    """Return cognitive core status for diagnostics."""
+    stats = {}
+    if _CORE.state_logger:
+        stats = _CORE.state_logger.get_pattern_stats()
+    last_analysis = {}
+    try:
+        from .pattern_analyzer import get_analyzer
+        last_analysis = dict(get_analyzer()._last_result)
+    except Exception:
+        last_analysis = {}
+    return {
+        "running": _CORE.running,
+        "tick_count": _CORE.tick_count,
+        "actions_taken": _CORE.actions_taken,
+        "offers_made": _CORE.offers_made,
+        "autonomous_actions": _CORE.autonomous_actions,
+        "autonomy_grants": _CORE.autonomy_mgr.list_grants() if _CORE.autonomy_mgr else [],
+        "uptime_hours": round((time.time() - _CORE.startup_time) / 3600, 1)
+        if _CORE.startup_time else 0,
+        "last_tick_ago": round(time.time() - _CORE.last_tick, 1)
+        if _CORE.last_tick else 0,
+        "ignore_rules": len(list_ignores()),
+        "learning": stats,
+        "last_analysis": last_analysis,
+        "certification": certification_report(),   # Phase AE parity dashboard
+    }
+
+
+def _backfill_filter_states(events: list, interval: float, cap: int = 1000) -> list:
+    """Chronological ``(epoch, state)`` events → filtered ``[(epoch, state)]``
+    for backfill: drop unavailable/unknown and no-change, apply the per-entity
+    rate limit, and keep only the most recent ``cap``. This is the anti-flood
+    core — importing 30 days of a chatty motion sensor's history through this
+    stays bounded, so backfill can't reintroduce the flood that was just killed.
+    """
+    from collections import deque
+    out: deque = deque(maxlen=max(1, cap))
+    last = None
+    prev = None
+    for epoch, st in events:
+        if st is None or st in ("unavailable", "unknown") or st == prev:
+            continue
+        prev = st
+        if last is not None and (epoch - last) < interval:
+            continue
+        out.append((epoch, st))
+        last = epoch
+    return list(out)
+
+
+async def backfill_from_history(hass: HomeAssistant, days: int = 30) -> dict:
+    """Import recent recorder history for pattern-relevant entities JARVIS isn't
+    already logging (e.g. motion/occupancy just opted in), so Analyze Now can
+    find routines from PAST behavior instead of only data since a setting was
+    enabled. Safe by construction: applies the same domain filter + class-aware
+    rate limit as live logging (motion capped hard), only touches entities with
+    no existing rows (no double-count), and is capped per-entity and globally.
+    """
+    out = {"imported": 0, "entities": 0, "considered": 0}
+    if not _CORE.state_logger:
+        return out
+    try:
+        from homeassistant.components.recorder import get_instance, history
+        from homeassistant.util import dt as dt_util
+    except Exception:
+        return out
+
+    _meta = ("automation", "script", "scene", "input_boolean", "input_number")
+    _noisy = ("sensor", "binary_sensor", "weather", "sun", "update", "device_tracker")
+    dc_by: dict = {}
+    relevant: list = []
+    try:
+        for state in hass.states.async_all():
+            eid = state.entity_id
+            dom = eid.split(".")[0]
+            dc = state.attributes.get("device_class") or ""
+            dc_by[eid] = dc
+            if dom in _meta:
+                continue
+            if dom in _noisy and not _pattern_opted_in(eid, dc):
+                continue
+            relevant.append(eid)
+    except Exception:
+        return out
+    if not relevant:
+        return out
+
+    existing = await hass.async_add_executor_job(
+        _CORE.state_logger.distinct_logged_entities)
+    todo = [e for e in relevant if e not in existing][:250]   # cap breadth
+    out["considered"] = len(todo)
+    if not todo:
+        return out
+
+    try:
+        days = max(1, min(int(days), 30))
+    except Exception:
+        days = 30
+    end = dt_util.utcnow()
+    start = end - timedelta(days=days)
+
+    def _fetch():
+        return history.get_significant_states(
+            hass, start, end, todo, minimal_response=True, no_attributes=True)
+
+    try:
+        raw = await get_instance(hass).async_add_executor_job(_fetch)
+    except Exception as exc:
+        _LOGGER.debug("JARVIS backfill: history fetch failed: %s", exc)
+        return out
+    if not raw:
+        return out
+
+    rows: list = []
+    for eid, states in raw.items():
+        dom = eid.split(".")[0]
+        interval = _pattern_log_interval(dc_by.get(eid, ""))
+        events: list = []
+        for s in states:
+            try:
+                st = getattr(s, "state", None)
+                when = (getattr(s, "last_changed", None)
+                        or getattr(s, "last_updated", None))
+                if st is None and isinstance(s, dict):
+                    st = s.get("state")
+                    when = s.get("last_changed") or s.get("last_updated")
+                if st is None or when is None:
+                    continue
+                epoch = when.timestamp() if hasattr(when, "timestamp") else None
+                if epoch is not None:
+                    events.append((epoch, st))
+            except Exception:
+                continue
+        kept = _backfill_filter_states(events, interval)
+        for epoch, st in kept:
+            rows.append((_jh_tz_dt(epoch).isoformat(),
+                         eid, dom, "unknown", st))
+        if kept:
+            out["entities"] += 1
+        if len(rows) >= 20000:                                # global safety cap
+            break
+
+    out["imported"] = await hass.async_add_executor_job(
+        _CORE.state_logger.bulk_insert_history, rows)
+    return out
+
+
+async def run_analysis_now(hass: HomeAssistant) -> dict:
+    """Force a pattern-analysis pass now, bypassing ONLY the 6-hour throttle.
+
+    The data-sufficiency gate still applies (>= 7 days and >= 50 recorded
+    changes), so this can't produce noise on a fresh install. Returns a result
+    dict the panel can show: whether it ran, and if not, why; if it did, how many
+    patterns were found and suggestions stored.
+    """
+    from .pattern_analyzer import get_analyzer, set_thresholds
+    analyzer = get_analyzer()
+    analyzer._last_analysis = 0.0  # bypass the 6h throttle for this manual run
+
+    # Backfill recorder history for any pattern-relevant entities we aren't
+    # logging yet (e.g. motion/occupancy just opted in), so this finds routines
+    # from PAST behavior instead of only data since the setting was enabled.
+    backfill = {}
+    try:
+        backfill = await backfill_from_history(hass, days=30)
+    except Exception:
+        backfill = {}
+
+    stats = {}
+    if _CORE.state_logger:
+        try:
+            stats = await hass.async_add_executor_job(
+                _CORE.state_logger.get_pattern_stats)
+        except Exception:
+            stats = {}
+
+    if not await hass.async_add_executor_job(analyzer.should_analyze):
+        return {
+            "ran": False,
+            "reason": ("Not enough history yet — pattern learning needs about a "
+                       "week of data (\u2265 7 days and \u2265 50 recorded changes)."),
+            "days_of_data": stats.get("days_of_data", 0),
+            "state_changes": stats.get("state_changes", 0),
+            "backfill": backfill,
+        }
+
+    cfg = _CORE.config or {}
+    try:
+        _occ = int(cfg.get("pattern_min_occurrences", 4) or 4)
+    except Exception:
+        _occ = 4
+    try:
+        _conf = float(cfg.get("pattern_confidence", 0.55) or 0.55)
+    except Exception:
+        _conf = 0.55
+    set_thresholds(_occ, _conf)
+
+    patterns = await analyzer.analyze(hass)
+    res = dict(analyzer._last_result)
+    res["ran"] = True
+    res.setdefault("patterns_found", len(patterns))
+    res["state_changes"] = stats.get("state_changes", 0)
+    res["days_of_data"] = stats.get("days_of_data", 0)
+    res["backfill"] = backfill
+    try:
+        res["diagnostic"] = await hass.async_add_executor_job(
+            analyzer.pattern_diagnostic)
+    except Exception:
+        res["diagnostic"] = {}
+    return res
+
+
+# ── Proactive offer API (v5.9.07) ───────────────────────────────────────────
+
+def _jh_areas_of(hass, entity_ids) -> list:
+    """Review round 15 (jh-r15-offer): the rooms of the speakers an offer was spoken on (entity area, else its device's)."""
+    out = []
+    try:
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        ents, devs = er.async_get(hass), dr.async_get(hass)
+        for eid in entity_ids or []:
+            ent = ents.async_get(eid)
+            area = getattr(ent, "area_id", None) if ent is not None else None
+            if not area and ent is not None and getattr(ent, "device_id", None):
+                dev = devs.async_get(ent.device_id)
+                area = getattr(dev, "area_id", None) if dev is not None else None
+            if area and area not in out:
+                out.append(area)
+    except Exception:
+        return []
+    return out
+
+
+_JH_OFFER_SERVICE_ACTION = {"turn_on": "turn_on", "turn_off": "turn_off", "lock": "lock", "unlock": "unlock",
+                            "open_cover": "open", "close_cover": "close"}
+
+
+async def _jh_offer_confirm(hass, action_data) -> tuple:
+    """Review round 15 (jh-r15-offer): (confirmed ids, {unconfirmed id: state}) after an accepted offer, through the local
+    engine's shared check. A service without a known end state is never counted as confirmed."""
+    ids = list((action_data or {}).get("entity_ids") or [])
+    act = _JH_OFFER_SERVICE_ACTION.get(str((action_data or {}).get("service") or ""))
+    try:
+        if act:
+            from .local_engine import _jh_confirm_all
+            return await _jh_confirm_all(hass, act, ids)
+    except Exception:
+        pass
+    return [], {e: str(getattr(hass.states.get(e), "state", "unknown")) for e in ids}
+
+
+def get_pending_offer() -> Optional[dict]:
+    """Return the offer currently awaiting a yes/no, if any."""
+    return _CORE.pending_offer
+
+
+async def accept_pending_offer(record: bool = True) -> dict:
+    """
+    User said yes to the pending proactive offer. Execute it and record the
+    acceptance toward graduated autonomy. Returns a result dict.
+    """
+    offer = _CORE.pending_offer
+    if not offer:
+        return {"ok": False, "reason": "no pending offer"}
+    _CORE.pending_offer = None
+    _CORE.pending_offer_origin = None
+    ok = await _execute_action_data(_CORE.hass, offer.get("action_data", {}))
+    pkey = offer.get("pattern_key", "")
+    # review round 15 (jh-r15-offer): "Done" and learning only for what the devices confirmed
+    conf, unc = (await _jh_offer_confirm(_CORE.hass, offer.get("action_data", {}))) if ok else ([], {})
+    seen = {"confirmed": conf, "unconfirmed": unc}
+    if ok and (not record or unc or not conf):
+        if conf:
+            _CORE.actions_taken += 1   # Jarvis Home patch: done once, nothing learned from it
+        return {"ok": True, **seen}
+    if ok and pkey and _CORE.autonomy_mgr:
+        grant = await _CORE.autonomy_mgr.async_record_acceptance(
+            _CORE.hass, pkey, 0.9
+        )
+        _CORE.actions_taken += 1
+        return {
+            "ok": True, "pattern_key": pkey,
+            "approvals": grant.get("approvals", 0),
+            "now_autonomous": grant.get("granted", False), **seen,
+        }
+    return {"ok": ok, **seen}
+
+
+def decline_pending_offer() -> dict:
+    """User said no. Clear the offer and reset trust toward that pattern."""
+    offer = _CORE.pending_offer
+    _CORE.pending_offer = None
+    if offer and _CORE.autonomy_mgr:
+        pkey = offer.get("pattern_key", "")
+        if pkey:
+            _CORE.autonomy_mgr.record_rejection(pkey)
+    return {"ok": True}
+
+
+async def async_decline_pending_offer() -> dict:
+    """Clear the offer on the loop and persist autonomy changes off-loop."""
+    offer = _CORE.pending_offer
+    _CORE.pending_offer = None
+    if offer and _CORE.autonomy_mgr:
+        pkey = offer.get("pattern_key", "")
+        if pkey:
+            await _CORE.autonomy_mgr.async_record_rejection(_CORE.hass, pkey)
+    return {"ok": True}
+
+
+def revoke_autonomy(pattern_key: str) -> dict:
+    """Revoke a previously-granted autonomous action."""
+    if _CORE.autonomy_mgr and _CORE.autonomy_mgr.revoke(pattern_key):
+        return {"ok": True, "pattern_key": pattern_key}
+    return {"ok": False, "reason": "no such grant"}
+
+
+async def async_revoke_autonomy(pattern_key: str) -> dict:
+    """Mutate autonomy state on the loop and persist its snapshot off-loop."""
+    if _CORE.autonomy_mgr and await _CORE.autonomy_mgr.async_revoke(
+            _CORE.hass, pattern_key):
+        return {"ok": True, "pattern_key": pattern_key}
+    return {"ok": False, "reason": "no such grant"}
+
+
+# ── Start / Stop ────────────────────────────────────────────────────────────
+
+async def start(hass: HomeAssistant, config: dict) -> None:
+    """Start the cognitive core."""
+    if _CORE.running:
+        await stop()
+
+    _CORE.hass = hass
+    _CORE.config = config
+    _CORE.running = True
+    _CORE.startup_time = time.time()
+    _CORE.tick_count = 0
+    _CORE.actions_taken = 0
+    _CORE.offers_made = 0
+    _CORE.autonomous_actions = 0
+    _CORE.pending_offer = None
+
+    _CORE.ignore_mgr = await hass.async_add_executor_job(IgnoreManager)
+    _CORE.safety_mgr = SafetyManager(hass, config)
+    _CORE.lockdown_mgr = await hass.async_add_executor_job(
+        LockdownManager, hass, config)          # __init__ reads lockdown_state.json
+    _CORE.proactive_mgr = ProactiveManager(hass, config)
+    _CORE.autonomy_mgr = await hass.async_add_executor_job(AutonomyManager)
+    _CORE.state_logger = await hass.async_add_executor_job(StateLogger)
+
+    # Lockdown alarm-sync (engage on arm / lift on disarm), event-driven and
+    # independent of the loop below; applies the current alarm state now.
+    try:
+        await ensure_lockdown(hass, config)
+    except Exception as exc:
+        _LOGGER.warning("Lockdown wiring in start() failed: %s", exc)
+
+    # Restore the cognition model (per-entity rhythm) so anticipation survives
+    # restarts and keeps accumulating across days.
+    try:
+        from . import cognition
+        await hass.async_add_executor_job(
+            cognition.load_from_db,
+            config_path_str("jarvis", "patterns.db", hass=hass),
+        )
+    except Exception as exc:
+        _LOGGER.debug("cognition load on start failed: %s", exc)
+
+    _CORE.unsub = hass.bus.async_listen("state_changed", _on_state_changed)
+    # The cognitive loop runs for the lifetime of the integration. It MUST be a
+    # *background* task — a plain async_create_task is tracked as part of config-
+    # entry setup, so HA's bootstrap waits on it to finish before completing
+    # startup. Since the loop never returns, that wait runs to the full timeout
+    # and HA logs "Something is blocking Home Assistant from wrapping up the
+    # start up phase … waiting for tasks: _loop()". Background tasks are exempt
+    # from that wait by design. (Fallback for cores predating the helper.)
+    if hasattr(hass, "async_create_background_task"):
+        _CORE.task = hass.async_create_background_task(_loop(), "jarvis_cognitive_loop")
+    else:
+        _CORE.task = hass.async_create_task(_loop())
+
+    stats = await hass.async_add_executor_job(
+        _CORE.state_logger.get_pattern_stats
+    )
+    _LOGGER.info(
+        "JARVIS Cognitive Core started — %d days of data, "
+        "%d state changes logged, %d patterns learned, "
+        "%d active ignore rules, %d autonomy grants",
+        stats.get("days_of_data", 0),
+        stats.get("state_changes", 0),
+        stats.get("patterns", 0),
+        len(_CORE.ignore_mgr.list_rules()),
+        len(_CORE.autonomy_mgr.list_grants()),
+    )
+
+
+async def stop() -> None:
+    """Stop the cognitive core."""
+    _CORE.running = False
+    _CORE.pending_offer = None  # don't let a stale offer survive a restart
+    if _CORE.task:
+        _CORE.task.cancel()
+        try:
+            await _CORE.task
+        except (asyncio.CancelledError, Exception):
+            pass
+    if _CORE.unsub:
+        try:
+            _CORE.unsub()
+        except Exception:
+            pass
+    if _CORE.alarm_unsub:
+        try:
+            _CORE.alarm_unsub()
+        except Exception:
+            pass
+        _CORE.alarm_unsub = None
+    _LOGGER.info(
+        "JARVIS Cognitive Core stopped — %d ticks, %d actions taken",
+        _CORE.tick_count, _CORE.actions_taken,
+    )

@@ -1,0 +1,587 @@
+"""
+JARVIS whole-house energy management (v6.62.0).
+
+The appliance monitor already SENSES power — it finds the whole-home meter,
+fingerprints appliances by wattage, and tracks what's running. This module is
+the MANAGEMENT layer on top: it reads current draw, understands what's drawing,
+and helps run the house efficiently — surfacing high-draw situations, warning
+before a configured peak, and (at higher agency levels) deferring or staggering
+high-draw loads.
+
+Configurable agency ladder (energy_agency config key):
+  - "advisory"  (default) — only surfaces insights; never touches a load.
+  - "opt_in"              — may propose deferring/staggering a load; acts only
+                            after approval (routed through the normal suggestion
+                            path — no new approval UI).
+  - "autonomous"          — may auto-defer high-draw loads when over the peak
+                            threshold, within user-set limits.
+
+Mode-aware: the active operational mode can raise the effective agency — e.g.
+"away" enables more aggressive saving than the household would want while home.
+A mode never RAISES agency past what the user configured as their ceiling; it
+can only be as aggressive as `energy_agency` permits. Safety is never touched:
+this module never sheds a load tagged critical (medical, security, network) and
+never acts on anything not explicitly an appliance/high-draw device.
+
+Nothing here raises to the caller; every entry point returns a status dict.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+_LOGGER = logging.getLogger(__name__)
+
+AGENCY_ADVISORY = "advisory"
+AGENCY_OPT_IN = "opt_in"
+AGENCY_AUTONOMOUS = "autonomous"
+_AGENCY_ORDER = {AGENCY_ADVISORY: 0, AGENCY_OPT_IN: 1, AGENCY_AUTONOMOUS: 2}
+
+# Default peak threshold (watts) above which the home is "drawing heavily".
+_DEFAULT_PEAK_W = 8000.0
+
+# Loads we never shed regardless of agency — matched against entity_id/name.
+_NEVER_SHED = ("medical", "cpap", "oxygen", "fridge", "freezer", "refrigerator",
+               "security", "alarm", "network", "router", "modem", "server",
+               "sump", "well_pump", "furnace", "boiler", "heat")
+
+# Phase X (roadmap) — kernel.environment SHADOW. Mirror the live power picture
+# into the kernel environment model's efficiency objective and log its verdict
+# alongside this module's own over-peak decision. Observe-only; drives nothing.
+ENVIRONMENT_SHADOW = True
+
+
+def _environment_shadow(st: dict) -> None:
+    """Phase X shadow: feed the whole-home draw into kernel.environment and log
+    its efficiency verdict + would-be recommendation against the incumbent
+    over_peak decision. Observe-only, kill-switched, and defensive — a failure
+    here can never reach the energy path. Flip ENVIRONMENT_SHADOW off to silence.
+    """
+    if not ENVIRONMENT_SHADOW:
+        return
+    try:
+        watts = st.get("watts")
+        peak = st.get("peak_watts")
+        if watts is None or not peak:
+            return
+        from .kernel import environment as ENV
+        eff = ENV.efficiency(float(watts), peak_w=float(peak))
+        # Efficiency objective only here (energy has no comfort readings); the
+        # proactive path carries no active safety concern, so recommendations are
+        # unguarded — the safety guard is exercised where a hazard is live.
+        recs = ENV.recommend(None, eff)
+        _LOGGER.debug(
+            "environment(shadow): draw=%.0fW peak=%.0fW util=%.2f kernel_over=%s "
+            "incumbent_over_peak=%s agree=%s recs=%d",
+            eff.draw, eff.peak, eff.utilization, eff.over,
+            st.get("over_peak"), eff.over == bool(st.get("over_peak")), len(recs),
+        )
+    except Exception as exc:
+        _LOGGER.debug("environment shadow failed: %s", exc)
+
+
+# Phase X (roadmap) — kernel.environment PARITY. Over real proactive ticks, track
+# how often the kernel environment recommender's *actionable* efficiency verdict
+# agrees with this module's incumbent decision to surface an energy offer, and
+# log the running agreement. Observe-only; this is the quantified bar the
+# owner-gated enforce rung must clear. Flip ENVIRONMENT_PARITY off to silence.
+ENVIRONMENT_PARITY = True
+_ENV_PARITY_LOG_EVERY = 10
+_ENV_PARITY = {"n": 0, "agree": 0, "kernel_only": 0, "incumbent_only": 0}
+
+
+def _environment_parity(st: dict) -> None:
+    """Phase X parity: compare the kernel recommender's actionable efficiency
+    verdict against the incumbent 'would surface an energy offer' predicate
+    (over peak AND >=2 sheddable loads), accumulate agreement, and log the
+    running rate. The expected divergence is the kernel recommending on 'over
+    peak' alone while the incumbent also requires something to stagger — the
+    signal the enforce rung reconciles. Observe-only, kill-switched, defensive.
+    """
+    if not ENVIRONMENT_PARITY:
+        return
+    try:
+        watts = st.get("watts")
+        peak = st.get("peak_watts")
+        if watts is None or not peak:
+            return
+        from .kernel import environment as ENV
+        eff = ENV.efficiency(float(watts), peak_w=float(peak))
+        kernel_rec = any(r.actionable for r in ENV.recommend(None, eff))
+        sheddable = sum(1 for a in (st.get("running") or []) if a.get("shed_ok"))
+        incumbent_offer = bool(st.get("over_peak")) and sheddable >= 2
+
+        _ENV_PARITY["n"] += 1
+        if kernel_rec == incumbent_offer:
+            _ENV_PARITY["agree"] += 1
+        elif kernel_rec:
+            _ENV_PARITY["kernel_only"] += 1
+        else:
+            _ENV_PARITY["incumbent_only"] += 1
+
+        n = _ENV_PARITY["n"]
+        if n % _ENV_PARITY_LOG_EVERY == 0 or kernel_rec != incumbent_offer:
+            _LOGGER.debug(
+                "environment(parity): n=%d agree=%.2f kernel_rec=%s "
+                "incumbent_offer=%s kernel_only=%d incumbent_only=%d",
+                n, _ENV_PARITY["agree"] / n, kernel_rec, incumbent_offer,
+                _ENV_PARITY["kernel_only"], _ENV_PARITY["incumbent_only"],
+            )
+    except Exception as exc:
+        _LOGGER.debug("environment parity failed: %s", exc)
+
+
+# Phase X (roadmap) — kernel.environment ENFORCE (owner-gated). When enabled, the
+# kernel environment recommender's actionable efficiency verdict becomes the
+# authority for the "home is over peak" determination that gates a proactive
+# energy offer — the step the parity rung measured. Default OFF, so shipping is
+# byte-for-byte behaviour-preserving; the household flips `environment_enforce`
+# after watching the environment(parity) agreement log. Fail-safe: any error
+# falls back to the legacy `over_peak` threshold, and the >=2-sheddable guard in
+# evaluate_for_proactive is unchanged, so an over-peak verdict with nothing to
+# stagger still surfaces nothing.
+ENVIRONMENT_ENFORCE = False
+
+
+def _environment_enforce_on() -> bool:
+    """True when the environment enforce flip is active (module flag or the
+    `environment_enforce` config key). Never raises."""
+    if ENVIRONMENT_ENFORCE:
+        return True
+    try:
+        from . import jarvis_config
+        return bool(jarvis_config.get("environment_enforce", False))
+    except Exception:
+        return False
+
+
+def _environment_over_peak(st: dict) -> bool:
+    """The effective over-peak verdict gating a proactive energy offer: the
+    kernel environment recommender under enforce, else the legacy threshold.
+    Fail-safe — any error returns the legacy `over_peak`. Never raises."""
+    legacy = bool(st.get("over_peak"))
+    if not _environment_enforce_on():
+        return legacy
+    try:
+        watts = st.get("watts")
+        peak = st.get("peak_watts")
+        if watts is None or not peak:
+            return legacy
+        from .kernel import environment as ENV
+        eff = ENV.efficiency(float(watts), peak_w=float(peak))
+        return any(r.actionable for r in ENV.recommend(None, eff))
+    except Exception:
+        return legacy
+
+
+def _cfg(key: str, default=None):
+    try:
+        from . import jarvis_config
+        v = jarvis_config.get(key, default)
+        return v if v is not None else default
+    except Exception:
+        return default
+
+
+def _configured_agency() -> str:
+    a = str(_cfg("energy_agency", AGENCY_ADVISORY) or AGENCY_ADVISORY).lower()
+    return a if a in _AGENCY_ORDER else AGENCY_ADVISORY
+
+
+def _mode_agency_bonus() -> int:
+    """A mode may nudge agency up by one step (e.g. 'away'). Returns 0 or 1.
+    Never lets the effective level exceed the user's configured ceiling."""
+    try:
+        from . import modes
+        # Which modes are allowed to bump energy agency — configurable, with a
+        # sensible default (away/focus lean toward saving).
+        bump_modes = _cfg("energy_mode_bump", [])  # opt-in: empty = mode never changes agency
+        if isinstance(bump_modes, list) and modes.active_mode() in bump_modes:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def effective_agency() -> str:
+    """The agency level in force right now.
+
+    Baseline is exactly what the user configured in `energy_agency` — no
+    surprises: choose 'autonomous' and you get autonomy, choose 'advisory' and
+    JARVIS only ever advises. Separately, a mode listed in `energy_mode_bump`
+    (e.g. 'away') can raise the level ONE step for the duration of that mode —
+    letting the house save more aggressively while you're out. The bump is
+    additive and purely opt-in (empty bump list → mode never changes agency),
+    and it's capped at 'autonomous'. A user who wants zero mode influence simply
+    leaves `energy_mode_bump` empty.
+    """
+    base_rank = _AGENCY_ORDER[_configured_agency()]
+    effective_rank = min(base_rank + _mode_agency_bonus(), _AGENCY_ORDER[AGENCY_AUTONOMOUS])
+    for name, rank in _AGENCY_ORDER.items():
+        if rank == effective_rank:
+            return name
+    return _configured_agency()
+
+
+def _peak_threshold() -> float:
+    try:
+        return float(_cfg("energy_peak_watts", _DEFAULT_PEAK_W) or _DEFAULT_PEAK_W)
+    except (ValueError, TypeError):
+        return _DEFAULT_PEAK_W
+
+
+def _never_shed(entity_id: str, name: str) -> bool:
+    hay = f"{entity_id} {name}".lower()
+    return any(tok in hay for tok in _NEVER_SHED)
+
+
+# ── current power picture (reuses appliance_monitor's meter discovery) ───────
+
+def _read_whole_home_watts(hass, states=None) -> tuple[Optional[float], str]:
+    """Current whole-home power in watts (SIGNED — positive is grid import /
+    consumption, negative is export), plus the source entity. (None, eid|'') when
+    unreadable.
+
+    An explicit ``energy_power_sensor`` config entity wins over auto-discovery, so
+    JARVIS stops guessing the meter (issue #476 — auto-discovery could latch onto a
+    Powerwall *max-discharge-capability* entity and raise constant false "over
+    peak" alerts). When one is configured it is used exclusively: no silent revert
+    to the mis-detected sensor. Only when unset do the appliance-monitor /
+    heuristic discovery paths run, preserving existing installs. kW is normalised
+    to W; the value keeps its sign so export can be told from consumption."""
+    configured = _cfg("energy_power_sensor", None)
+    eid = None
+    if configured:
+        eid = str(configured).strip()
+        if not eid.startswith("sensor."):
+            return None, eid  # honour a misconfigured override (show no reading)
+    if not eid:
+        if states is not None:
+            eid = _find_whole_home_meter(states)
+        else:
+            try:
+                from . import appliance_monitor
+                tracker = appliance_monitor._discover_whole_home_meter(hass)
+                # tracker exposes the entity; re-read its live value for freshness
+                eid = getattr(tracker, "entity_id", None) if tracker else None
+            except Exception:
+                eid = None
+        if not eid:
+            # fallback: scan for a plausible whole-home meter directly
+            eid = _fallback_meter(hass, states)
+    if not eid:
+        return None, ""
+
+    st = states.get(eid) if states is not None else hass.states.get(eid)
+    if st is None:
+        return None, eid
+    try:
+        val = float(st.state)
+        unit = (st.attributes.get("unit_of_measurement") or "").lower()
+        if unit == "kw":
+            val *= 1000.0
+        elif unit not in ("w", ""):
+            return None, eid  # not a power reading we understand
+        return val, eid
+    except (ValueError, TypeError):
+        return None, eid
+
+
+def power_sensor_candidates(hass, states=None) -> list:
+    """Plausible whole-home power sensors for the panel's selector — sensors with
+    device_class 'power' or a W/kW unit. Each: {entity, name, watts(signed)}.
+    Sorted by name, capped. Never raises. (v9.82.0)"""
+    out: list = []
+    try:
+        if states is not None:
+            items = list(states.items())
+        else:
+            items = [(s.entity_id, s) for s in hass.states.async_all("sensor")]
+        for key, st in items:
+            eid = getattr(st, "entity_id", key)
+            if not str(eid).startswith("sensor."):
+                continue
+            attrs = getattr(st, "attributes", {}) or {}
+            dc = attrs.get("device_class", "")
+            unit = (attrs.get("unit_of_measurement") or "").lower()
+            if dc != "power" and unit not in ("w", "kw"):
+                continue
+            try:
+                w = float(st.state) * (1000.0 if unit == "kw" else 1.0)
+            except (ValueError, TypeError):
+                w = None
+            out.append({"entity": eid,
+                        "name": attrs.get("friendly_name") or eid,
+                        "watts": round(w) if w is not None else None})
+        out.sort(key=lambda c: str(c.get("name") or "").lower())
+    except Exception:
+        pass
+    return out[:80]
+
+
+def _find_whole_home_meter(states) -> Optional[str]:
+    candidates = []
+    for entity_id, state in states.items():
+        entity_id = getattr(state, "entity_id", entity_id)
+        if not entity_id.startswith("sensor."):
+            continue
+        dc = getattr(state, "attributes", {}).get("device_class", "")
+        unit = (getattr(state, "attributes", {}).get("unit_of_measurement") or "").lower()
+        fname = (getattr(state, "attributes", {}).get("friendly_name") or "").lower()
+        if dc != "power" and unit not in ("w", "kw"):
+            continue
+        if not any(kw in fname or kw.replace(" ", "_") in entity_id.lower()
+                   for kw in ("electric consumption", "home energy",
+                              "total consumption", "main power", "whole house",
+                              "grid consumption", "mains power")):
+            continue
+        import re as _re
+        has_suffix = bool(_re.search(r"\(\d+\)$", fname.strip()))
+        try:
+            watts = float(state.state) * (1000 if unit == "kw" else 1)
+        except (ValueError, TypeError):
+            watts = 0.0
+        candidates.append((entity_id, watts, has_suffix))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (not item[2], item[1]))[0]
+
+
+def _fallback_meter(hass, states=None) -> Optional[str]:
+    if states is not None:
+        candidates = []
+        for key, state in states.items():
+            eid = getattr(state, "entity_id", key)
+            if not eid.startswith("sensor."):
+                continue
+            dc = getattr(state, "attributes", {}).get("device_class", "")
+            unit = (getattr(state, "attributes", {}).get("unit_of_measurement") or "").lower()
+            fname = (getattr(state, "attributes", {}).get("friendly_name") or "").lower()
+            if dc != "power" and unit not in ("w", "kw"):
+                continue
+            for kw in ("electric consumption", "home energy", "total consumption",
+                       "main power", "whole house", "grid consumption", "mains power"):
+                if kw in fname:
+                    return eid
+            try:
+                watts = float(state.state) * (1000 if unit == "kw" else 1)
+            except (ValueError, TypeError):
+                watts = 0.0
+            candidates.append((eid, watts))
+        if len(candidates) == 1:   # Jarvis Home patch (2026-11-10): the biggest of several is one device, not the house
+            return candidates[0][0]
+        return None
+
+    candidates = []
+    for state in hass.states.async_all("sensor"):
+        eid = getattr(state, "entity_id", "")
+        if not eid.startswith("sensor."):
+            continue
+        dc = state.attributes.get("device_class", "")
+        unit = (state.attributes.get("unit_of_measurement") or "").lower()
+        fname = (state.attributes.get("friendly_name") or "").lower()
+        if dc != "power" and unit not in ("w", "kw"):
+            continue
+        for kw in ("electric consumption", "home energy", "total consumption",
+                   "main power", "whole house", "grid consumption", "mains power"):
+            if kw in fname:
+                return eid
+        try:
+            watts = float(state.state) * (1000 if unit == "kw" else 1)
+        except (ValueError, TypeError):
+            watts = 0.0
+        candidates.append((eid, watts))
+    if len(candidates) == 1:   # Jarvis Home patch (2026-11-10): the biggest of several is one device, not the house
+        return candidates[0][0]
+    return None
+
+
+def _running_appliances(hass, states=None) -> list[dict]:
+    """Declared appliances currently drawing power, from config + live sensors.
+    Each: {name, entity, watts, shed_ok}."""
+    out = []
+    profile = _cfg("appliances", [])
+    if not isinstance(profile, list):
+        return out
+    for ap in profile:
+        if not isinstance(ap, dict):
+            continue
+        name = str(ap.get("name", "") or "")
+        eid = str(ap.get("entity", "") or "")
+        watts = 0.0
+        running = False
+        if eid:
+            st = states.get(eid) if states is not None else hass.states.get(eid)
+            if st is not None:
+                try:
+                    watts = float(st.state)
+                    unit = (st.attributes.get("unit_of_measurement") or "").lower()
+                    if unit == "kw":
+                        watts *= 1000.0
+                    running = watts > 50.0     # drawing meaningfully
+                except (ValueError, TypeError):
+                    pass
+        if running:
+            out.append({
+                "name": name, "entity": eid, "watts": round(watts),
+                "shed_ok": not _never_shed(eid, name),
+            })
+    out.sort(key=lambda a: -a["watts"])
+    return out
+
+
+# ── public: status + advice ──────────────────────────────────────────────────
+
+def power_status(hass, states=None) -> dict:
+    """The current energy picture for the panel/agent. Never raises.
+
+    Peak is judged on grid IMPORT, not the raw signed reading: a signed
+    grid-power sensor goes negative while exporting, and export must never trip an
+    excessive-consumption alert (issue #476). ``watts`` is the import value (what
+    downstream peak/efficiency logic consumes); ``signed_watts`` keeps the raw
+    reading so export is visible."""
+    signed, meter = _read_whole_home_watts(hass, states)
+    peak = _peak_threshold()
+    running = _running_appliances(hass, states)
+    import_watts = max(0.0, signed) if signed is not None else None
+    exporting = signed is not None and signed < 0
+    over = import_watts is not None and import_watts >= peak
+    configured = _cfg("energy_power_sensor", None)
+
+    advice = []
+    if signed is None:
+        advice.append("No whole-home power meter found — pick one in Settings → "
+                      "Safety & Energy → Energy Management (an Electric Consumption "
+                      "[W] or grid-power sensor) to enable energy management.")
+    elif over:
+        big = [a for a in running if a["shed_ok"]]
+        if len(big) >= 2:
+            names = " + ".join(a["name"] for a in big[:3] if a["name"])
+            advice.append(f"Drawing {import_watts/1000:.1f} kW (over the "
+                          f"{peak/1000:.1f} kW peak) — {names or 'multiple loads'} "
+                          f"running at once. Staggering them would cut the peak.")
+        else:
+            advice.append(f"Drawing {import_watts/1000:.1f} kW, above the "
+                          f"{peak/1000:.1f} kW peak.")
+    elif exporting:
+        advice.append(f"Exporting {abs(signed)/1000:.1f} kW to the grid — no "
+                      f"consumption concern.")
+    else:
+        advice.append(f"Drawing {import_watts/1000:.1f} kW — within the "
+                      f"{peak/1000:.1f} kW comfort range.")
+
+    return {
+        "watts": round(import_watts) if import_watts is not None else None,
+        "signed_watts": round(signed) if signed is not None else None,
+        "kw": round(import_watts / 1000, 2) if import_watts is not None else None,
+        "meter": meter,
+        "configured_meter": str(configured).strip() if configured else "",
+        "exporting": exporting,
+        "peak_watts": round(peak),
+        "over_peak": over,
+        "agency": effective_agency(),
+        "configured_agency": _configured_agency(),
+        "running": running,
+        "candidates": power_sensor_candidates(hass, states),
+        "advice": advice,
+    }
+
+
+# Jarvis Home patch (2026-11-10): what the devices on the Energy dashboard draw right now, read live.
+async def jh_devices_power_now(hass) -> Optional[dict]:
+    """The power the devices on the Energy dashboard draw right now. A device's power sensor is its power entry on the
+    dashboard, else the one power sensor on the same device as its energy sensor; a device without one is left out.
+    None when no device has a power sensor. Never raises."""
+    try:
+        from homeassistant.components.energy.data import async_get_manager
+        from homeassistant.helpers import device_registry as dr, entity_registry as er
+        prefs = (await async_get_manager(hass)).data or {}
+        ents, devs = er.async_get(hass), dr.async_get(hass)
+        rows, unread = [], []
+        for item in prefs.get("device_consumption") or []:
+            entry = ents.async_get(item.get("stat_consumption") or "")
+            device_id = getattr(entry, "device_id", None)
+            power_id = item.get("stat_rate")
+            if not power_id and device_id:
+                same = [e.entity_id for e in list(ents.entities.values())
+                        if getattr(e, "device_id", None) == device_id and _jh_is_power(hass.states.get(e.entity_id))]
+                power_id = same[0] if len(same) == 1 else None
+            if not power_id:
+                continue   # this device only reports energy
+            state = hass.states.get(power_id)
+            device = devs.async_get(device_id) if device_id else None
+            name = (item.get("name") or getattr(device, "name_by_user", None) or getattr(device, "name", None)
+                    or (state.attributes.get("friendly_name") if state is not None else None) or power_id)
+            watts = _jh_watts(state)
+            if watts is None:
+                unread.append(name)
+            else:
+                rows.append({"name": name, "watts": round(watts, 1)})
+        if not rows and not unread:
+            return None
+        rows.sort(key=lambda r: -r["watts"])
+        return {"total_watts": round(sum(r["watts"] for r in rows)), "devices": rows, "unreadable": unread,
+                "covers": ("only the %d monitored devices on the Energy dashboard that measure power; there is no "
+                           "whole-house meter, so the household draws more" % (len(rows) + len(unread)))}
+    except Exception:
+        return None
+
+
+def _jh_is_power(state) -> bool:
+    return (state is not None and state.attributes.get("device_class") == "power"
+            and str(state.attributes.get("unit_of_measurement") or "").lower() in ("w", "kw"))
+
+
+def _jh_watts(state) -> Optional[float]:
+    try:
+        watts = float(state.state)
+    except (AttributeError, TypeError, ValueError):
+        return None   # unavailable, unknown or missing
+    return watts * 1000 if str(state.attributes.get("unit_of_measurement") or "").lower() == "kw" else watts
+
+
+def evaluate_for_proactive(hass) -> Optional[dict]:
+    """Called by the cognitive loop: returns a proactive offer dict when the
+    home is over peak with sheddable loads, shaped by the effective agency —
+    advisory just informs; opt_in proposes an action; autonomous flags auto.
+    Returns None when nothing warrants surfacing. Never raises."""
+    try:
+        st = power_status(hass)
+    except Exception:
+        return None
+    _environment_shadow(st)   # Phase X: observe-only, never affects the offer
+    _environment_parity(st)   # Phase X: observe-only agreement tracking
+    if not _environment_over_peak(st):   # Phase X enforce (default OFF): kernel verdict or legacy
+        return None
+    sheddable = [a for a in st["running"] if a["shed_ok"]]
+    if len(sheddable) < 2:
+        return None      # a single big load isn't a staggering opportunity
+
+    agency = st["agency"]
+    kw = st["kw"]
+    names = " and ".join(a["name"] for a in sheddable[:2] if a["name"]) or "two high-draw loads"
+    defer = sheddable[0]  # highest-draw sheddable load
+
+    if agency == AGENCY_AUTONOMOUS:
+        return {
+            "type": "energy_shed", "urgency": "low", "auto_act": True,
+            "entity_id": defer["entity"],
+            "message": f"{names} are both running at {kw:.1f} kW. I'll ease the "
+                       f"peak by holding {defer['name']} for now.",
+            "energy": True,
+        }
+    if agency == AGENCY_OPT_IN:
+        return {
+            "type": "energy_shed_offer", "urgency": "low", "auto_act": False,
+            "entity_id": defer["entity"],
+            "message": f"{names} are drawing {kw:.1f} kW together. Want me to "
+                       f"hold {defer['name']} until the load drops?",
+            "energy": True,
+        }
+    # advisory
+    return {
+        "type": "energy_advice", "urgency": "low", "auto_act": False,
+        "message": f"Heads up — {names} are running at {kw:.1f} kW, over your "
+                   f"peak. Staggering them would help.",
+        "energy": True,
+    }

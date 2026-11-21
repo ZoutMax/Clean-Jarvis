@@ -1,0 +1,4738 @@
+"""
+JARVIS Panel WebSocket API (v5.4.2).
+
+Registers the `jarvis/get_panel_data` WebSocket command that the custom
+panel calls (on mount + every 5s) to refresh live state.
+
+The single command returns everything the panel needs in one round-trip:
+status flags, area registry with capabilities and occupancy, dominant
+room, satellite count, bedroom count, uptime.
+
+Activity log is a separate endpoint (deferred to session 3, needs DB work).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Optional
+
+import voluptuous as vol
+
+from homeassistant.components import websocket_api
+from homeassistant.core import HomeAssistant, callback
+
+from . import audio_routing, sleep_detection
+from .const import (
+    CONF_BEDROOM_AREAS,
+    CONF_BROADCAST_GROUP,
+    CONF_CUSTOM_BASE_URL,
+    CONF_NOTIFY_SERVICE,
+    CONF_OBSERVER_ENABLED,
+    CONF_OBSERVER_QUIET_END,
+    CONF_OBSERVER_QUIET_START,
+    CONF_OLLAMA_BASE_URL,
+    DEFAULT_HONORIFIC,
+    DEFAULT_OBSERVER_QUIET_END,
+    DEFAULT_OBSERVER_QUIET_START,
+    DOMAIN,
+    PROVIDER_API_KEY_FIELDS,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Startup wall-clock — for uptime computation
+_STARTUP_TS: float = time.time()
+
+
+# ─── Command registration ────────────────────────────────────────────────────
+
+@callback
+def async_register(hass: HomeAssistant) -> None:
+    """Register all JARVIS panel WebSocket commands. Idempotent-ish."""
+    try:
+        websocket_api.async_register_command(hass, ws_get_panel_data)
+        websocket_api.async_register_command(hass, ws_get_activity_log)
+        websocket_api.async_register_command(hass, ws_update_config)
+        websocket_api.async_register_command(hass, ws_set_lockdown)
+        websocket_api.async_register_command(hass, ws_get_knowledge)
+        websocket_api.async_register_command(hass, ws_add_knowledge)
+        websocket_api.async_register_command(hass, ws_forget_knowledge)
+        websocket_api.async_register_command(hass, ws_root_cause)
+        websocket_api.async_register_command(hass, ws_compute_camera_coverage)
+        websocket_api.async_register_command(hass, ws_reload_appliances)
+        websocket_api.async_register_command(hass, ws_search_memory)
+        websocket_api.async_register_command(hass, ws_get_briefings)
+        websocket_api.async_register_command(hass, ws_area_lights)
+        websocket_api.async_register_command(hass, ws_area_lights_set)   # jh-r22-lights (step 164)
+        websocket_api.async_register_command(hass, ws_get_debug_log)
+        websocket_api.async_register_command(hass, ws_get_cognitive_status)
+        websocket_api.async_register_command(hass, ws_run_analysis)
+        websocket_api.async_register_command(hass, ws_get_calibration)
+        websocket_api.async_register_command(hass, ws_list_models)
+        websocket_api.async_register_command(hass, ws_suggestion_action)
+        websocket_api.async_register_command(hass, ws_compose_automation)
+        websocket_api.async_register_command(hass, ws_goal_action)
+        websocket_api.async_register_command(hass, ws_get_person_routines)
+        websocket_api.async_register_command(hass, ws_get_area_sparklines)
+        websocket_api.async_register_command(hass, ws_camera_snapshot)
+        websocket_api.async_register_command(hass, ws_camera_diagnostics)
+        websocket_api.async_register_command(hass, ws_rename_camera)
+        websocket_api.async_register_command(hass, ws_camera_location)
+        websocket_api.async_register_command(hass, ws_mmwave_overview)
+        websocket_api.async_register_command(hass, ws_documents)
+        websocket_api.async_register_command(hass, ws_semantic_search)
+        websocket_api.async_register_command(hass, ws_diagnostics)
+        websocket_api.async_register_command(hass, ws_download_diagnostics)
+        websocket_api.async_register_command(hass, ws_voice_confirm_test)
+        websocket_api.async_register_command(hass, ws_intrusion)
+        websocket_api.async_register_command(hass, ws_faces)
+        websocket_api.async_register_command(hass, ws_face_reference)
+        websocket_api.async_register_command(hass, ws_voices)
+        websocket_api.async_register_command(hass, ws_mutes)
+        websocket_api.async_register_command(hass, ws_mode)
+        websocket_api.async_register_command(hass, ws_energy)
+        websocket_api.async_register_command(hass, ws_hazard)
+        websocket_api.async_register_command(hass, ws_biometrics)
+        websocket_api.async_register_command(hass, ws_get_enforcement)
+        websocket_api.async_register_command(hass, ws_set_enforcement)
+        websocket_api.async_register_command(hass, ws_floorplan_sources)
+        websocket_api.async_register_command(hass, ws_import_floorplan)
+        websocket_api.async_register_command(hass, ws_segment_floorplan_rooms)
+    except Exception as exc:
+        _LOGGER.debug("WS command register note: %s", exc)
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+def _get_entry(hass: HomeAssistant):
+    """Return the first JARVIS config entry's ConfigEntry object, or None."""
+    # hass.data[DOMAIN] is keyed by entry_id, values are dicts of runtime state.
+    # We need the actual ConfigEntry object for options/data lookups.
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        return entry
+    return None
+
+
+def _entry_opt(entry, key: str, default=None):
+    """Config read via the canonical resolver (no hass here, so runtime_config is
+    skipped): config.json → options → data → default."""
+    from . import jarvis_config
+    return jarvis_config.runtime_get(None, entry, key, default)
+
+
+def _runtime_opt(hass: HomeAssistant, entry, key: str, default=None):
+    """Runtime-aware config read via the canonical resolver (runtime_config →
+    config.json → options → data → default)."""
+    from . import jarvis_config
+    return jarvis_config.runtime_get(hass, entry, key, default)
+
+
+def _jh_cam_default(hass, entry) -> str:
+    """Jarvis Home patch (2026-11-07, round 2): 'Last camera used' is saved from the panel as "last", an explicit choice that wins
+    over a camera picked in the Core options. An empty value keeps its old meaning: not set there, so the next place decides
+    (runtime config, then config.json, then the Core options)."""
+    return str(_runtime_opt(hass, entry, "camera_watch_default", "") or "")
+
+
+_JH_QA_SPECIAL = "jarvis:analyze_now"
+_JH_QA_DOMAINS = ("script", "scene", "automation", "light", "switch", "fan", "climate", "media_player", "cover",
+                  "input_boolean", "jarvis")
+_JH_QA_AUTOMATION = ("trigger", "turn_on", "turn_off")
+_JH_QA_BLOCKED = ("jarvis.database_purge", "jarvis.restore", "jarvis.forget")   # they delete data
+_JH_QA_MAX = 12
+JH_QA_DEFAULT = (
+    {"label": "Briefing", "service": "jarvis.briefing"},
+    {"label": "Nap 30m", "service": "jarvis.nap", "data": {"duration_minutes": 30}},
+    {"label": "Nap 60m", "service": "jarvis.nap", "data": {"duration_minutes": 60}},
+    {"label": "Unshush All", "service": "jarvis.unshush"},
+    {"label": "Status Dump", "service": "jarvis.observer_status"},
+    {"label": "Analyze Now", "service": _JH_QA_SPECIAL},
+)
+
+
+def _jh_qa_clean(value):
+    """Jarvis Home patch (2026-11-14): check the Quick Actions list from the panel. Returns None (= the default buttons) or
+    a clean list; a ValueError carries a message for the panel."""
+    import json as _json, re as _re
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = _json.loads(value)
+        except ValueError:
+            raise ValueError("Quick actions must be a JSON list") from None
+    if not isinstance(value, list):
+        raise ValueError("Quick actions must be a list of buttons")
+    if len(value) > _JH_QA_MAX:
+        raise ValueError(f"At most {_JH_QA_MAX} quick actions ({len(value)} given)")
+    out, analyze = [], 0
+    for n, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Button {n}: must have a label and an action")
+        label = item.get("label")
+        label = label.strip() if isinstance(label, str) else ""
+        if not 1 <= len(label) <= 24 or any(ord(c) < 32 for c in label):
+            raise ValueError(f"Button {n}: the label must be 1-24 characters")
+        service = item.get("service")
+        service = service.strip() if isinstance(service, str) else ""
+        data = item.get("data")
+        if data is None or (isinstance(data, str) and not data.strip()):
+            data = {}
+        if isinstance(data, str):
+            try:
+                data = _json.loads(data)
+            except ValueError:
+                raise ValueError(f"Button {n} ({label}): the data is not valid JSON") from None
+        if not isinstance(data, dict):
+            raise ValueError(f"Button {n} ({label}): the data must be a JSON object, like {{\"entity_id\": \"script.x\"}}")
+        if len(_json.dumps(data)) > 2000:
+            raise ValueError(f"Button {n} ({label}): the data is too long")
+        if service == _JH_QA_SPECIAL:
+            analyze += 1
+            if analyze > 1:
+                raise ValueError("Only one Analyze Now button (jarvis:analyze_now)")
+            out.append({"label": label, "service": service})
+            continue
+        m = _re.fullmatch(r"([a-z0-9_]+)\.([a-z0-9_]+)", service)
+        if not m:
+            raise ValueError(f"Button {n} ({label}): the action must look like domain.service, e.g. script.turn_on")
+        domain, action = m.groups()
+        if domain not in _JH_QA_DOMAINS or service in _JH_QA_BLOCKED:
+            raise ValueError(f"Button {n} ({label}): {service} is not allowed on a button. Allowed: "
+                             + ", ".join(_JH_QA_DOMAINS) + " (automation: trigger, turn_on, turn_off)")
+        if domain == "automation" and action not in _JH_QA_AUTOMATION:
+            raise ValueError(f"Button {n} ({label}): automation buttons may only trigger, turn_on or turn_off")
+        out.append({"label": label, "service": service, **({"data": data} if data else {})})
+    return out
+
+
+def _jh_qa_manual(hass, buttons) -> None:
+    """Jarvis Home patch (2026-11-15): a Quick Actions button never switches a manual heater (label manual_heater)."""
+    from .local_engine import jh_strip_manual, jh_norm_ids   # jh-r5-qa-norm (review round 5): ids compared as HA reads them
+    for n, item in enumerate(buttons or [], 1):
+        domain, _, action = str(item.get("service", "")).partition(".")
+        data = dict(item.get("data") or {})
+        _d, _t, skip = jh_strip_manual(hass, domain, action, data, dict(data))
+        def ids(v):
+            return sorted(jh_norm_ids(v))
+        if skip or ids(data.get("entity_id")) != ids((_d or {}).get("entity_id")):
+            raise ValueError(f"Button {n} ({item.get('label')}): it would switch a manual heater, which JARVIS never "
+                             "switches (label manual_heater). Name the other devices instead.")
+
+
+def _jh_quick_actions(hass, entry) -> list:
+    """The Quick Actions buttons to show: the saved list when it is valid, else the six upstream buttons."""
+    try:
+        got = _jh_qa_clean(_runtime_opt(hass, entry, "quick_actions", None))
+    except ValueError as exc:
+        _LOGGER.warning("JARVIS: saved quick actions ignored, the default buttons are shown: %s", exc)
+        got = None
+    got = [dict(a) for a in JH_QA_DEFAULT] if got is None else got
+    keep = []   # jh-qa-manual-on-read (review 2026-11-15): a button that would switch a manual heater is never shown
+    for item in got:
+        try:
+            _jh_qa_manual(hass, [item])
+            keep.append(item)
+        except ValueError:
+            _LOGGER.warning("JARVIS: a Quick Actions button that would switch a manual heater is not shown: %s", item.get("label"))
+        except Exception:
+            keep.append(item)
+    return keep
+
+
+def _jh_opt_cfg(hass) -> dict:
+    """Clean Jarvis: the Optional pages switches, what Setup made, the history days and the card file versions (jh-optional)."""
+    try:
+        from .optional_pages import panel_config
+        return panel_config(hass)
+    except Exception:
+        return {}
+
+
+def _jh_notify_private_cfg() -> str:
+    """jh-notify-private (step 158, C3): where private alerts go, as saved (admin_phones when unset)."""
+    try:
+        from .jh_notify import mode
+        return mode()
+    except Exception:  # noqa: BLE001
+        return "admin_phones"
+
+
+def _jh_location_sharing_cfg(hass, entry) -> str:
+    """Jarvis Home patch (2026-11-15): the location_sharing setting as the where-is answers use it."""
+    from .presence import jh_location_sharing
+    return jh_location_sharing(hass)
+
+
+def _jh_person_address_cfg(hass, entry) -> dict:
+    """Jarvis Home patch (2026-11-14): the saved person_address setting, clean ({} when unset or broken)."""
+    from .presence import jh_clean_address
+    try:
+        return jh_clean_address(_runtime_opt(hass, entry, "person_address", None))
+    except ValueError as exc:
+        _LOGGER.warning("JARVIS: saved forms of address ignored: %s", exc)
+        return {}
+
+
+def _jh_person_pronouns_cfg(hass, entry) -> dict:
+    """Jarvis Home patch (2026-11-14): the saved person_pronouns setting, clean ({} when unset or broken)."""
+    from .presence import jh_clean_pronouns
+    try:
+        return jh_clean_pronouns(_runtime_opt(hass, entry, "person_pronouns", None))
+    except ValueError as exc:
+        _LOGGER.warning("JARVIS: saved person pronouns ignored: %s", exc)
+        return {}
+
+
+def _jh_hide_addresses(res):
+    """Jarvis Home patch (2026-11-07): the health check names the LLM host and port, which get_panel_data hides from
+    non-admins. For them the address is dropped and blanked out of the details."""
+    import copy, re
+    if not isinstance(res, dict):
+        return res
+    out = copy.deepcopy(res)
+    pat = re.compile(r"[a-z][a-z0-9+.-]*://[^\s,;)'\"]+|\('[^']*',\s*\d{1,5}\)|\[[0-9a-f:]+\](?::\d+)?"
+                     r"|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b|\b[a-z][\w-]*(?:\.[\w-]+)*:\d{2,5}\b", re.I)
+    for svc in out.get("services") or []:
+        if isinstance(svc, dict):
+            svc.pop("base", None)
+            if isinstance(svc.get("detail"), str):
+                svc["detail"] = pat.sub("(address hidden)", svc["detail"])
+    return out
+
+
+# jh-r20-secrets (step 162, review round 20 #4): connection details are for administrators. ONE redaction for every result and
+# error text a non-admin can get from a command that talks to the LLM / Ollama host, a camera or another service: a key that
+# names an address, URL, host, user, key, token, password or secret is dropped, and any address in a text (a URL, also with
+# user:password in it, an IP, host:port) becomes "(address hidden)".
+import re as _jh_re20   # jh-r20-secrets
+_JH_SECRET_KEY = _jh_re20.compile(r"(?:^|_)(?:base|url|uri|host|hostname|user|username|key|api_key|token|password|passwd|secret"
+                            r"|auth)$|_(?:url|host|user|key|token|password|secret)s?$", _jh_re20.I)
+_JH_ADDRESS = _jh_re20.compile(r"[a-z][a-z0-9+.-]*://[^\s,;)'\"]+|\('[^']*',\s*\d{1,5}\)|\[[0-9a-f:]+\](?::\d+)?"
+                               r"|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b|\b[\w.%+-]+:[^\s@/]+@[\w.-]+"
+                               r"|\b[a-z][\w-]*(?:\.[\w-]+)*:\d{2,5}\b", _jh_re20.I)
+
+
+def jh_redact_secrets(obj):
+    """jh-r20-secrets: obj without connection details (see above). Used for every non-admin result of such a command."""
+    if isinstance(obj, dict):
+        return {k: jh_redact_secrets(v) for k, v in obj.items() if not (isinstance(k, str) and _JH_SECRET_KEY.search(k))}
+    if isinstance(obj, (list, tuple)):
+        return [jh_redact_secrets(x) for x in obj]
+    if isinstance(obj, str):
+        return _JH_ADDRESS.sub("(address hidden)", obj)
+    return obj
+
+
+def _jh_for_viewer_secrets(connection, obj):
+    """jh-r20-secrets: an administrator gets obj as it is, every other login jh_redact_secrets(obj)."""
+    return obj if _is_admin(connection) else jh_redact_secrets(obj)
+
+
+def _honorific_payload(value) -> str:
+    """Honorific for the panel payload. An explicitly-blank honorific (the owner
+    wants no form of address) is preserved; only a truly-unset value (``None``)
+    falls back to the default, so a cleared honorific no longer snaps back to
+    "sir" on the next panel render (#400 #8)."""
+    if value is None:
+        return DEFAULT_HONORIFIC
+    return str(value)
+
+
+def _is_admin(connection) -> bool:
+    """True only for an authenticated admin Home Assistant user. Fail-safe:
+    a missing connection/user reads as non-admin, so write actions deny by
+    default (CWE-862 hardening for the panel's websocket commands)."""
+    user = getattr(connection, "user", None)
+    return bool(user is not None and getattr(user, "is_admin", False))
+
+
+def _deny_non_admin(connection, msg) -> bool:
+    """Guard a *write* action on a mixed read/write panel command. Returns True
+    (and sends an 'unauthorized' error) when the caller is not an admin, so the
+    handler should ``return``; returns False when the caller may proceed.
+
+    Read actions on the same command stay available to non-admin users — only
+    the mutating branch is gated. Pure-write commands use the stronger
+    ``@websocket_api.require_admin`` decorator instead."""
+    if _is_admin(connection):
+        return False
+    connection.send_error(
+        msg["id"], "unauthorized",
+        "administrator privileges are required for this action")
+    return True
+
+
+def _int_opt(hass: HomeAssistant, entry, key: str, default: int) -> int:
+    """Read an int option, preserving 0 — `value or default` clobbers a valid 0."""
+    v = _runtime_opt(hass, entry, key, default)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _area_name(hass: HomeAssistant, area_id: str) -> str:
+    """Friendly name for an area_id."""
+    try:
+        from homeassistant.helpers import area_registry as ar
+        reg = ar.async_get(hass)
+        area = reg.async_get_area(area_id)
+        if area:
+            return area.name or area_id
+    except Exception:
+        pass
+    return area_id
+
+
+def _entities_in_area(hass: HomeAssistant, area_id: str) -> list[str]:
+    """All entity_ids whose (entity area) or (device area) matches.
+
+    Skips user-excluded entities so the room card (light count, capabilities,
+    last motion) doesn't show or count entities the user has excluded.
+    """
+    from homeassistant.helpers import entity_registry as er, device_registry as dr
+    try:
+        from .entity_filter import is_excluded
+    except Exception:
+        is_excluded = lambda _h, _e: False
+    ent_reg = er.async_get(hass)
+    dev_reg = dr.async_get(hass)
+    out = []
+    for ent in ent_reg.entities.values():
+        ent_area = ent.area_id
+        if not ent_area and ent.device_id:
+            dev = dev_reg.async_get(ent.device_id)
+            if dev:
+                ent_area = dev.area_id
+        if ent_area == area_id:
+            if is_excluded(hass, ent.entity_id):
+                continue
+            out.append(ent.entity_id)
+    return out
+
+
+def _area_capabilities(hass: HomeAssistant, area_id: str) -> list[str]:
+    """
+    Return a sorted list of capability codes present in this area.
+    Each code is what the panel will render as icon + label.
+    """
+    caps: set[str] = set()
+    for eid in _entities_in_area(hass, area_id):
+        domain = eid.split(".", 1)[0]
+        state = hass.states.get(eid)
+        dclass = state.attributes.get("device_class") if state else None
+
+        if domain == "assist_satellite":
+            caps.add("sat")
+        elif domain == "media_player":
+            caps.add("spkr")
+        elif domain == "camera":
+            caps.add("cam")
+        elif domain == "binary_sensor":
+            if dclass in ("occupancy", "motion", "presence"):
+                caps.add("mmwave")
+            elif dclass in ("door", "window", "garage_door", "opening"):
+                caps.add("door")
+            elif dclass in ("moisture",):
+                caps.add("leak")
+            elif dclass in ("smoke", "gas", "carbon_monoxide"):
+                caps.add("alarm")
+            elif dclass in ("safety", "tamper", "problem"):
+                caps.add("alarm")
+        elif domain == "light":
+            caps.add("light")
+        elif domain == "switch":
+            caps.add("switch")
+        elif domain == "lock":
+            caps.add("lock")
+        elif domain == "climate":
+            caps.add("climate")
+
+    # Ordering: sat, spkr, mmwave, cam, light, switch, lock, climate, door, leak, alarm
+    order = ["sat", "spkr", "mmwave", "cam", "light", "switch", "lock", "climate", "door", "leak", "alarm"]
+    return [c for c in order if c in caps]
+
+
+def _is_outdoor_area(hass: HomeAssistant, area_id: str) -> bool:
+    """Heuristic: does the area name look outdoor?"""
+    name = (_area_name(hass, area_id) or "").lower()
+    outdoor_keywords = (
+        "yard", "garden", "driveway", "patio", "deck", "porch",
+        "pool", "outdoor", "outside", "exterior", "lawn",
+    )
+    return any(kw in name for kw in outdoor_keywords)
+
+
+def _dominant_area(hass: HomeAssistant) -> str | None:
+    """
+    Pick the 'most alive' area — currently occupied, with most-recent motion.
+    Prefers indoor areas over outdoor ones (you don't live in the yard).
+    Returns area_id or None.
+    """
+    occupied = audio_routing.currently_occupied_areas(hass)
+    if not occupied:
+        return None
+
+    # Split into indoor vs outdoor
+    indoor = [a for a in occupied if not _is_outdoor_area(hass, a)]
+    outdoor = [a for a in occupied if _is_outdoor_area(hass, a)]
+    # Strongly prefer indoor; only use outdoor if that's all we have
+    candidates = indoor or outdoor
+
+    # Rank by most recent occupancy sensor change
+    best_area = None
+    best_ts = 0.0
+    for area_id in candidates:
+        for eid in audio_routing.presence_entities_in_area(hass, area_id):
+            state = hass.states.get(eid)
+            if state is None:
+                continue
+            # last_changed is a datetime
+            try:
+                ts = state.last_changed.timestamp()
+            except Exception:
+                continue
+            if ts > best_ts:
+                best_ts = ts
+                best_area = area_id
+
+    return best_area or candidates[0]
+
+
+def _area_light_state(hass: HomeAssistant, area_id: str) -> tuple[int, int]:
+    """Count (lights_on, lights_total) for an area — cheap, light-domain only.
+    Used to drive the per-room light indicator + toggle in the 3D house."""
+    on = total = 0
+    for eid in _entities_in_area(hass, area_id):
+        if not eid.startswith("light."):
+            continue
+        st = hass.states.get(eid)
+        if st is None:
+            continue
+        total += 1
+        if st.state == "on":
+            on += 1
+    return on, total
+
+
+def _area_temp_humidity_entities(hass: HomeAssistant, area_id: str) -> tuple[Optional[str], Optional[str]]:
+    """The first temperature/humidity sensor entity_id found in an area, or
+    None. Same resolution order _area_live_readings uses, factored out so
+    the areas grid and the sparkline history fetch use one source of truth."""
+    temp_eid = None
+    humidity_eid = None
+    for eid in _entities_in_area(hass, area_id):
+        if temp_eid and humidity_eid:
+            break
+        state = hass.states.get(eid)
+        if state is None or eid.split(".", 1)[0] != "sensor":
+            continue
+        dclass = state.attributes.get("device_class")
+        if dclass == "temperature" and temp_eid is None:
+            temp_eid = eid
+        elif dclass == "humidity" and humidity_eid is None:
+            humidity_eid = eid
+    return temp_eid, humidity_eid
+
+
+def _area_live_readings(hass: HomeAssistant, area_id: str) -> dict:
+    """Pull temperature, humidity, any lights-on count in the area."""
+    temp = None
+    humidity = None
+    lights_on = 0
+    lights_total = 0
+    last_motion_seconds = None
+
+    for eid in _entities_in_area(hass, area_id):
+        state = hass.states.get(eid)
+        if state is None:
+            continue
+        domain = eid.split(".", 1)[0]
+        dclass = state.attributes.get("device_class")
+
+        if domain == "sensor":
+            if dclass == "temperature" and temp is None:
+                try:
+                    val = float(state.state)
+                    unit = state.attributes.get("unit_of_measurement", "")
+                    # jh-temp-unit (step 158): a reading with no unit takes Home Assistant's unit, not always °F
+                    _jh_tu = str(getattr(getattr(hass.config, 'units', None), 'temperature_unit', '') or '°F')
+                    temp = f"{int(round(val))}°{unit.replace('°', '')[:1] or _jh_tu.replace('°', '')[:1] or 'F'}"
+                except (ValueError, TypeError):
+                    pass
+            elif dclass == "humidity" and humidity is None:
+                try:
+                    humidity = f"{int(round(float(state.state)))}%"
+                except (ValueError, TypeError):
+                    pass
+        elif domain == "light":
+            lights_total += 1
+            if state.state == "on":
+                lights_on += 1
+        elif domain == "binary_sensor" and dclass in ("occupancy", "motion", "presence"):
+            try:
+                age = (time.time() - state.last_changed.timestamp())
+                if last_motion_seconds is None or age < last_motion_seconds:
+                    last_motion_seconds = age
+            except Exception:
+                pass
+
+    lights_display = None
+    if lights_total > 0:
+        lights_display = f"{lights_on}/{lights_total}" if lights_total > 1 else ("ON" if lights_on else "OFF")
+
+    return {
+        "temp": temp,
+        "humidity": humidity,
+        "lights": lights_display,
+        "last_motion_seconds": last_motion_seconds,
+    }
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{int(seconds // 3600)}h"
+
+
+def _satellite_count(hass: HomeAssistant) -> tuple[int, int]:
+    """Return (available, total) satellite count."""
+    total = 0
+    avail = 0
+    for state in hass.states.async_all("assist_satellite"):
+        total += 1
+        if state.state not in ("unavailable", "unknown"):
+            avail += 1
+    return avail, total
+
+
+def _get_satellites(hass: HomeAssistant) -> list[dict]:
+    """Return list of satellites with entity_id, name, and area."""
+    satellites = []
+    try:
+        from homeassistant.helpers import (
+            entity_registry as er,
+            device_registry as dr,
+            area_registry as areg,
+        )
+        ent_reg = er.async_get(hass)
+        dev_reg = dr.async_get(hass)
+        area_reg = areg.async_get(hass)
+
+        for state in hass.states.async_all("assist_satellite"):
+            entry = ent_reg.async_get(state.entity_id)
+            area_name = ""
+            if entry and entry.device_id:
+                device = dev_reg.async_get(entry.device_id)
+                if device and device.area_id:
+                    area = area_reg.async_get_area(device.area_id)
+                    area_name = area.name if area else device.area_id
+            name = state.attributes.get("friendly_name", state.entity_id)
+            satellites.append({
+                "entity_id": state.entity_id,
+                "name": name,
+                "area": area_name,
+            })
+    except Exception:
+        for state in hass.states.async_all("assist_satellite"):
+            satellites.append({
+                "entity_id": state.entity_id,
+                "name": state.attributes.get("friendly_name", state.entity_id),
+                "area": "",
+            })
+    return satellites
+
+
+def _get_camera_overrides() -> dict:
+    """The camera_overrides runtime map (original → frame source), for the
+    panel to mirror server-side source resolution (v6.47.0). Never raises."""
+    try:
+        from . import jarvis_config
+        ov = jarvis_config.get("camera_overrides", {}) or {}
+        return {str(k): str(v) for k, v in ov.items()} if isinstance(ov, dict) else {}
+    except Exception:
+        return {}
+
+
+def _get_camera_names() -> dict:
+    """The camera_names runtime map (entity_id → JARVIS-only display name),
+    v6.48.0. Never raises."""
+    try:
+        from . import jarvis_config
+        nm = jarvis_config.get("camera_names", {}) or {}
+        return {str(k): str(v) for k, v in nm.items()} if isinstance(nm, dict) else {}
+    except Exception:
+        return {}
+
+
+def _get_onboarding_state(hass: HomeAssistant, entry, current_notify: str) -> dict:
+    """Compute the first-run onboarding checklist (v6.70.0). Reports which
+    high-value setup steps are done so the panel can show a welcome card to new
+    users and hide it once they're set up or dismiss it. Guidance, not config —
+    the LLM key is already collected by the config flow before the panel loads;
+    this covers the 'what now?' gap after install."""
+    try:
+        from . import jarvis_config
+        dismissed = bool(jarvis_config.get("onboarding_dismissed", False))
+    except Exception:
+        dismissed = False
+    has_notify = bool(current_notify)
+    try:
+        has_cameras = len(_get_cameras(hass)) > 0
+    except Exception:
+        has_cameras = False
+    try:
+        from . import jarvis_config
+        banter_set = jarvis_config.get("banter_level", None) is not None
+    except Exception:
+        banter_set = False
+    try:
+        has_voice = any(
+            e.entity_id.startswith("assist_satellite.")
+            for e in hass.states.async_all("assist_satellite"))
+    except Exception:
+        has_voice = False
+    try:
+        from . import jarvis_config
+        briefings_on = (bool(jarvis_config.get("briefing_morning_enabled", False))
+                        or bool(jarvis_config.get("briefing_evening_enabled", False)))
+    except Exception:
+        briefings_on = False
+    steps = [
+        {"id": "notify", "label": "Set an alert destination",
+         "hint": "Where JARVIS sends security alerts and notifications (your phone).",
+         "jump": "Notifications", "done": has_notify},
+        {"id": "cameras", "label": "Connect cameras (optional)",
+         "hint": "Nest/Frigate cameras enable doorbell analysis, package detection, the live floor plan.",
+         "jump": "Cameras", "done": has_cameras},
+        {"id": "voice", "label": "Set up voice (optional)",
+         "hint": "On HA OS/Supervised JARVIS installs the voice stack for you — or just talk to it in chat.",
+         "done": has_voice},
+        {"id": "banter", "label": "Pick a personality level",
+         "hint": "Plain, dry, or full MCU-JARVIS wit — Settings \u2192 Character.",
+         "jump": "JARVIS Character", "done": banter_set},
+        {"id": "briefings", "label": "Turn on daily briefings",
+         "hint": "Morning and evening summaries of weather, calendar, overnight "
+                 "events, and energy, in Settings under Briefings. Anticipation "
+                 "and cross-session memory live under Anticipation and Memory.",
+         "jump": "Briefings", "done": briefings_on},
+    ]
+    done_count = sum(1 for s in steps if s["done"])
+    return {
+        "dismissed": dismissed,
+        "show": (not dismissed) and (not has_notify or done_count < 2),
+        "steps": steps,
+        "done_count": done_count,
+        "total": len(steps),
+    }
+
+
+def _get_cameras(hass: HomeAssistant) -> list[dict]:
+    """Camera entities for the picker/chips. `name` honours the JARVIS-only
+    camera_names map (v6.48.0); `raw_name` keeps the HA friendly name so the
+    rename UI can show what blank reverts to."""
+    cams = []
+    names = _get_camera_names()
+    try:
+        from . import outdoor
+        from .camera import display_name, _disabled_cameras
+        indoor_list = outdoor._cfg_list("indoor_entities")
+        outdoor_list = outdoor._cfg_list("outdoor_entities")
+        disabled = _disabled_cameras()
+        for state in hass.states.async_all("camera"):
+            friendly = state.attributes.get("friendly_name", state.entity_id)
+            cams.append({
+                "entity_id": state.entity_id,
+                "name": display_name(state.entity_id, friendly, names),
+                "raw_name": friendly,
+                # v6.49.0: location designation for the whole cognitive stack
+                # (intrusion filter, notable-events, motion scan all consult
+                # outdoor.is_outdoor).
+                "enabled": state.entity_id not in disabled,
+                "outdoor": outdoor.is_outdoor(hass, state.entity_id, friendly),
+                "location_mode": outdoor.location_mode(
+                    state.entity_id, indoor_list, outdoor_list),
+            })
+    except Exception:
+        pass
+    return sorted(cams, key=lambda c: c["name"])
+
+
+def _get_cast_devices(hass: HomeAssistant) -> list[dict]:
+    """Return list of Cast/Google media_player entities."""
+    devices = []
+    for state in hass.states.async_all("media_player"):
+        # Include cast, Google, Sonos, Lenovo, and group players
+        eid = state.entity_id
+        name = state.attributes.get("friendly_name", eid)
+        platform = state.attributes.get("platform", "")
+        # Cast devices typically have these attributes
+        is_cast = (
+            "cast" in platform.lower()
+            or "google" in name.lower()
+            or "nest" in name.lower()
+            or "lenovo" in name.lower()
+            or "sonos" in name.lower()
+            or "home_group" in eid
+            or "group" in eid
+            or state.attributes.get("supported_features", 0) & 16384  # PLAY_MEDIA
+        )
+        if is_cast and state.state not in ("unavailable",):
+            devices.append({
+                "entity_id": eid,
+                "name": name,
+            })
+    return devices
+
+
+def _all_areas_with_anything(hass: HomeAssistant) -> list[str]:
+    """Areas that have at least one satellite, speaker, or presence sensor."""
+    try:
+        from homeassistant.helpers import area_registry as ar
+        reg = ar.async_get(hass)
+        all_ids = [a.id for a in reg.async_list_areas()]
+    except Exception:
+        return []
+
+    interesting = []
+    for aid in all_ids:
+        if _area_capabilities(hass, aid):
+            interesting.append(aid)
+    return interesting
+
+
+# ─── WebSocket command ───────────────────────────────────────────────────────
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_panel_data",
+    vol.Optional("area_id"): vol.All(str, vol.Length(max=128)),   # jh-room-pin (step 155): the room this login pinned
+})
+@websocket_api.async_response
+async def ws_get_panel_data(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return all data the panel needs for one render."""
+    try:
+        from . import ha_secrets
+        from .const import (
+            DIRECTIVE_PRESETS as _DIR_PRESETS,
+            DEFAULT_DIRECTIVE_PRESET as _DEF_DIR_PRESET,
+        )
+        entry = _get_entry(hass)
+
+        # ── Status flags ────────────────────────────────────────────────────
+        observer_running = False
+        if entry is not None:
+            data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            observer_running = bool(data.get("observer_running", False))
+
+        bedroom_areas = _entry_opt(entry, CONF_BEDROOM_AREAS, []) or []
+        quiet_start = _entry_opt(entry, CONF_OBSERVER_QUIET_START, DEFAULT_OBSERVER_QUIET_START)
+        quiet_end = _entry_opt(entry, CONF_OBSERVER_QUIET_END, DEFAULT_OBSERVER_QUIET_END)
+
+        sleeping, sleep_reason = sleep_detection.is_sleeping(
+            hass,
+            bedroom_area_ids=bedroom_areas,
+            quiet_start=quiet_start,
+            quiet_end=quiet_end,
+        )
+
+        configured_providers = await _configured_providers(hass, entry)
+        (
+            announcements_today,
+            doorbell_training,
+            knowledge_stats,
+            suggestions,
+            goals,
+            observer_stats,
+            memory_stats,
+            camera_overrides,
+            camera_names,
+        ) = await asyncio.gather(
+            hass.async_add_executor_job(_get_announcements_today),
+            hass.async_add_executor_job(_get_doorbell_training),
+            hass.async_add_executor_job(_get_knowledge_stats),
+            hass.async_add_executor_job(_get_suggestions),
+            hass.async_add_executor_job(_get_goals),
+            _async_get_observer_stats(hass),
+            hass.async_add_executor_job(_get_memory_stats),
+            hass.async_add_executor_job(_get_camera_overrides),
+            hass.async_add_executor_job(_get_camera_names),
+        )
+        broadcast_group = _entry_opt(entry, CONF_BROADCAST_GROUP, "") or ""
+        notify_service = _entry_opt(entry, CONF_NOTIFY_SERVICE, "") or ""
+        observer_enabled_cfg = bool(_runtime_opt(hass, entry, CONF_OBSERVER_ENABLED, False))
+
+        sat_avail, sat_total = _satellite_count(hass)
+
+        # ── Areas grid ──────────────────────────────────────────────────────
+        areas_list = []
+        for aid in _all_areas_with_anything(hass):
+            caps = _area_capabilities(hass, aid)
+            active = audio_routing.is_area_occupied(hass, aid)
+            l_on, l_total = _area_light_state(hass, aid)
+            readings = _area_live_readings(hass, aid)
+            temp_eid, humidity_eid = _area_temp_humidity_entities(hass, aid)
+            areas_list.append({
+                "id":       aid,
+                "name":     _area_name(hass, aid),
+                "caps":     caps,
+                "active":   active,
+                "bedroom":  aid in bedroom_areas,
+                "lights_on":    l_on,
+                "lights_total": l_total,
+                "temp":         readings.get("temp"),
+                "humidity":     readings.get("humidity"),
+                "temp_entity":     temp_eid,
+                "humidity_entity": humidity_eid,
+                "last_motion":  _format_duration(readings.get("last_motion_seconds")),
+            })
+        # Sort: active first, then bedrooms, then alphabetical
+        areas_list.sort(key=lambda a: (not a["active"], not a["bedroom"], a["name"].lower()))
+
+        # ── Dominant room ───────────────────────────────────────────────────
+        dominant_id = _dominant_area(hass)
+        if dominant_id:
+            readings = _area_live_readings(hass, dominant_id)
+            dominant_satellites = audio_routing.satellites_in_area(hass, dominant_id)
+            sat_id = dominant_satellites[0] if dominant_satellites else None
+            dominant = {
+                "area_id":    dominant_id,
+                "name":       _area_name(hass, dominant_id),
+                "subtitle":   f"Occupied · {_format_duration(readings.get('last_motion_seconds'))}" if readings.get('last_motion_seconds') is not None else "Occupied",
+                "coord":      f"#{dominant_id[:8]}",
+                "temp":       readings.get("temp") or "—",
+                "humidity":   readings.get("humidity") or "—",
+                "lights":     readings.get("lights") or "—",
+                "satellite":  sat_id.split(".", 1)[-1][:20] if sat_id else "—",
+                "last_motion": _format_duration(readings.get("last_motion_seconds")),
+            }
+        else:
+            # No presence detected anywhere
+            anyone = audio_routing.anyone_home(hass)
+            dominant = {
+                "area_id":    None,
+                "name":       "AWAY" if not anyone else "AT HOME",
+                # Jarvis Home patch (2026-11-04): show who is home when there are no room presence sensors.
+                "subtitle":   ((", ".join(sorted(st.attributes.get("friendly_name", st.entity_id) for st in hass.states.async_all("person") if st.state == "home")) + " home \u00b7 room unknown (no motion sensors)") if anyone else "nobody home"),
+                "coord":      "—",
+                "temp":       "—",
+                "humidity":   "—",
+                "lights":     "—",
+                "satellite":  "—",
+                "last_motion": "—",
+            }
+
+        try:   # jh-r7-at-home (review round 7): the AT HOME tile names only the people this login may know about
+            if (not getattr(connection.user, "is_admin", False) and isinstance(dominant, dict)
+                    and str(dominant.get("subtitle") or "").endswith(" home \u00b7 room unknown (no motion sensors)")):
+                from .presence import jh_hidden_people as _jh_hp7
+                _jh_hid7 = await _jh_hp7(hass, connection.user.id)
+                _jh_vis7 = sorted(st.attributes.get("friendly_name", st.entity_id) for st in hass.states.async_all("person")
+                                  if st.state == "home" and st.entity_id not in _jh_hid7)
+                dominant["subtitle"] = ((", ".join(_jh_vis7) + " home") if _jh_vis7 else "someone home") + " \u00b7 room unknown (no motion sensors)"
+        except Exception:
+            if isinstance(dominant, dict) and " home \u00b7 " in str(dominant.get("subtitle") or ""):
+                dominant["subtitle"] = "someone home \u00b7 room unknown (no motion sensors)"
+        try:   # jh-room-pin (step 155): a room this login pinned is shown instead of the automatic one, with its live readings.
+            # Only a room the panel lists anyway (one with readings or lights); anything else keeps the automatic room.
+            _jh_pin = msg.get("area_id")
+            if _jh_pin and _jh_pin in set(_all_areas_with_anything(hass)):
+                _jh_r = _area_live_readings(hass, _jh_pin)
+                _jh_lm = _jh_r.get("last_motion_seconds")
+                _jh_occ = audio_routing.is_area_occupied(hass, _jh_pin)
+                _jh_sats = audio_routing.satellites_in_area(hass, _jh_pin)
+                dominant = {
+                    "area_id":    _jh_pin,
+                    "name":       _area_name(hass, _jh_pin),
+                    "subtitle":   (("Occupied \u00b7 " + _format_duration(_jh_lm)) if _jh_occ and _jh_lm is not None else "Occupied"
+                                   if _jh_occ else ("Last motion " + _format_duration(_jh_lm)) if _jh_lm is not None else "No one here"),
+                    "coord":      f"#{_jh_pin[:8]}",
+                    "temp":       _jh_r.get("temp") or "\u2014",
+                    "humidity":   _jh_r.get("humidity") or "\u2014",
+                    "lights":     _jh_r.get("lights") or "\u2014",
+                    "satellite":  _jh_sats[0].split(".", 1)[-1][:20] if _jh_sats else "\u2014",
+                    "last_motion": _format_duration(_jh_lm),
+                    "pinned":     True,
+                }
+        except Exception as _jh_exc:  # noqa: BLE001 - the automatic room stays
+            _LOGGER.debug("JARVIS: pinned room not shown: %s", _jh_exc)
+        # ── Status tiles ────────────────────────────────────────────────────
+        status = {
+            "observer": {
+                "state": "RUNNING" if observer_running else ("READY" if observer_enabled_cfg else "DISABLED"),
+                "level": "live" if observer_running else ("warn" if observer_enabled_cfg else "off"),
+            },
+            "sleep": {
+                "state": "ASLEEP" if sleeping else "AWAKE",
+                "level": "warn" if sleeping else "live",
+            },
+            "llm_providers": {
+                "state": f"{len(configured_providers)} READY" if configured_providers else "UNSET",
+                "level": "live" if configured_providers else "warn",
+            },
+            "broadcast": {
+                "state": "ONLINE" if broadcast_group else "UNSET",
+                "level": "live" if broadcast_group else "warn",
+            },
+            "notify": {
+                "state": "READY" if notify_service else "UNSET",
+                "level": "live" if notify_service else "warn",
+            },
+            "satellites": {
+                "state": f"{sat_avail} / {sat_total}" if sat_total > 0 else "NONE",
+                "level": "live" if sat_avail == sat_total and sat_total > 0 else ("warn" if sat_total > 0 else "off"),
+            },
+        }
+
+        uptime_seconds = time.time() - _STARTUP_TS
+        uptime_str = _format_uptime(uptime_seconds)
+
+        # ── Config flags for settings panel ─────────────────────────────
+        announcements_on = bool(_runtime_opt(hass, entry, "announcements_enabled", False))
+        sentinel_on = bool(_runtime_opt(hass, entry, "sentinel_enabled", True))
+
+        # Available notify services for phone notification dropdown
+        notify_services = []
+        try:
+            for svc in hass.services.async_services().get("notify", {}):
+                notify_services.append(f"notify.{svc}")
+        except Exception:
+            pass
+        current_notify = str(_runtime_opt(hass, entry, CONF_NOTIFY_SERVICE, "") or "")
+
+        result = {
+            "status":         status,
+            "version":        _INTEGRATION_VERSION,
+            "meta": {
+                "bedrooms":          len(bedroom_areas),
+                "areas_monitored":   len(areas_list),
+                "announcements_today": announcements_today,
+                "est_cost":          _telemetry_est_cost(),
+                "uptime":            uptime_str,
+            },
+            "dominant":       dominant,
+            "areas":          areas_list,
+            "sleep_reason":   sleep_reason if sleeping else None,
+            "doorbell_training": doorbell_training,
+            "doors":          _get_door_states(hass),
+            "lockdown":       _get_lockdown_status(),
+            "intrusion":      _get_intrusion_status(),
+            "knowledge":      knowledge_stats,
+            "suggestions":    suggestions,
+            "goals":          goals,
+            "config": {
+                # Preserve an explicitly-blank honorific (the owner wants no form
+                # of address) — only fall back to the default when truly unset, so
+                # the panel no longer snaps a cleared honorific back to "sir"
+                # (#400 #8).
+                "honorific": _honorific_payload(_runtime_opt(hass, entry, "honorific", None)),
+                # ── Config-flow parity (9.19.0): current values for the panel's
+                # mirrored settings. Secrets (api keys, imap password) are never
+                # surfaced here. ──
+                "observer_quiet_start": quiet_start,
+                "observer_quiet_end": quiet_end,
+                "bedroom_areas": list(bedroom_areas or []),
+                "broadcast_group": broadcast_group,
+                # ── Issue #400 settings ──
+                "arrival_greeting_enabled": bool(_runtime_opt(hass, entry, "arrival_greeting_enabled", True)),
+                "arrival_min_away_minutes": int(_runtime_opt(hass, entry, "arrival_min_away_minutes", 10) or 0),
+                "quiet_hours_push_critical_only": bool(_runtime_opt(hass, entry, "quiet_hours_push_critical_only", False)),
+                "presence_only_entities": list(_runtime_opt(hass, entry, "presence_only_entities", []) or []),
+                "proactive_questions_interactive": bool(_runtime_opt(hass, entry, "proactive_questions_interactive", True)),
+                "directive_preset": str(_runtime_opt(hass, entry, "directive_preset", _DEF_DIR_PRESET)
+                                        or _DEF_DIR_PRESET),
+                "directive": str(_runtime_opt(hass, entry, "directive", "") or ""),
+                "directive_presets": list(_DIR_PRESETS.keys()),
+                "use_hass_api": bool(_runtime_opt(hass, entry, "use_hass_api", True)),
+                "identity_enabled": bool(_runtime_opt(hass, entry, "identity_enabled", True)),
+                "identity_voice_fingerprint": bool(_runtime_opt(hass, entry, "identity_voice_fingerprint", False)),
+                "voice_recognition_source": str(_runtime_opt(hass, entry, "voice_recognition_source", "") or ""),
+                "voice_recognition_auto_enroll": bool(_runtime_opt(hass, entry, "voice_recognition_auto_enroll", True)),
+                "voice_recognition_local": bool(_runtime_opt(hass, entry, "voice_recognition_local", False)),
+                "voice_recognition_delegate_stt": str(_runtime_opt(hass, entry, "voice_recognition_delegate_stt", "") or ""),
+                "imap_enabled": bool(_runtime_opt(hass, entry, "imap_enabled", False)),
+                "imap_host": str(_runtime_opt(hass, entry, "imap_host", "") or ""),
+                "imap_port": int(_runtime_opt(hass, entry, "imap_port", 993) or 993),
+                "imap_user": str(_runtime_opt(hass, entry, "imap_user", "") or ""),
+                "imap_folder": str(_runtime_opt(hass, entry, "imap_folder", "INBOX") or "INBOX"),
+                "imap_ssl": bool(_runtime_opt(hass, entry, "imap_ssl", True)),
+                "announcements_enabled": announcements_on,
+                "announce_notify_only": bool(_runtime_opt(hass, entry, "announce_notify_only", False)),
+                "sentinel_enabled": sentinel_on,
+                "observer_enabled": observer_enabled_cfg,
+                "pattern_learn_doors":     bool(_runtime_opt(hass, entry, "pattern_learn_doors", False)),
+                "pattern_learn_presence":  bool(_runtime_opt(hass, entry, "pattern_learn_presence", False)),
+                "pattern_learn_buttons":   bool(_runtime_opt(hass, entry, "pattern_learn_buttons", False)),
+                "pattern_include_entities": _get_runtime_json(hass, entry, "pattern_include_entities", []),
+                "excluded_entities": _get_runtime_json(hass, entry, "excluded_entities", []),
+                "excluded_domains": _get_runtime_json(hass, entry, "excluded_domains", []),
+                "excluded_labels": _get_runtime_json(hass, entry, "excluded_labels", []),
+                "available_labels": _available_labels(hass),
+                "cognition_enabled": bool(_runtime_opt(hass, entry, "cognition_enabled", True)),
+                "friday_automator": bool(_runtime_opt(hass, entry, "friday_automator", False)),
+                "proximity_volume": bool(_runtime_opt(hass, entry, "proximity_volume", True)),
+                "host_telemetry": bool(_runtime_opt(hass, entry, "host_telemetry", True)),
+                "camera_auto_analyze": bool(_runtime_opt(hass, entry, "camera_auto_analyze", True)),
+                "camera_auto_analyze_motion": bool(_runtime_opt(hass, entry, "camera_auto_analyze_motion", False)),
+                "camera_motion_vision": bool(_runtime_opt(hass, entry, "camera_motion_vision", False)),
+                "camera_important_only": bool(_runtime_opt(hass, entry, "camera_important_only", True)),
+                "camera_alert_level": (
+                    str(_runtime_opt(hass, entry, "camera_alert_level", "") or "")
+                    or ("all" if _runtime_opt(hass, entry, "camera_important_only", True) is False else "urgent")
+                ),
+                "camera_property_scope_only": bool(_runtime_opt(hass, entry, "camera_property_scope_only", True)),
+                "package_detection": bool(_runtime_opt(hass, entry, "package_detection", True)),
+                "visitor_learning": bool(_runtime_opt(hass, entry, "visitor_learning", True)),
+                "rich_reasoning": bool(_runtime_opt(hass, entry, "rich_reasoning", False)),
+                "direct_reasoning": bool(_runtime_opt(hass, entry, "direct_reasoning", False)),
+                "light_control_enabled": bool(_runtime_opt(hass, entry, "light_control_enabled", True)),
+                "appliance_power_guessing": bool(_runtime_opt(hass, entry, "appliance_power_guessing", False)),
+                "departure_alerts_enabled": bool(_runtime_opt(hass, entry, "departure_alerts_enabled", True)),
+                "departure_require_location": bool(_runtime_opt(hass, entry, "departure_require_location", True)),
+                "routine_alerts_enabled": bool(_runtime_opt(hass, entry, "routine_alerts_enabled", True)),
+                "door_window_alerts_enabled": bool(_runtime_opt(hass, entry, "door_window_alerts_enabled", True)),
+                "arrival_push_enabled": bool(_runtime_opt(hass, entry, "arrival_push_enabled", False)),
+                "autonomy_enforce": bool(_runtime_opt(hass, entry, "autonomy_enforce", False)),
+                "departure_lead_minutes": _runtime_opt(hass, entry, "departure_lead_minutes", 30),
+                "departure_origin_entity": str(_runtime_opt(hass, entry, "departure_origin_entity", "") or ""),
+                "departure_osrm_url": str(_runtime_opt(hass, entry, "departure_osrm_url", "") or ""),
+                "departure_travel_sensor": str(_runtime_opt(hass, entry, "departure_travel_sensor", "") or ""),
+                "driving_mode_enabled": bool(_runtime_opt(hass, entry, "driving_mode_enabled", False)),
+                "driving_notify_briefings": bool(_runtime_opt(hass, entry, "driving_notify_briefings", True)),
+                "driving_notify_travel": bool(_runtime_opt(hass, entry, "driving_notify_travel", True)),
+                "driving_notify_security": bool(_runtime_opt(hass, entry, "driving_notify_security", True)),
+                "driving_suppress_home_audio": bool(_runtime_opt(hass, entry, "driving_suppress_home_audio", True)),
+                "driving_car_sensor": str(_runtime_opt(hass, entry, "driving_car_sensor", "") or ""),
+                "identity_min_confidence": _runtime_opt(hass, entry, "identity_min_confidence", 0.45),
+                "ollama_num_ctx": _runtime_opt(hass, entry, "ollama_num_ctx", 8192),
+                "fast_chat_enabled": bool(_runtime_opt(hass, entry, "fast_chat_enabled", False)),
+                "fast_model": str(_runtime_opt(hass, entry, "fast_model", "") or ""),
+                "fast_provider": str(_runtime_opt(hass, entry, "fast_provider", "") or ""),
+                "fast_chat_max_complexity": _runtime_opt(hass, entry, "fast_chat_max_complexity", 70),
+                "memory_threading_enabled": bool(_runtime_opt(hass, entry, "memory_threading_enabled", True)),
+                "memory_threading_hours": _runtime_opt(hass, entry, "memory_threading_hours", 48),
+                "memory_threading_max": _runtime_opt(hass, entry, "memory_threading_max", 12),
+                "vague_command_minutes": _runtime_opt(hass, entry, "vague_command_minutes", 10),
+                "jh_fresh_chat_minutes": _runtime_opt(hass, entry, "jh_fresh_chat_minutes", 30),
+                "continued_conversation_enabled": bool(_runtime_opt(hass, entry, "continued_conversation_enabled", True)),
+                "continued_conversation_speaker_reopen": bool(_runtime_opt(hass, entry, "continued_conversation_speaker_reopen", True)),
+                "continued_conversation_multi_satellite": bool(_runtime_opt(hass, entry, "continued_conversation_multi_satellite", False)),
+                "observer_group_debounce": _runtime_opt(hass, entry, "observer_group_debounce", 90),
+                "adaptive_interruption_budget": bool(_runtime_opt(hass, entry, "adaptive_interruption_budget", False)),
+                "adaptive_suggestion_threshold": bool(_runtime_opt(hass, entry, "adaptive_suggestion_threshold", False)),
+                "adaptive_cognition_threshold": bool(_runtime_opt(hass, entry, "adaptive_cognition_threshold", False)),
+                "tts_use_ha_voice": bool(_runtime_opt(hass, entry, "tts_use_ha_voice", False)),
+                "arrival_greeting_enabled": bool(_runtime_opt(hass, entry, "arrival_greeting_enabled", False)),
+                "arrival_greeting_doors": _get_runtime_json(hass, entry, "arrival_greeting_doors", []),
+                "arrival_greeting_start": str(_runtime_opt(hass, entry, "arrival_greeting_start", "") or ""),
+                "arrival_greeting_end": str(_runtime_opt(hass, entry, "arrival_greeting_end", "") or ""),
+                "arrival_greeting_cooldown_min": _runtime_opt(hass, entry, "arrival_greeting_cooldown_min", 30),
+                "pattern_learn_motion": bool(_runtime_opt(hass, entry, "pattern_learn_motion", False)),
+                "suggest_garage_confirmation": bool(_runtime_opt(hass, entry, "suggest_garage_confirmation", False)),
+                "operational_mode_auto": bool(_runtime_opt(hass, entry, "operational_mode_auto", True)),
+                "lab_areas": _runtime_opt(hass, entry, "lab_areas", []) or [],
+                "movie_area": str(_runtime_opt(hass, entry, "movie_area", "") or ""),
+                "movie_media_player": str(_runtime_opt(hass, entry, "movie_media_player", "") or ""),
+                "movie_dim_pct": int(_runtime_opt(hass, entry, "movie_dim_pct", 15) or 15),
+                "llm_base_url": str(_runtime_opt(hass, entry, "llm_base_url", "") or ""),
+                "custom_base_url": str(_runtime_opt(hass, entry, "custom_base_url", "") or ""),
+                "ollama_base_url": str(_runtime_opt(hass, entry, "ollama_base_url", "") or ""),
+                "notify_service": current_notify,
+                "notify_services_available": notify_services,
+                "onboarding": _get_onboarding_state(hass, entry, current_notify),
+                "sentinel_rules": _get_sentinel_rules(),
+                "disabled_sentinel_rules": _get_disabled_rules(hass, entry),
+                "observer_stats": observer_stats,
+                "lockdown": _get_lockdown_status(),
+                "appliances": _get_appliance_status(),
+                "appliance_profile": _get_runtime_json(hass, entry, "appliance_profile", []),
+                "appliance_announce_unknown": _runtime_opt(hass, entry, "appliance_announce_unknown", False),
+                "memory_stats": memory_stats,
+                "satellites": _get_satellites(hass),
+                "cast_devices": _get_cast_devices(hass),
+                "cameras": _get_cameras(hass),
+                "camera_overrides": camera_overrides,
+                "camera_names": camera_names,
+                "satellite_pairings": _get_runtime_json(hass, entry, "satellite_pairings", {}),
+                "announcement_speakers": _get_runtime_json(hass, entry, "announcement_speakers", []),
+                "floor_plan_rooms": _get_runtime_json(hass, entry, "floor_plan_rooms", {}),
+                "floor_plan_bg": _get_runtime_json(hass, entry, "floor_plan_bg", {}),
+                "door_mapping": _get_runtime_json(hass, entry, "door_mapping", {}),
+                # AI model selection (provider + model per role) — for the
+                # Settings "AI Models" section's live-fetched dropdowns.
+                "configured_providers": configured_providers,
+                "llm_provider":        str(_runtime_opt(hass, entry, "llm_provider", "groq") or "groq"),
+                "model":               str(_runtime_opt(hass, entry, "model", "") or ""),
+                "classifier_provider": str(_runtime_opt(hass, entry, "classifier_provider", "") or ""),
+                "classifier_model":    str(_runtime_opt(hass, entry, "classifier_model", "") or ""),
+                "reasoning_provider":  str(_runtime_opt(hass, entry, "reasoning_provider", "") or ""),
+                "reasoning_model":     str(_runtime_opt(hass, entry, "reasoning_model", "") or ""),
+                # Extended "thinking" on models that support it (Gemini/Gemma,
+                # Ollama reasoning models). Vision defaults OFF — its small
+                # per-call token budget can be exhausted by thinking alone,
+                # leaving no answer (see llm_provider.GeminiProvider).
+                "vision_thinking_enabled":    bool(_runtime_opt(hass, entry, "vision_thinking_enabled", False)),
+                # Token budget used ONLY when the toggle above is on — a
+                # thinking model spends part of it on internal reasoning
+                # before the answer, so it needs more room than the tight
+                # non-thinking defaults (220/300 tokens).
+                "vision_thinking_max_tokens":    _runtime_opt(hass, entry, "vision_thinking_max_tokens", 1024),
+                # Global minimum seconds between AUTOMATIC camera analyses (motion
+                # / auto event reviews) — a throttle so frequent triggers don't
+                # exhaust a provider's daily token budget. 0 = off (#421).
+                "vision_min_interval":    _runtime_opt(hass, entry, "vision_min_interval", 0),
+                "review_enabled":      bool(_runtime_opt(hass, entry, "review_enabled", False)),
+                "review_provider":     str(_runtime_opt(hass, entry, "review_provider", "") or ""),
+                "review_model":        str(_runtime_opt(hass, entry, "review_model", "") or ""),
+                "vision_provider":     str(_runtime_opt(hass, entry, "vision_provider", "") or ""),
+                "vision_model":        str(_runtime_opt(hass, entry, "vision_model", "") or ""),
+                "camera_reasoning_provider": str(_runtime_opt(hass, entry, "camera_reasoning_provider", "") or ""),
+                "camera_reasoning_model":    str(_runtime_opt(hass, entry, "camera_reasoning_model", "") or ""),
+                # JARVIS Character & Research — these must be surfaced here or
+                # the panel's selects snap back to their defaults on every
+                # re-render even though the value was saved (v6.64.1 fix).
+                "banter_level":         _runtime_opt(hass, entry, "banter_level", 1),
+            "camera_watch_default": _jh_cam_default(hass, entry),
+            "quick_actions": _jh_quick_actions(hass, entry),
+            "person_pronouns": _jh_person_pronouns_cfg(hass, entry),
+            "person_address": _jh_person_address_cfg(hass, entry),
+            "location_sharing": _jh_location_sharing_cfg(hass, entry),
+                "jh_strict_actions": bool(_runtime_opt(hass, entry, "jh_strict_actions", True)),
+                "jh_mail_block": bool(_runtime_opt(hass, entry, "jh_mail_block", True)),
+                "jh_facts_only_briefings": bool(_runtime_opt(hass, entry, "jh_facts_only_briefings", True)),
+                "jh_faces_from_profile": bool(_runtime_opt(hass, entry, "jh_faces_from_profile", True)),
+                "ollama_keep_warm": _runtime_opt(hass, entry, "ollama_keep_warm", False) is True,
+                "jh_web_rescue": _runtime_opt(hass, entry, "jh_web_rescue", False) is True,
+                "jh_notify_admins": _runtime_opt(hass, entry, "jh_notify_admins", True) is not False,
+                "jh_notify_private": _jh_notify_private_cfg(),   # jh-notify-private
+                **_jh_opt_cfg(hass),
+                "search_backend":       str(_runtime_opt(hass, entry, "search_backend", "duckduckgo") or "duckduckgo"),
+                "searxng_url":          str(_runtime_opt(hass, entry, "searxng_url", "") or ""),
+                "web_research_llm_fallback": bool(_runtime_opt(hass, entry, "web_research_llm_fallback", False)),
+                "calendar_tight_gap_min": _runtime_opt(hass, entry, "calendar_tight_gap_min", 15),
+                "recognition_source":   str(_runtime_opt(hass, entry, "recognition_source", "both") or "both"),
+                "llm_face_recognition": bool(_runtime_opt(hass, entry, "llm_face_recognition", False)),
+                "llm_face_autotrain":   bool(_runtime_opt(hass, entry, "llm_face_autotrain", False)),
+                "output_language":      str(_runtime_opt(hass, entry, "output_language", "") or ""),
+                "voice_confirm_enabled": bool(_runtime_opt(hass, entry, "voice_confirm_enabled", False)),
+                "voice_confirm_mode":   str(_runtime_opt(hass, entry, "voice_confirm_mode", "auto") or "auto"),
+                "intrusion_response_timeout": _runtime_opt(hass, entry, "intrusion_response_timeout", 120),
+                "intrusion_vision_confirm": bool(_runtime_opt(hass, entry, "intrusion_vision_confirm", True)),
+                "intrusion_vision_veto": bool(_runtime_opt(hass, entry, "intrusion_vision_veto", True)),
+                "intrusion_requires_confinement": bool(_runtime_opt(hass, entry, "intrusion_requires_confinement", False)),
+                "intrusion_breach_only": bool(_runtime_opt(hass, entry, "intrusion_breach_only", True)),
+                # Nighttime cover securing policy (issue #495): secure | all | off
+                "nighttime_lockdown_covers": str(_runtime_opt(hass, entry, "nighttime_lockdown_covers", "secure") or "secure"),
+                # Goals: kernel Plan authoritative over goal step state (H4b, 9.40.0)
+                "goals_kernel_authoritative": bool(_runtime_opt(hass, entry, "goals_kernel_authoritative", True)),
+                # Scheduled briefings (v6.78.0)
+                "briefing_morning_enabled": bool(_runtime_opt(hass, entry, "briefing_morning_enabled", False)),
+                "briefing_evening_enabled": bool(_runtime_opt(hass, entry, "briefing_evening_enabled", False)),
+                "briefing_morning_time": _runtime_opt(hass, entry, "briefing_morning_time", "07:30"),
+                "briefing_evening_time": _runtime_opt(hass, entry, "briefing_evening_time", "19:30"),
+                "briefing_require_home": bool(_runtime_opt(hass, entry, "briefing_require_home", True)),
+                "briefing_include_weather": bool(_runtime_opt(hass, entry, "briefing_include_weather", True)),
+                "briefing_include_calendar": bool(_runtime_opt(hass, entry, "briefing_include_calendar", True)),
+                "briefing_include_events": bool(_runtime_opt(hass, entry, "briefing_include_events", True)),
+                "briefing_include_energy": bool(_runtime_opt(hass, entry, "briefing_include_energy", True)),
+                "briefing_include_hazards": bool(_runtime_opt(hass, entry, "briefing_include_hazards", True)),
+                # Hazard monitor controls — same read-back requirement (v6.71.0)
+                "hazard_monitor_enabled": bool(_runtime_opt(hass, entry, "hazard_monitor_enabled", False)),
+                "hazard_lat":             _runtime_opt(hass, entry, "hazard_lat", ""),
+                "hazard_lon":             _runtime_opt(hass, entry, "hazard_lon", ""),
+                "hazard_quakes_on":       bool(_runtime_opt(hass, entry, "hazard_quakes_on", True)),
+                "hazard_weather_on":      bool(_runtime_opt(hass, entry, "hazard_weather_on", True)),
+                "hazard_disasters_on":    bool(_runtime_opt(hass, entry, "hazard_disasters_on", True)),
+                "hazard_quake_radius_km": _runtime_opt(hass, entry, "hazard_quake_radius_km", 300),
+                "hazard_quake_min_mag":   _runtime_opt(hass, entry, "hazard_quake_min_mag", 2.5),
+                # Residence model detail controls — same read-back requirement:
+                # these save fine but reset on re-render unless surfaced here.
+                "residence_style":      str(_runtime_opt(hass, entry, "residence_style", "cape_cod") or "cape_cod"),
+                "home_attached":        str(_runtime_opt(hass, entry, "home_attached", "") or ""),
+                "home_roof":            str(_runtime_opt(hass, entry, "home_roof", "") or ""),
+                "floor_plan_sqft":      _runtime_opt(hass, entry, "floor_plan_sqft", ""),
+                "floor_plan_units":     str(_runtime_opt(hass, entry, "floor_plan_units", "imperial") or "imperial"),
+                "floor_plan_elements":  _get_runtime_json(hass, entry, "floor_plan_elements", {}),
+                "floor_plan_cameras":   _get_runtime_json(hass, entry, "floor_plan_cameras", {}),
+                "floor_plan_entities":  _get_runtime_json(hass, entry, "floor_plan_entities", {}),
+                "floor_plan_bg_opacity": _runtime_opt(hass, entry, "floor_plan_bg_opacity", ""),
+                "floor_plan_property":  _get_runtime_json(hass, entry, "floor_plan_property", {}),
+                "home_context_max_entities": _int_opt(hass, entry, "home_context_max_entities", 15),
+                "ui_language": _runtime_opt(hass, entry, "ui_language", "auto"),
+                "disabled_cameras":     _get_runtime_json(hass, entry, "disabled_cameras", []),
+                "home_stories":         _runtime_opt(hass, entry, "home_stories", "1.5"),
+                "has_basement":         _runtime_opt(hass, entry, "has_basement", True),
+                "dormers_front":        _runtime_opt(hass, entry, "dormers_front", 2),
+                "dormers_rear":         _runtime_opt(hass, entry, "dormers_rear", 1),
+                "garage_bays":          _runtime_opt(hass, entry, "garage_bays", 3),
+                "chimney_side":         str(_runtime_opt(hass, entry, "chimney_side", "right") or "right"),
+                "chimney_count":        _runtime_opt(hass, entry, "chimney_count", 1),
+                "basement_entrance":    str(_runtime_opt(hass, entry, "basement_entrance", "bulkhead") or "bulkhead"),
+                "home_bedrooms":        _runtime_opt(hass, entry, "home_bedrooms", ""),
+                "home_bathrooms":       _runtime_opt(hass, entry, "home_bathrooms", ""),
+            },
+        }
+        if not _is_admin(connection):
+            # Jarvis Home patch (2026-11-06): the panel stays open to everyone, the owner's connection details do not.
+            for _jh_key in ("imap_host", "imap_user", "llm_base_url", "custom_base_url", "ollama_base_url",
+                            "searxng_url", "departure_osrm_url", "hazard_lat", "hazard_lon"):
+                if _jh_key in result.get("config", {}):
+                    result["config"][_jh_key] = ""
+            for _jh_key in list(result.get("config", {})):   # jh-r20-secrets (step 162): and every other such key
+                if _JH_SECRET_KEY.search(_jh_key) and isinstance(result["config"][_jh_key], str):
+                    result["config"][_jh_key] = ""
+            result["goals"] = [g for g in result.get("goals", []) if g.get("owner") == connection.user.id]
+            # jh-r23-sleep (step 165, review round 23 #4): asleep / awake from the household signals and the viewer's OWN
+            # wearable only; another person's wearable is that person's health data. No reason text. Fails closed: awake.
+            _jh_sl23 = await _jh_viewer_sleep(hass, connection.user.id, bedroom_areas, quiet_start, quiet_end)
+            result.setdefault("status", {})["sleep"] = {"state": "ASLEEP" if _jh_sl23 else "AWAKE",
+                                                       "level": "warn" if _jh_sl23 else "live"}
+            result["sleep_reason"] = None
+            try:   # jh-r21-presence (step 163, review round 21 #2): no other person's zone, gps or distance; fail closed
+                _jh_os = (result.get("config") or {}).get("observer_stats")
+                if isinstance(_jh_os, dict):
+                    _jh_os["presence"] = await _jh_presence_rows(hass, connection.user.id, _jh_os.get("presence"))
+                    from . import agent as _jh_ag21
+                    result["config"]["observer_stats"] = await _jh_ag21.jh_viewer_private(hass, connection.user.id, _jh_os)
+            except Exception:  # noqa: BLE001
+                if isinstance((result.get("config") or {}).get("observer_stats"), dict):
+                    result["config"]["observer_stats"]["presence"] = []
+            result["suggestions"] = await _jh_own_suggestions(hass, connection.user.id, result.get("suggestions"))   # jh-r14-suggest
+        connection.send_result(msg["id"], result)
+    except Exception as exc:
+        _LOGGER.exception("ws_get_panel_data failed: %s", exc)
+        connection.send_error(msg["id"], "panel_data_failed", str(exc))
+
+
+async def _jh_presence_rows(hass, uid, rows) -> list:
+    """jh-r21-presence (step 163, review round 21 #2): the panel's presence rows (cognition.presence_status: zone, gps, distance)
+    for a login that is no administrator. A person row only when the where-is rule lets this login see that person
+    (presence.jh_hidden_people), a device tracker row only when it is one of this login's own person's trackers, and what is left
+    passes the shared filter (agent.jh_viewer_private). Fails closed: no row."""
+    try:
+        from .presence import jh_hidden_people
+        from . import agent as _jh_ag
+        hidden = await jh_hidden_people(hass, uid)
+        own = set()
+        for st in hass.states.async_all("person"):
+            if uid and st.attributes.get("user_id") == uid and st.entity_id not in hidden:
+                own |= {str(t) for t in (st.attributes.get("device_trackers") or [])}
+        keep = [r for r in (rows or []) if isinstance(r, dict) and (
+            (str(r.get("entity_id") or "").startswith("person.") and r.get("entity_id") not in hidden)
+            or r.get("entity_id") in own)]
+        out = await _jh_ag.jh_viewer_private(hass, uid, keep)
+        return out if isinstance(out, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def _jh_feed_private(hass, uid, entries):
+    """Review round 14 (jh-r14-feed): a member's activity feed leaves out rows about what the AI tools hide from them (another
+    person's trackers, phone and app sensors): by the row's entity id, or a message that names one. Fail closed: when the
+    lookup fails, no row about an entity is shown."""
+    try:
+        from . import agent as _jh_ag   # jh-r20-private (step 162): the one shared filter
+        return await _jh_ag.jh_viewer_private(hass, uid, list(entries or []))
+    except Exception:  # noqa: BLE001
+        return [e for e in entries if not e.get("entity_id")]
+
+
+async def _jh_viewer_sleep(hass, uid, bedrooms, quiet_start, quiet_end) -> bool:
+    """jh-r23-sleep (step 165, review round 23 #4): asleep or awake as a login that is no administrator may see it: the nap
+    override and a bedroom occupied during quiet hours (household signals), and only the viewer's own wearable (_jh_own_readings
+    over biometrics' sleep entities). Fails closed: False (awake)."""
+    try:
+        from . import biometrics, sleep_detection
+        sl, _why = sleep_detection.is_sleeping(hass, bedroom_area_ids=bedrooms, quiet_start=quiet_start,
+                                               quiet_end=quiet_end, wearable=False)
+        if sl:
+            return True
+        found = biometrics.discover(hass)
+        ents = [e for k in getattr(biometrics, "_SLEEP_KINDS", ()) for e in found.get(k, [])]
+        own = {e.get("entity") for e in await _jh_own_readings(hass, uid, ents)}
+        return bool(own) and biometrics.sleep_signal(hass, only=own) is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _jh_own_readings(hass, uid, entities):
+    """Review round 15 (jh-r15-bio): only readings from the asker's own devices (their person's trackers and app devices).
+    Fail closed: none."""
+    try:
+        from .presence import _jh_person_devices
+        own = set()
+        for p in hass.states.async_all("person"):
+            if uid and p.attributes.get("user_id") == uid:
+                own |= {t for t in (p.attributes.get("device_trackers") or []) if isinstance(t, str)}
+                for group in _jh_person_devices(hass, p):
+                    own |= set(group)
+        return [e for e in (entities or []) if e.get("entity") in own]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def _jh_own_suggestions(hass, uid, items):
+    """Review round 14 (jh-r14-suggest): a member sees no suggestion about another person (their person or tracker entity, or
+    their name as a whole word): another person's routines are theirs. Fail closed: none."""
+    import json as _jh_json
+    import re as _jh_re
+    try:
+        pats = []
+        for p in hass.states.async_all("person"):
+            if uid and p.attributes.get("user_id") == uid:
+                continue
+            for e in [p.entity_id] + [t for t in (p.attributes.get("device_trackers") or []) if isinstance(t, str)]:
+                pats.append(_jh_re.compile(r"(?<![\w.])" + _jh_re.escape(e) + r"(?![\w])"))
+            name = str(p.attributes.get("friendly_name") or "").strip()
+            for n in {name, name.split()[0] if name else ""}:
+                if len(n) >= 2:
+                    pats.append(_jh_re.compile(r"(?<!\w)" + _jh_re.escape(n) + r"(?!\w)", _jh_re.I))
+        from . import agent as _jh_ag   # review round 15: and every entity the AI tools hide from this login (phone sensors)
+        tok = _jh_ag._JH_CALLER.set(uid or "")
+        try:
+            hidden = await _jh_ag._jh_private_ids(hass)
+        finally:
+            _jh_ag._JH_CALLER.reset(tok)
+        pats += [_jh_re.compile(r"(?<![\w.])" + _jh_re.escape(e) + r"(?![\w])") for e in hidden]
+        return [s for s in (items or []) if not any(p.search(_jh_json.dumps(s, default=str, ensure_ascii=False)) for p in pats)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def _jh_member_cognitive(hass, uid, status):
+    """Review round 16 (jh-r16-cog): the cognitive status for a login that is no administrator (a member, the house group,
+    voice with no login). The last pattern analysis's near misses and the autonomy grants are routines: only rows that name no
+    other person and nothing hidden from this login stay (the panel's suggestion filter, _jh_own_suggestions, plus the hidden
+    entities' own names as whole phrases). The counts stay. Fail closed: none of those rows."""
+    out = dict(status or {})
+    la = dict(out.get("last_analysis") or {})
+    try:
+        from . import agent as _jh_ag
+        tok = _jh_ag._JH_CALLER.set(uid or "")
+        try:
+            hidden = await _jh_ag._jh_private_ids(hass)
+        finally:
+            _jh_ag._JH_CALLER.reset(tok)
+        leak = _jh_ag._jh_leak_test(hass, hidden)
+        import json as _jh_json
+
+        async def own(rows):
+            rows = await _jh_own_suggestions(hass, uid, [r for r in (rows or [])])
+            return [r for r in rows if not leak(_jh_json.dumps(r, default=str, ensure_ascii=False))]
+        if "near_misses" in la:
+            la["near_misses"] = await own(la.get("near_misses"))
+        if "autonomy_grants" in out:
+            out["autonomy_grants"] = await own(out.get("autonomy_grants"))
+    except Exception:  # noqa: BLE001
+        if "near_misses" in la:
+            la["near_misses"] = []
+        if "autonomy_grants" in out:
+            out["autonomy_grants"] = []
+    if "last_analysis" in out:
+        out["last_analysis"] = la
+    try:   # jh-r20-private (step 162, review round 20 #3): every other part of the status too (patterns, recent events)
+        from . import agent as _jh_ag
+        out = await _jh_ag.jh_viewer_private(hass, uid, out)
+    except Exception:  # noqa: BLE001
+        out = {k: v for k, v in out.items() if not isinstance(v, (list, dict))}
+    return out
+
+
+def _format_uptime(seconds: float) -> str:
+    """'2d 14h' / '14h 22m' / '42m 10s' format."""
+    seconds = int(seconds)
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    if d > 0:
+        return f"{d}d {h}h"
+    if h > 0:
+        return f"{h}h {m}m"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _telemetry_est_cost() -> str:
+    """Session LLM spend estimate for the status panel, or the "—" placeholder.
+
+    Thin delegate to ``llm_provider.telemetry_est_cost`` (TC4 enforce), which
+    owns the kernel ``summarize`` read, the enforce kill-switch and the fail-safe
+    formatting. Wrapped once more here so the panel never raises.
+    """
+    try:
+        from . import llm_provider
+
+        return llm_provider.telemetry_est_cost()
+    except Exception:  # noqa: BLE001 - observe-only panel figure, never fatal
+        return "—"
+
+
+def _get_announcements_today() -> int:
+    """Get today's spoken announcement count from DB. Returns 0 on error."""
+    try:
+        from .database import get_activity_count_today
+        return get_activity_count_today()
+    except Exception:
+        return 0
+
+
+def _door_entity_open(state_obj) -> bool:
+    """Back-compat shim — door open logic now lives in door_state.py."""
+    from . import door_state
+    return door_state.entity_is_open(state_obj)
+
+
+def _get_door_states(hass: HomeAssistant) -> dict:
+    """
+    Open/closed state of the home's doors for the Residence 3D model. Reads the
+    explicit ``door_mapping`` (slot -> entity_id) the user set on the Residence
+    tab, then delegates to door_state.get_door_states which honours it and
+    auto-detects the rest. Never raises.
+    """
+    try:
+        from . import door_state
+        entry = _get_entry(hass)
+        mapping = _get_runtime_json(hass, entry, "door_mapping", {}) or {}
+        return door_state.get_door_states(hass, mapping)
+    except Exception:
+        return {}
+
+
+def _get_doorbell_training() -> dict:
+    """Doorbell training-dataset stats + the most recent analysed events, for
+    the panel's Doorbell Training view. Never raises."""
+    try:
+        from . import doorbell_training
+        return {
+            "stats": doorbell_training.stats(),
+            "recent": doorbell_training.load_events(limit=12),
+        }
+    except Exception:
+        return {"stats": {"total": 0}, "recent": []}
+
+
+def _get_suggestions() -> list[dict]:
+    """Pending automation suggestions from the pattern engine, panel-shaped.
+    Includes the EVIDENCE behind each one (v6.80.0) so review shows why.
+    Never raises."""
+    try:
+        import json as _json
+        from .pattern_analyzer import get_analyzer, explain_suggestion
+        out = []
+        for s in get_analyzer().get_pending_suggestions():
+            ptype = s.get("pattern_type", "") or ""
+            try:
+                details = _json.loads(s.get("details") or "{}")
+            except Exception:
+                details = {}
+            try:
+                entities = _json.loads(s.get("entity_ids") or "[]")
+            except Exception:
+                entities = []
+            count = s.get("pattern_count", 0) or 0
+            why = explain_suggestion(ptype, details, count)
+            out.append({
+                "id": s.get("id"),
+                "created": s.get("created", ""),
+                "description": s.get("description", ""),
+                "yaml": s.get("automation_yaml", ""),
+                "confidence": round(float(s.get("confidence", 0) or 0), 2),
+                "count": count,
+                "pattern_type": ptype,
+                "entities": entities,
+                "why_headline": why.get("headline", ""),
+                "evidence": why.get("evidence", []),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _get_goals() -> list[dict]:
+    """Active + recently closed goals, panel-shaped. Never raises."""
+    try:
+        from . import goals
+        out = []
+        for g in goals.recent(limit=20):
+            steps = g.get("steps") or []
+            done = sum(1 for s in steps if s.get("status") == "done")
+            out.append({
+                "owner": g.get("user_id"),
+                "id": g.get("id"),
+                "title": g.get("title", ""),
+                "outcome": g.get("outcome", ""),
+                "status": g.get("status", "active"),
+                "steps_done": done,
+                "steps_total": len(steps),
+                "steps": steps,
+                "next_check_ts": g.get("next_check_ts", ""),
+                "deadline_ts": g.get("deadline_ts"),
+                "last_result": g.get("last_result", ""),
+                "updated_ts": g.get("updated_ts", ""),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _get_person_routines() -> dict:
+    """Per-person learned routines from the pattern engine, grouped by
+    person for the Memory panel. Never raises."""
+    try:
+        from .pattern_analyzer import get_analyzer
+        rows = get_analyzer().get_person_patterns()
+        grouped: dict[str, list[dict]] = {}
+        for r in rows:
+            person = r.get("person", "")
+            if not person:
+                continue
+            grouped.setdefault(person, []).append({
+                "id": r.get("id"),
+                "pattern_type": r.get("pattern_type", ""),
+                "description": r.get("description", ""),
+                "confidence": round(float(r.get("confidence", 0) or 0), 2),
+                "occurrences": r.get("occurrences", 0),
+                "last_seen": r.get("last_seen", ""),
+            })
+        return grouped
+    except Exception:
+        return {}
+
+
+def _downsample(vals: list[float], n: int) -> list[float]:
+    """Evenly-spaced downsample to at most n points — a sparkline doesn't
+    need every recorder sample, just the shape."""
+    if len(vals) <= n or n <= 0:
+        return vals
+    step = len(vals) / n
+    return [vals[int(i * step)] for i in range(n)]
+
+
+async def _get_area_sparklines(hass: HomeAssistant, entity_map: dict[str, dict[str, Optional[str]]],
+                                hours: float = 12.0, points: int = 20) -> dict:
+    """Compact recent history for area-tile sparklines, keyed by area_id:
+    {area_id: {"temp": [floats], "humidity": [floats]}}. entity_map is
+    {area_id: {"temp": entity_id_or_None, "humidity": entity_id_or_None}}.
+
+    v6.43.0 — the first use of HA's recorder in this integration. Pattern
+    learning deliberately built its own telemetry (patterns.db) instead of
+    depending on recorder, but that store explicitly excludes sensor/
+    binary_sensor domains as noise — exactly the domains a temperature
+    sparkline needs. Recorder is the right tool for this one job. Read-only,
+    wrapped defensively throughout: recorder internals vary by HA version
+    and this integration has no other code path exercising them.
+    Never raises — an empty dict just means no sparklines this cycle.
+    """
+    entity_ids = sorted({eid for m in entity_map.values() for eid in m.values() if eid})
+    if not entity_ids:
+        return {}
+    try:
+        from datetime import timedelta
+        from homeassistant.components.recorder import get_instance, history
+        from homeassistant.util import dt as dt_util
+    except Exception:
+        return {}
+
+    end = dt_util.utcnow()
+    start = end - timedelta(hours=hours)
+
+    def _fetch() -> dict:
+        return history.get_significant_states(
+            hass, start, end, entity_ids,
+            minimal_response=True, no_attributes=True)
+
+    try:
+        raw = await get_instance(hass).async_add_executor_job(_fetch)
+    except Exception as exc:
+        _LOGGER.debug("sparkline history fetch failed: %s", exc)
+        return {}
+    if not raw:
+        return {}
+
+    def _series(eid: str) -> list[float]:
+        vals: list[float] = []
+        for s in (raw.get(eid) or []):
+            # minimal_response mixes full State objects (first/last entry)
+            # with plain {"state": ..., "last_changed": ...} dicts.
+            raw_state = getattr(s, "state", None) if not isinstance(s, dict) else s.get("state")
+            try:
+                vals.append(float(raw_state))
+            except (TypeError, ValueError):
+                continue
+        return _downsample(vals, points)
+
+    out: dict = {}
+    for area_id, m in entity_map.items():
+        entry: dict = {}
+        if m.get("temp"):
+            v = _series(m["temp"])
+            if v:
+                entry["temp"] = v
+        if m.get("humidity"):
+            v = _series(m["humidity"])
+            if v:
+                entry["humidity"] = v
+        if entry:
+            out[area_id] = entry
+    return out
+
+
+def _get_sentinel_rules() -> list[dict]:
+    """Return list of sentinel rule IDs and descriptions."""
+    try:
+        from .sentinel import DEFAULT_RULES
+        return [{"id": r["id"], "desc": r.get("message", "")[:60]} for r in DEFAULT_RULES]
+    except Exception:
+        return []
+
+
+def _get_disabled_rules(hass: HomeAssistant, entry) -> list[str]:
+    """Return list of disabled sentinel rule IDs from runtime config."""
+    if entry is None:
+        return []
+    data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+    raw = rc.get("disabled_sentinel_rules", _entry_opt(entry, "disabled_sentinel_rules", "[]"))
+    if isinstance(raw, list):
+        return raw
+    try:
+        import json
+        return json.loads(raw) if isinstance(raw, str) else []
+    except Exception:
+        return []
+
+
+def _get_lockdown_status() -> dict:
+    """Formal lockdown state for the panel."""
+    try:
+        from . import cognitive_core
+        return cognitive_core.lockdown_status()
+    except Exception:
+        return {"active": False, "since": 0.0, "reason": "", "auto": False, "exempt_windows": 0}
+
+
+def _get_intrusion_status() -> dict:
+    """Active intrusion investigation (breach point + route) for the panel."""
+    try:
+        from . import cognitive_core
+        return cognitive_core.intrusion_status()
+    except Exception:
+        return {"active": False, "confirmed": False}
+
+
+def _get_knowledge_stats() -> dict:
+    """Curated-knowledge summary (counts) for the panel."""
+    try:
+        from . import knowledge
+        return knowledge.stats()
+    except Exception:
+        return {"total": 0, "by_kind": {}, "by_subject": {}}
+
+
+def _get_appliance_status() -> dict:
+    """Appliance monitor state — declared profile (with learned watts) and what
+    JARVIS is currently tracking — for the Settings → Appliances panel."""
+    try:
+        from . import appliance_monitor
+        st = appliance_monitor.status()
+        return {
+            "running": st.get("running", False),
+            "profile": st.get("profile", []),
+            "tracked_sensors": [
+                {"entity": eid, "name": s.get("friendly_name", eid),
+                 "appliance": s.get("appliance"), "phase": s.get("phase"),
+                 "power_w": round(s.get("power_w", 0) or 0),
+                 "discovery": s.get("discovery")}
+                for eid, s in (st.get("sensors") or {}).items()
+            ],
+            "native": [
+                {"entity": eid, "name": n.get("device_name", eid),
+                 "appliance": n.get("appliance"), "state": n.get("current_state")}
+                for eid, n in (st.get("native_appliances") or {}).items()
+            ],
+            "whole_home": bool(st.get("whole_home_delta")),
+        }
+    except Exception:
+        return {"running": False, "profile": [], "tracked_sensors": [],
+                "native": [], "whole_home": False}
+
+
+def _get_reasoning_stats() -> dict:
+    """Learned-reasoning cache + connectivity breaker stats for the panel."""
+    out = {
+        "learned_patterns": 0, "cloud_calls": 0, "local_decisions": 0,
+        "local_rate": 0, "llm_breaker": "closed",
+    }
+    try:
+        from . import reasoning_cache
+        out.update(reasoning_cache.stats())
+    except Exception:
+        pass
+    try:
+        from . import connectivity
+        st = connectivity.status()
+        out["llm_breaker"] = st.get("state", "closed") if isinstance(st, dict) else "closed"
+    except Exception:
+        pass
+    return out
+
+
+def _get_observer_stats(recent=None, reasoning_stats=None) -> dict:
+    """Return observer pipeline stats for the tuning dashboard."""
+    try:
+        from . import observer as obs
+        from .database import get_recent_activity
+        state = obs._STATE
+
+        # Classifier calls in last hour
+        now = time.time()
+        calls_last_hour = sum(1 for ts in state.classifier_timestamps if ts > now - 3600) if hasattr(state, 'classifier_timestamps') else 0
+
+        # Activity stats from DB
+        if recent is None:
+            recent = get_recent_activity(hours=24, limit=500)
+        total_events = len(recent)
+        spoken = sum(1 for e in recent if e.get("was_spoken"))
+        flagged = sum(1 for e in recent if "flagged" in (e.get("message") or ""))
+        dropped = sum(1 for e in recent if "not worth" in (e.get("message") or ""))
+
+        try:
+            from . import cognition as _cog
+            cog_stats = _cog.stats()
+        except Exception:
+            cog_stats = {"entities_tracked": 0, "events_seen": 0, "anomalies_escalated": 0}
+
+        try:
+            from . import cognition as _cog2
+            presence = _cog2.presence_status(state.hass) if getattr(state, "hass", None) else []
+        except Exception:
+            presence = []
+
+        return {
+            "running": state.running,
+            "calls_last_hour": calls_last_hour,
+            "rate_limit": obs._effective_rate_limit(),
+            "events_24h": total_events,
+            "flagged_24h": flagged,
+            "dropped_24h": dropped,
+            "spoken_24h": spoken,
+            "cognition_enabled": obs._cognition_enabled(),
+            "cognition_threshold": obs._cognition_threshold(),
+            "cog_entities": cog_stats.get("entities_tracked", 0),
+            "cog_events_seen": cog_stats.get("events_seen", 0),
+            "cog_escalated": cog_stats.get("anomalies_escalated", 0),
+            "cog_predictable": cog_stats.get("predictable", 0),
+            "cog_routines": cog_stats.get("routines", 0),
+            "cog_presence": cog_stats.get("presence_routines", 0),
+            "presence": presence,
+            **(reasoning_stats or _get_reasoning_stats()),
+        }
+    except Exception:
+        return {"running": False, "calls_last_hour": 0, "rate_limit": 30,
+                "events_24h": 0, "flagged_24h": 0, "dropped_24h": 0, "spoken_24h": 0,
+                "cognition_enabled": True, "cognition_threshold": 0.6,
+                "cog_entities": 0, "cog_events_seen": 0, "cog_escalated": 0,
+                "cog_predictable": 0, "cog_routines": 0, "cog_presence": 0,
+                "presence": [], "learned_patterns": 0, "cloud_calls": 0,
+                "local_decisions": 0, "local_rate": 0, "llm_breaker": "closed"}
+
+
+async def _async_get_observer_stats(hass) -> dict:
+    from .database import get_recent_activity
+    recent, reasoning_stats = await asyncio.gather(
+        hass.async_add_executor_job(get_recent_activity, 24, 500),
+        hass.async_add_executor_job(_get_reasoning_stats),
+    )
+    return _get_observer_stats(recent, reasoning_stats)
+
+
+# ─── Activity log WebSocket command ──────────────────────────────────────────
+
+# Jarvis Home patch (2026-11-06): these lines quote what a person asked for and what came back.
+_JH_PRIVATE_ACTIVITY = ("followup", "goal")
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_activity_log",
+    vol.Optional("hours", default=24): int,
+    vol.Optional("limit", default=50): int,
+})
+@websocket_api.async_response
+async def ws_get_activity_log(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return recent activity log entries for the panel."""
+    try:
+        from .database import get_recent_activity
+        entries = await hass.async_add_executor_job(
+            lambda: get_recent_activity(hours=msg["hours"], limit=msg["limit"])
+        )
+        if not _is_admin(connection):
+            entries = [e for e in entries if e.get("category") not in _JH_PRIVATE_ACTIVITY
+                       or e.get("user_id") == connection.user.id]
+            entries = await _jh_feed_private(hass, connection.user.id, entries)   # jh-r14-feed (review round 14)
+        # Format for the panel
+        result = []
+        for e in entries:
+            ts_str = e.get("timestamp", "")
+            # Parse "2026-04-23T05:30:00" → "05:30"
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                from homeassistant.util import dt as dt_util
+                # Parse UTC timestamp and convert to local
+                dt = _dt.fromisoformat(ts_str).replace(tzinfo=_tz.utc)
+                local_dt = dt_util.as_local(dt)
+                hhmm = local_dt.strftime("%H:%M")
+            except Exception:
+                hhmm = ts_str[:5] if len(ts_str) >= 5 else ts_str
+            result.append({
+                "ts": hhmm,
+                "urgency": e.get("urgency", "low"),
+                "tag": (e.get("entity_id", "").split(".", 1)[-1][:20] or e.get("source", "")).upper(),
+                "entity_id": e.get("entity_id", "") or "",   # jh-feed (step 149): the readable headline (friendly name)
+                "name": (lambda _jh_s: str(_jh_s.attributes.get("friendly_name") or "") if _jh_s is not None else "")(
+                    hass.states.get(e.get("entity_id") or "") if e.get("entity_id") else None),
+                "msg": e.get("message", ""),
+                "source": e.get("source", "observer"),
+            })
+        connection.send_result(msg["id"], {"entries": result})
+    except Exception as exc:
+        _LOGGER.warning("ws_get_activity_log failed: %s", exc)
+        connection.send_error(msg["id"], "activity_log_failed", str(exc))
+
+# ─── Config update WebSocket command ─────────────────────────────────────────
+
+# Only these keys can be toggled from the panel. Prevents arbitrary writes.
+PANEL_WRITABLE_KEYS = {
+    "ui_language",
+    "announcements_enabled",
+    "announce_notify_only",      # bool: mute speakers — proactive announcements go to notifications only (#181)
+    "sentinel_enabled",
+    "observer_enabled",
+    "nighttime_lockdown_covers",   # str: "secure" (default, doors/garage/gate only) | "all" (legacy, every open cover) | "off" — bounds autonomous nighttime cover-closing so egress shutters aren't rolled down over sleeping residents (issue #495)
+    "pattern_learn_doors",         # learn door/window activity for routines
+    "pattern_learn_presence",      # learn presence/arrivals for routines
+    "pattern_learn_buttons",       # learn button/remote presses ("press -> scene")
+    "pattern_include_entities",    # JSON list: specific entities to always learn
+    "excluded_entities",           # JSON list: entity_ids removed from JARVIS's awareness
+    "excluded_domains",            # JSON list: whole domains removed from awareness
+    "excluded_labels",             # JSON list: HA labels whose entities are removed from awareness
+    "notify_service",
+    "departure_alerts_enabled",
+    "departure_require_location",   # bool: only alert for events with a physical location (skip online meetings) — #233
+    "routine_alerts_enabled",
+    "door_window_alerts_enabled",   # bool: announce door/window/garage open-at-unusual-time (awareness kept either way)
+    "departure_lead_minutes",
+    "departure_origin_entity",
+    "departure_osrm_url",
+    "departure_travel_sensor",
+    "driving_mode_enabled",          # bool: route proactive alerts to the car (Android Auto) screen
+    "driving_car_sensor",            # str: head-unit-connected binary_sensor (blank = auto-detect *_android_auto)
+    "driving_notify_briefings",      # bool: route proactive briefings to the car screen
+    "driving_notify_travel",         # bool: route departure / leave-now heads-ups to the car screen
+    "driving_notify_security",       # bool: route security / hazard / camera alerts to the car screen
+    "driving_suppress_home_audio",   # bool: while driving, skip the home spoken announcement for routed alerts
+    "memory_threading_enabled",
+    "memory_threading_hours",
+    "memory_threading_max",
+    "vague_command_minutes",     # 0-240: ask first for "do all" after this many quiet minutes (0 = off)
+    "jh_fresh_chat_minutes",     # 0-1440: a chat starts fresh after this many quiet minutes (0 = off)
+    "db_retention_days",             # int days: cap raw-observation retention to bound DB growth (0 = keep forever) — issue #491
+    "db_source_retention_days",      # int days: flush raw learning source (state_changes/commands) sooner than the rest, 0 = use db_retention_days — issue #491b
+    "db_storage_path",               # str: host the .db files on an external volume / share instead of <config>/jarvis — issue #491c
+    "continued_conversation_enabled",
+    "continued_conversation_speaker_reopen",   # bool: JARVIS times the follow-up mic reopen to the reply speaker finishing
+    "continued_conversation_multi_satellite",  # bool: follow-up follows the person to another room's satellite when the start room empties
+    "disabled_sentinel_rules",   # JSON list of disabled rule IDs
+    "satellite_pairings",        # JSON dict: {satellite_entity_id: cast_entity_id}
+    "announcement_speakers",     # JSON list of cast entity IDs for announcements
+    "floor_plan_rooms",          # JSON: floor plan room positions per floor
+    "floor_plan_entities",       # JSON: HA entities pinned to plan coords per floor
+    "floor_plan_bg_opacity",     # 0-1: opacity of the imported floor-plan background image
+    "floor_plan_bg",             # JSON: base64 background images per floor
+    # Residence model (the 3D house on the Residence tab)
+    "residence_style",           # str: home style template (cape_cod, ranch, …)
+    "floor_plan_sqft",           # str/int: estimated square footage
+    "floor_plan_units",          # "imperial" | "metric" for room dimensions
+    "floor_plan_elements",       # JSON: placed windows/doors per floor (+ sensor map)
+    "floor_plan_cameras",        # JSON: placed cameras per floor (pos/angle/fov/range) (v7.17.0)
+    "floor_plan_property",       # JSON: property boundary polygon {points:[[x,y],...]} (v7.22.0)
+    "home_context_max_entities", # int: entity names per domain in the system prompt (0=counts only) (v7.23.1)
+    "disabled_cameras",          # JSON list: camera entity_ids JARVIS must not use
+    "home_stories",              # str: number of stories (controls floor tabs)
+    "has_basement",              # bool: whether to show the basement floor
+    "dormers_front",             # int: front dormer count override
+    "dormers_rear",              # int: rear dormer count override
+    "home_attached",             # str: party wall side for UK semi/terrace (''|none|left|right|top|bottom|both)
+    "home_roof",                 # str: roof type override (''|gable|hip|gambrel|mansard|flat|shed|dormer|mshape|butterfly|jerkinhead|crossgable|hipvalley)
+    "garage_bays",               # int: garage bay count
+    "chimney_side",              # str: chimney placement (left/right/center/none)
+    "home_bedrooms",             # int: bedroom count (Residence stats)
+    "home_bathrooms",            # int: bathroom count (Residence stats)
+    "door_mapping",              # JSON: {model door slot -> entity_id}
+    # Outdoor classification (feeds the intrusion false-alarm guards)
+    "outdoor_areas",             # JSON list: extra area names treated as outdoor
+    "outdoor_entities",          # JSON list: entity globs forced outdoor
+    "indoor_entities",           # JSON list: entity globs forced indoor (wins)
+    # Web Research + Communication agents (v6.51.0)
+    "search_backend",            # str: "duckduckgo" (default) | "searxng"
+    "searxng_url",               # str: SearXNG base URL when backend=searxng
+    "web_research_llm_fallback", # bool: opt-in — escalate to the LLM's own web search on empty results
+    "calendar_tight_gap_min",    # int: back-to-back gap flagged as "tight"
+    # Persona (v6.51.0)
+    "camera_watch_default",      # str: camera Camera Watch opens on
+    "quick_actions",             # JSON list: Command Center Quick Actions buttons (checked on save)
+    "person_pronouns",           # JSON dict: {person entity: she | he | they} (checked on save)
+    "person_address",            # JSON dict: {person entity: sir | madam | name | none} (checked on save)
+    "location_sharing",          # str: household | private - who may ask where someone is (checked on save)
+    "jh_strict_actions",   # bool: Core switch, on by default
+    "jh_mail_block",   # bool: Core switch, on by default
+    "jh_facts_only_briefings",   # bool: Core switch, on by default
+    "jh_faces_from_profile",   # bool: Faces tab, residents from HA profile pictures, on by default
+    "ollama_keep_warm",   # bool: keep the local Ollama model loaded (Clean Jarvis: off by default)
+    "jh_web_rescue",   # bool: automatic web search on a knowledge-cutoff reply (off by default)
+    "jh_notify_admins",   # bool: JARVIS may send notifications for logged-in admins (on by default)
+    "jh_opt_map", "jh_opt_people", "jh_opt_phone", "jh_opt_chat",   # bool: Optional pages switches (off by default)
+    "jh_opt_created",   # dict: what the Optional pages Setup made (checked on save)
+    "jh_history_days",   # int 1-365 or empty: days of history JARVIS keeps while the Map page is on
+    "jh_opt_overview", "jh_opt_history", "jh_opt_watch", "jh_opt_chatlog",   # bool: jh-optional-extras switches (off by default)
+    "jh_notify_private",   # str: admin_phones | notify_service - where private alerts go (jh-notify-private (step 158), checked)
+    "jh_overview_cams_all",   # bool: the Home overview's cameras for everyone (step 158, C4; off: admins only)
+    "jh_watch_days",   # int 1-90: days the answer watcher keeps flagged answers
+    "jh_watch_notify",   # bool: answer watcher notifies admins (no chat text)
+    "jh_opt_login", "jh_login_status", "jh_login_voice",   # bool: jh-login-screen (step 136): the page, its status, its voice
+    "jh_opt_brand", "jh_opt_mediabar", "jh_opt_tuya",   # bool: jh-optional-looks (step 137)
+    "jh_opt_assist",   # bool: jh-assist-history (step 139)
+    "banter_level",              # int: 0 plain · 1 dry (default) · 2 full MCU wit
+    # Local semantic search via Ollama embeddings (v6.57.0)
+    "semantic_search",           # bool: use Ollama embeddings for doc retrieval
+    "embed_model",               # str: Ollama embed model (default nomic-embed-text)
+    "embed_base_url",            # str: override Ollama host for embeddings
+    "custom_modes",              # dict: user-defined operational modes (v6.61.0)
+    "operational_mode_auto",     # bool: auto away/normal by occupancy (v7.14.0)
+    "lab_areas",                 # list: rooms Lab mode is scoped to (v7.15.0)
+    "movie_area",                # str: room Movie mode is bound to (v7.15.0)
+    "movie_media_player",        # str: Movie media_player binding (v7.15.0)
+    "movie_dim_pct",             # int: Movie mood dim level 0-100 (v7.15.0)
+    "energy_agency",             # str: advisory | opt_in | autonomous (v6.62.0)
+    "energy_peak_watts",         # float: whole-home peak threshold in watts
+    "energy_power_sensor",       # str: explicit whole-home power sensor entity_id (overrides auto-discovery; #476)
+    "energy_mode_bump",          # list: modes that raise energy agency one step
+    "biometrics_enabled",        # bool: read wearable context (opt-in) (v6.63.0)
+    "biometric_entities",        # dict: explicit kind→entity_id overrides
+    "recognition_source",        # str: both | doubletake | frigate (v6.64.1)
+    "llm_face_recognition",      # bool: best-effort resident recognition via the local vision LLM, opt-in (#140 Phase 3)
+    "llm_face_autotrain",        # bool: auto-enroll LLM reference photos from confident Frigate/Double Take recognitions, opt-in (#140 Phase 3 training, v9.86.0)
+    "output_language",           # str: ISO code (e.g. "de") or ""/"auto" to follow HA; steers JARVIS's spoken/written output (#148)
+    "voice_confirm_enabled",      # bool: voice-confirm sensitive actions (v6.67.0)
+    "voice_confirm_mode",         # str: native | gated | auto
+    "voice_confirm_entities",     # list: extra entities to confirm / !exempt
+    "satellite_audio_out",        # dict/bool: satellites whose audio routes out
+    "satellite_start_action",     # dict: satellite → esphome start action
+    "intrusion_response_timeout", # float: secs before unanswered alert escalates
+    "onboarding_dismissed",       # bool: user dismissed the first-run welcome card
+    "friday_automator",           # bool: enable the FRIDAY actuating sub-agent (off by default; v7.96.0)
+    "proximity_volume",           # bool: mmWave distance-based TTS volume dampening (v7.96.0)
+    "host_telemetry",             # bool: read host CPU temp / memory pressure / NVMe I/O (v7.96.0)
+    # Multi-hazard monitor (v6.71.0)
+    "hazard_monitor_enabled",     # bool: master on/off for hazard polling
+    "hazard_lat",                 # float|"": location override latitude
+    "hazard_lon",                 # float|"": location override longitude
+    "hazard_quakes_on",           # bool: earthquake feed
+    "hazard_weather_on",          # bool: NWS severe-weather feed
+    "hazard_disasters_on",        # bool: NASA EONET disaster feed
+    "hazard_quake_radius_km",     # float: earthquake radius
+    "hazard_quake_min_mag",       # float: min magnitude to alert
+    "hazard_disaster_radius_km",  # float: disaster radius
+    "intrusion_vision_confirm",   # bool: verify Frigate person detection with JARVIS vision before escalating
+    "intrusion_vision_veto",      # bool: a clear visual "no person" vetoes low-confidence intrusion alerts (default on; off = ever-vigilant)
+    "intrusion_inward_depth",     # int: rooms deep from breach motion must reach to confirm
+    "intrusion_requires_confinement", # bool: gate intrusion on Lockdown/alarm-armed instead of auto away/sleep (#111)
+    "intrusion_breach_only",      # bool: interior motion never alarms (residents/pets); only a breach (open exterior entry) or a camera-confirmed person opens an intrusion (default on; v9.85.0)
+    "goals_kernel_authoritative", # bool: kernel journal is authoritative for goal step state (H4b, default on; off = store-authoritative parity)
+    # Scheduled briefings (v6.78.0)
+    "briefing_morning_enabled",   # bool: deliver a morning briefing
+    "briefing_evening_enabled",   # bool: deliver an evening briefing
+    "briefing_morning_time",      # str "HH:MM"
+    "briefing_evening_time",      # str "HH:MM"
+    "briefing_require_home",      # bool: skip when nobody is home
+    "briefing_include_weather",
+    "briefing_include_calendar",
+    "briefing_include_presence",
+    "briefing_include_events",
+    "briefing_include_energy",
+    "briefing_include_hazards",
+    "chimney_count",                # int: number of chimneys (1-4), spaced along the ridge (#324)
+    "basement_entrance",            # str: cellar entry — bulkhead|interior (#324)
+    "autonomy_enforce",             # bool: opt-in — kernel-governed graduated autonomy (security never auto-acts); confirmed in-panel
+    "arrival_push_enabled",         # bool: also PUSH the "heading home" anticipation alert to phones (#265); default off, spoken either way
+    "document_watch_folders",    # str/list: extra folders to auto-ingest new docs from
+    # AI model selection (Settings → AI Models live-fetched dropdowns)
+    "llm_provider",
+    "model",
+    "llm_base_url",
+    "custom_base_url",
+    "ollama_base_url",
+    "classifier_provider",
+    "classifier_model",
+    "reasoning_provider",
+    "reasoning_model",
+    "review_enabled",               # bool: run the second-opinion review pass (issue #400 #10)
+    "review_provider",
+    "review_model",
+    "vision_provider",
+    "vision_model",
+    "camera_reasoning_provider",
+    "camera_reasoning_model",
+    "vision_thinking_enabled",     # bool: let the vision pipeline's model think (default off)
+    "vision_thinking_max_tokens",     # int: token budget when vision thinking is on
+    "vision_min_interval",         # int seconds: global min gap between AUTOMATIC camera analyses (0 = off) — #421
+    "classifier_rate_limit",
+    "cognition_enabled",
+    "cognition_threshold",
+    "observer_group_debounce",      # seconds: coalesce a burst of numbered sibling entities (0 = off)
+    "adaptive_interruption_budget",  # bool: scale the announcement cap down when recent proactive decisions were unwelcome
+    "adaptive_suggestion_threshold", # bool: tune the suggestion confidence bar from how welcome recent suggestions were
+    "adaptive_cognition_threshold",  # bool: tune the cognition/anticipation salience bar from how welcome recent alerts were
+    "tts_use_ha_voice",              # bool: use Home Assistant's configured TTS voice instead of the JARVIS Piper voice
+    "arrival_greeting_enabled",      # bool: greet a resident by name on arrival through a chosen door (opt-in; v9.84.0)
+    "arrival_greeting_doors",        # list: binary_sensor door entity_ids that trigger an arrival greeting
+    "arrival_greeting_start",        # str: "HH:MM" start of the greeting window (blank = no start bound)
+    "arrival_greeting_end",          # str: "HH:MM" end of the greeting window (blank = no end bound)
+    "arrival_greeting_cooldown_min", # int: minutes before the same resident is greeted again
+    "pattern_learn_motion",          # bool: learn motion/occupancy triggers for "when X, do Y" suggestions (rate-limited)
+    "suggest_garage_confirmation",   # bool: opt-in to safety-sensitive confirmation-sequence suggestions (e.g. close the garage once the car is confirmed inside)
+    "appliance_profile",            # JSON list of declared appliances (name/type/entity/watts)
+    "appliance_announce_unknown",   # bool: announce loads matching no declared appliance
+    "camera_auto_analyze",          # bool: auto-inspect doorbell/person camera events
+    "camera_auto_analyze_motion",   # bool: also auto-inspect motion events (noisier)
+    "camera_motion_vision",         # bool: generic HA motion sensor → silent camera vision (#140)
+    "camera_important_only",         # bool: (legacy) auto reviews announce only important events
+    "camera_alert_level",            # str: off|urgent|important|all — severity threshold for auto camera announcements
+    "camera_property_scope_only",    # bool: auto reviews consider only on-property activity; off = watch public areas too (v9.80.0)
+    "package_detection",            # bool: watch porch cameras for packages & mail
+    "visitor_learning",             # bool: silent vision learning from person events
+    "rich_reasoning",               # bool: cloud-first reasoning for medium+ events
+    "direct_reasoning",             # bool: skip JARVIS's local triage, send conversation input straight to the reasoning agent (#469)
+    "llm_base_url",                 # str: OpenAI-compatible endpoint (Ollama GPU server)
+    "pattern_min_occurrences",      # int: pattern engine repeat threshold
+    "pattern_confidence",           # float: pattern engine confidence threshold
+    "light_control_enabled",        # bool: allow toggling lights from the dashboard
+    "appliance_power_guessing",     # bool: announce fingerprint/auto-discovered guesses
+    "identity_min_confidence",      # float: face-match threshold below which a person is 'unknown'
+    "ollama_num_ctx",               # int: Ollama context window for local models
+    "fast_chat_enabled",            # bool: route simple conversational turns to a small/fast model (latency)
+    "fast_model",                   # str: the small model for the fast-chat tier (e.g. gemma3n:e4b)
+    "fast_provider",                # str: provider for the fast model (blank = same as Main Agent)
+    "fast_chat_max_complexity",     # int: complexity score below which a turn uses the fast model (default 70)
+    # ── Config-flow parity (9.19.0): every non-secret options-flow field is now
+    # settable from the main panel too. Secrets (provider api_key, imap_secret_key)
+    # stay in the config flow / secrets.yaml and are deliberately NOT here.
+    "observer_quiet_start",         # str "HH:MM": quiet-hours start (proactive/observer back off)
+    "observer_quiet_end",           # str "HH:MM": quiet-hours end
+    "bedroom_areas",                # list[area_id]: rooms whose presence triggers sleep during quiet hours
+    "broadcast_group",              # str: media_player entity used as the announcement broadcast group
+    "honorific",                    # str: form of address (e.g. "sir")
+    "directive_preset",             # str: persona directive preset key
+    "directive",                    # str: custom standing directive (overrides the preset when set)
+    "use_hass_api",                 # bool: let JARVIS use Home Assistant's own LLM API tools
+    "identity_enabled",             # bool: per-person recognition master switch
+    "identity_voice_fingerprint",   # bool: voice-fingerprint identity tier (needs a GPU)
+    "voice_recognition_source",     # str: voice-recognition source identifier
+    "voice_recognition_auto_enroll",# bool: auto-enroll newly heard voices
+    "voice_recognition_local",      # bool: in-process speaker ID (Path B; needs backend+model)
+    "voice_recognition_delegate_stt",  # str: underlying STT the tee delegates transcription to
+    "voice_embedding_model_path",   # str: path to the ONNX speaker-embedding model
+    "voice_local_trust_threshold",  # float: cosine ≥ this (with enough samples) = trusted match
+    "voice_local_guess_threshold",  # float: cosine ≥ this = panel-only guess
+    "voice_local_min_samples",      # int: enrolled samples required before a match can be trusted
+    "imap_enabled",                 # bool: read-only IMAP inbox access
+    "imap_host",                    # str: IMAP host
+    "imap_port",                    # int: IMAP port (default 993)
+    "imap_user",                    # str: IMAP username
+    "imap_folder",                  # str: IMAP folder (default INBOX)
+    "imap_ssl",                     # bool: IMAP over SSL
+    # ── Issue #400 ──
+    "arrival_greeting_enabled",     # bool: speak a welcome-home greeting on arrival (#3)
+    "arrival_min_away_minutes",     # int: minimum minutes away before an arrival counts (#3)
+    "quiet_hours_push_critical_only",  # bool: during quiet hours, push only critical (#4)
+    "presence_only_entities",       # list[entity_id]: visible to presence, never escalated/announced (#4)
+    "proactive_questions_interactive",  # bool: open the mic for proactive questions (#6)
+}
+
+# ── Debug log ring buffer ────────────────────────────────────────────────────
+from collections import deque as _deque
+from datetime import datetime as _datetime
+from pathlib import Path as _Path
+import threading as _threading
+import queue as _queue
+import json as _json_mod
+from .paths import config_path as _config_path
+
+_DEBUG_LOG: _deque = _deque(maxlen=500)
+# A dedicated buffer for conversation + reply-routing entries only, so a burst of
+# observer/anomaly noise (e.g. many alarm-zone escalations at once) can't evict
+# the reply-delivery decisions before they're read from diagnostics.
+_CONV_CATEGORIES = frozenset({"CONV", "LOCAL", "AGENT", "REPLY", "ROUTE", "OFFLINE", "ERROR"})
+_CONV_LOG: _deque = _deque(maxlen=80)
+_LOG_FILE = _config_path("jarvis", "jarvis.log")
+
+
+def _read_integration_version() -> str:
+    """
+    Read the integration version from manifest.json — the single source of
+    truth. Done once at import (not per-request) so the panel can display the
+    actually-running version. This fixes the banner drifting out of sync: the
+    version was hardcoded in the panel JS, so a browser-cached panel showed a
+    stale number after an addon update. Now the panel fetches this live.
+    """
+    try:
+        mf = _Path(__file__).parent / "manifest.json"
+        return _json_mod.loads(mf.read_text()).get("version", "?")
+    except Exception:
+        return "?"
+
+
+_INTEGRATION_VERSION = _read_integration_version()
+
+# Persistent-log writes happen on a dedicated daemon thread, never on the
+# event loop. jarvis_log() is called synchronously from event-loop callbacks
+# (the classifier, observer, etc.) — doing file I/O there blocks the loop, and
+# under an announcement/classify storm that stall degrades the ESPHome
+# satellite connections (mic ESP_ERR_TIMEOUT → crash-loop). Enqueue instead;
+# the writer thread does the blocking open()/write()/rotate() off-loop.
+_LOG_QUEUE: "_queue.Queue[dict]" = _queue.Queue(maxsize=2000)
+_WRITER_STARTED = False
+_WRITER_LOCK = _threading.Lock()
+_WRITER_THREAD: "_threading.Thread | None" = None
+# Pushed to the queue to tell the writer thread to exit (distinct from None,
+# which the loop ignores). An object() sentinel can't collide with a log entry.
+_WRITER_STOP = object()
+
+
+def _log_writer_loop() -> None:
+    """Drain the log queue and write to disk. Runs on a daemon thread.
+
+    Exits when it dequeues the _WRITER_STOP sentinel (pushed by
+    stop_log_writer), flushing anything queued ahead of it first.
+    """
+    while True:
+        entry = _LOG_QUEUE.get()
+        try:
+            if entry is _WRITER_STOP:
+                return
+            if entry is None:
+                continue
+            _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_LOG_FILE, "a") as f:
+                f.write(f"{entry['date']} {entry['ts']} [{entry['cat']}] {entry['msg']}\n")
+            # Rotate if file gets too large (>2MB)
+            if _LOG_FILE.stat().st_size > 2_000_000:
+                lines = _LOG_FILE.read_text().splitlines()
+                _LOG_FILE.write_text("\n".join(lines[-2000:]) + "\n")
+        except Exception:
+            pass
+        finally:
+            _LOG_QUEUE.task_done()
+
+
+def _ensure_writer() -> None:
+    """Start the background writer thread once, lazily."""
+    global _WRITER_STARTED, _WRITER_THREAD
+    if _WRITER_STARTED:
+        return
+    with _WRITER_LOCK:
+        if _WRITER_STARTED:
+            return
+        t = _threading.Thread(
+            target=_log_writer_loop, name="jarvis-log-writer", daemon=True,
+        )
+        t.start()
+        _WRITER_THREAD = t
+        _WRITER_STARTED = True
+
+
+def stop_log_writer(timeout: float = 2.0) -> None:
+    """Stop the background log-writer thread (idempotent).
+
+    Called on unload so the thread does not outlive the config entry and leak
+    across reloads. Safe to call when the writer was never started. This blocks
+    briefly to join the thread, so callers on the event loop should run it in an
+    executor. The thread wakes from its blocking get() the moment the sentinel
+    is dequeued, so the join returns almost immediately in practice.
+    """
+    global _WRITER_STARTED, _WRITER_THREAD
+    with _WRITER_LOCK:
+        t = _WRITER_THREAD
+        _WRITER_STARTED = False
+        _WRITER_THREAD = None
+        if t is None:
+            return
+        try:
+            _LOG_QUEUE.put_nowait(_WRITER_STOP)
+        except _queue.Full:
+            # Queue is saturated; make room so the stop sentinel gets through.
+            try:
+                _LOG_QUEUE.get_nowait()
+                _LOG_QUEUE.task_done()
+                _LOG_QUEUE.put_nowait(_WRITER_STOP)
+            except Exception:
+                pass
+    try:
+        t.join(timeout=timeout)
+    except Exception:
+        pass
+
+
+def _persist_log_entry(entry: dict) -> None:
+    """Queue a log entry for the background writer (never blocks the caller)."""
+    _ensure_writer()
+    try:
+        _LOG_QUEUE.put_nowait(entry)
+    except _queue.Full:
+        pass  # under extreme load, drop the persisted copy rather than block
+
+
+def _load_persisted_log() -> None:
+    """Load recent entries from persistent log on startup."""
+    try:
+        if _LOG_FILE.exists():
+            import re
+            lines = _LOG_FILE.read_text().splitlines()[-200:]
+            for line in lines:
+                m = re.match(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) \[(\w+)\] (.+)", line)
+                if m:
+                    _entry = {
+                        "date": m.group(1),
+                        "ts": m.group(2),
+                        "cat": m.group(3),
+                        "msg": m.group(4),
+                    }
+                    _DEBUG_LOG.append(_entry)
+                    if m.group(3) in _CONV_CATEGORIES:
+                        _CONV_LOG.append(_entry)
+    except Exception:
+        pass
+
+
+# Load on import
+_load_persisted_log()
+
+
+def jarvis_log(category: str, message: str) -> None:
+    """Add to JARVIS debug log (visible in panel Log tab + persistent file)."""
+    try:   # jh-r23-tz (step 165, review round 23 #8): the log's date and time
+        from .const import jh_local_now as _jh_ln23
+    except ImportError:   # a stubbed const (tests): the process clock
+        import datetime as _jh_dt23
+        _jh_ln23 = _jh_dt23.datetime.now
+    now = _jh_ln23()
+    entry = {
+        "date": now.strftime("%Y-%m-%d"),
+        "ts": now.strftime("%H:%M:%S"),
+        "cat": category,
+        "msg": message[:500],
+    }
+    _DEBUG_LOG.append(entry)
+    if category in _CONV_CATEGORIES:
+        _CONV_LOG.append(entry)
+    _persist_log_entry(entry)
+
+
+def recent_conversation_log(n: int = 80) -> list:
+    """Last ``n`` conversation/reply-routing entries, from a dedicated buffer that
+    observer/anomaly noise cannot evict. Included in diagnostics so a spoken-reply
+    delivery problem is diagnosable even when the main log is flooded."""
+    entries = list(_CONV_LOG)
+    return entries[-n:] if n and n > 0 else entries
+
+
+def recent_debug_log(n: int = 150) -> list:
+    """Return the last ``n`` debug-log entries (used by the diagnostics export so
+    a spoken-reply issue is diagnosable from the downloaded file, not just the
+    live Logs tab)."""
+    entries = list(_DEBUG_LOG)
+    return entries[-n:] if n and n > 0 else entries
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/reload_appliances",
+})
+@websocket_api.async_response
+async def ws_reload_appliances(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Restart the appliance monitor so profile edits take effect immediately
+    (no Home Assistant restart needed)."""
+    try:
+        from . import appliance_monitor, jarvis_config
+        entry = _get_entry(hass)
+        cfg: dict = {}
+        if entry:
+            data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+            cfg = await hass.async_add_executor_job(
+                jarvis_config.effective_config_with_runtime, entry, rc)
+        await appliance_monitor.start(hass, cfg)
+        connection.send_result(msg["id"], {
+            "ok": True, "appliances": _get_appliance_status(),
+        })
+    except Exception as exc:
+        connection.send_error(msg["id"], "reload_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/set_lockdown",
+    vol.Required("on"): bool,
+})
+@websocket_api.async_response
+async def ws_set_lockdown(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Engage or lift the formal lockdown from the panel."""
+    try:
+        from . import cognitive_core
+        ok = await cognitive_core.request_lockdown(
+            bool(msg["on"]), reason="requested from panel", hass=hass)
+        status = cognitive_core.lockdown_status()
+        if not ok:
+            _LOGGER.warning("Panel lockdown request returned not-ok (on=%s); status=%s",
+                            bool(msg["on"]), status)
+        connection.send_result(msg["id"], {"ok": ok, "lockdown": status})
+    except Exception as exc:
+        _LOGGER.exception("Panel lockdown request failed: %s", exc)
+        connection.send_error(msg["id"], "lockdown_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_knowledge",
+    vol.Optional("subject"): str,
+})
+@websocket_api.async_response
+async def ws_get_knowledge(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the curated facts JARVIS knows, for the Memory panel."""
+    try:
+        from . import knowledge
+        if not _is_admin(connection):
+            # Jarvis Home patch (2026-11-06): a non-admin sees only their own facts and the household's.
+            from . import identity
+            mine = [identity.subject_for_user(hass, connection.user.id), knowledge.DEFAULT_SUBJECT]
+            wanted = [msg["subject"]] if msg.get("subject") else mine
+            allowed = [s for s in wanted if s in mine]
+            facts = await hass.async_add_executor_job(lambda: knowledge.all_facts(subjects=allowed)) if allowed else []
+            connection.send_result(msg["id"], {"facts": facts, "stats": {"total": len(facts), "by_kind": {}, "by_subject": {}}})
+            return
+        subject = msg.get("subject")
+        facts = await hass.async_add_executor_job(lambda: knowledge.all_facts(subject=subject))
+        kstats = await hass.async_add_executor_job(knowledge.stats)
+        connection.send_result(msg["id"], {"facts": facts, "stats": kstats})
+    except Exception as exc:
+        _LOGGER.exception("get_knowledge failed: %s", exc)
+        connection.send_error(msg["id"], "knowledge_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/add_knowledge",
+    vol.Required("key"): str,
+    vol.Required("value"): str,
+    vol.Optional("subject"): str,
+    vol.Optional("kind"): str,
+})
+@websocket_api.async_response
+async def ws_add_knowledge(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Teach JARVIS a fact from the Memory panel."""
+    try:
+        from . import knowledge
+        f = await hass.async_add_executor_job(
+            lambda: knowledge.remember(
+                msg["key"], msg["value"],
+                subject=msg.get("subject", knowledge.DEFAULT_SUBJECT),
+                kind=msg.get("kind", "fact"), source="stated"))
+        facts = await hass.async_add_executor_job(knowledge.all_facts)
+        connection.send_result(msg["id"], {"ok": bool(f), "facts": facts})
+    except Exception as exc:
+        _LOGGER.exception("add_knowledge failed: %s", exc)
+        connection.send_error(msg["id"], "add_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/forget_knowledge",
+    vol.Optional("fact_id"): int,
+    vol.Optional("subject"): str,
+    vol.Optional("key"): str,
+})
+@websocket_api.async_response
+async def ws_forget_knowledge(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Forget a fact (by fact_id, or subject+key) from the Memory panel.
+
+    NOTE: the fact id is carried as ``fact_id``, not ``id`` — ``id`` is reserved
+    by the HA WebSocket protocol for the message sequence number (the frontend
+    overwrites any ``id`` we send), so using it here silently deleted nothing.
+    """
+    try:
+        from . import knowledge
+        fid = msg.get("fact_id")
+        removed = await hass.async_add_executor_job(
+            lambda: knowledge.forget(fact_id=fid, subject=msg.get("subject"), key=msg.get("key")))
+        facts = await hass.async_add_executor_job(knowledge.all_facts)
+        connection.send_result(msg["id"], {"removed": removed, "facts": facts})
+    except Exception as exc:
+        _LOGGER.exception("forget_knowledge failed: %s", exc)
+        connection.send_error(msg["id"], "forget_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/root_cause",
+    vol.Required("entity_id"): str,
+    vol.Optional("event_time"): str,
+    vol.Optional("window_secs"): int,
+})
+@websocket_api.async_response
+async def ws_root_cause(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Root cause analysis for an entity's (latest or specified) change —
+    the same engine the conversational 'why did …' tool uses, structured for
+    the panel."""
+    try:
+        from . import rca
+        _jh_admin = _is_admin(connection)
+        if not _jh_admin:   # jh-r20-private (step 162, review round 20 #3): the where-is rule, fail closed
+            from . import agent as _jh_ag
+            _jh_uid = getattr(getattr(connection, "user", None), "id", "") or ""
+            _jh_hid, _jh_leak, _jh_ok = await _jh_ag.jh_viewer_hidden(hass, _jh_uid)
+            _jh_eid = str(msg["entity_id"])
+            if _jh_hid(_jh_eid) or _jh_leak(_jh_eid):
+                connection.send_result(msg["id"], {
+                    "entity_id": _jh_eid, "event": {}, "candidates": [], "timeline": [], "private": True,
+                    "summary": "That is private: where a person is, and their phone's history, is only for that person or "
+                               "an administrator."})
+                return
+        result = await hass.async_add_executor_job(
+            lambda: rca.analyze(
+                msg["entity_id"],
+                msg.get("event_time"),
+                int(msg.get("window_secs") or rca.DEFAULT_WINDOW_SECS),
+                viewer=None if _jh_admin else connection.user.id))
+        if not _jh_admin:
+            result = await _jh_ag.jh_viewer_private(hass, _jh_uid, result)
+            if not _jh_ok:   # the rule could not be read: no timeline, no candidates
+                result = {**result, "timeline": [], "candidates": []}
+        connection.send_result(msg["id"], result)
+    except Exception as exc:
+        _LOGGER.exception("root_cause failed: %s", exc)
+        connection.send_error(msg["id"], "root_cause_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/compute_camera_coverage",
+    vol.Required("camera"): dict,
+})
+@websocket_api.async_response
+async def ws_compute_camera_coverage(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Judge one camera's coverage (which rooms it can confirm + a human reason)
+    from the geometric candidates the panel supplies. Uses the reasoning LLM,
+    falling back to a geometry-only summary."""
+    try:
+        from . import camera_coverage, jarvis_config
+        entry = _get_entry(hass)
+        try:
+            config = jarvis_config.effective_config(entry) if entry else {}
+        except Exception:
+            config = {}
+        result = await camera_coverage.infer_coverage(hass, config, msg["camera"])
+        connection.send_result(msg["id"], result)
+    except Exception as exc:
+        _LOGGER.exception("compute_camera_coverage failed: %s", exc)
+        connection.send_error(msg["id"], "coverage_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/update_config",
+    vol.Required("key"): str,
+    # list/dict are accepted so area/entity multi-selects (e.g. bedroom_areas,
+    # lab_areas) can be saved as real JSON values rather than only scalars.
+    vol.Required("value"): vol.Any(bool, str, int, float, list, dict, None),
+})
+@websocket_api.async_response
+async def ws_update_config(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """
+    Update a config toggle from the panel.
+
+    Stores in hass.data runtime_config (NOT entry.options) to avoid
+    triggering an entry reload which would navigate the browser away
+    from the panel. Sentinel and observer check runtime_config first,
+    then fall back to entry.options.
+    """
+    key = msg["key"]
+    value = msg["value"]
+
+    if key not in PANEL_WRITABLE_KEYS:
+        connection.send_error(
+            msg["id"], "invalid_key",
+            f"Key '{key}' is not writable from the panel",
+        )
+        return
+    if key == "quick_actions":   # Jarvis Home patch (2026-11-14): only allowed services, checked here
+        try:
+            value = _jh_qa_clean(value)
+            _jh_qa_manual(hass, value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_quick_actions", str(exc))
+            return
+    if key == "person_pronouns":   # Jarvis Home patch (2026-11-14): she, he or they per person entity
+        try:
+            from .presence import jh_clean_pronouns
+            value = jh_clean_pronouns(value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_person_pronouns", str(exc))
+            return
+    if key == "person_address":   # Jarvis Home patch (2026-11-14): sir, madam, name or none per person entity
+        try:
+            from .presence import jh_clean_address
+            value = jh_clean_address(value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_person_address", str(exc))
+            return
+    if key == "jh_fresh_chat_minutes":   # Jarvis Home patch (2026-11-15): jh-fresh-chat, whole minutes 0-1440
+        try:
+            value = int(float(value))
+            if not 0 <= value <= 1440:
+                raise ValueError
+        except (TypeError, ValueError):
+            connection.send_error(msg["id"], "invalid_jh_fresh_chat_minutes", "Fresh chat minutes must be 0-1440 (0 = off)")
+            return
+    if key == "vague_command_minutes":   # Jarvis Home patch (2026-11-15): jh-vague-command, whole minutes 0-240
+        try:
+            value = int(float(value))
+            if not 0 <= value <= 240:
+                raise ValueError
+        except (TypeError, ValueError):
+            connection.send_error(msg["id"], "invalid_vague_command_minutes", "Ask-first minutes must be 0-240 (0 = off)")
+            return
+    if key == "jh_faces_from_profile" and not isinstance(value, bool):   # Jarvis Home patch (2026-11-15)
+        connection.send_error(msg["id"], "invalid_jh_faces_from_profile", "On or off only")
+        return
+    if key in ("ollama_keep_warm", "jh_web_rescue", "jh_notify_admins") and not isinstance(value, bool):   # Clean Jarvis
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key in ("jh_opt_map", "jh_opt_people", "jh_opt_phone", "jh_opt_chat") and not isinstance(value, bool):   # jh-optional
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key == "jh_opt_assist" and not isinstance(value, bool):   # jh-assist-history
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key in ("jh_opt_brand", "jh_opt_mediabar", "jh_opt_tuya") and not isinstance(value, bool):   # jh-optional-looks
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key in ("jh_opt_login", "jh_login_status", "jh_login_voice") and not isinstance(value, bool):   # jh-login-screen
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key == "jh_notify_private":   # jh-notify-private: admin_phones or notify_service
+        try:
+            from .jh_notify import clean_choice
+            value = clean_choice(value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_jh_notify_private", str(exc))
+            return
+    if key == "jh_overview_cams_all" and not isinstance(value, bool):
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key in ("jh_opt_overview", "jh_opt_history", "jh_opt_watch", "jh_opt_chatlog", "jh_watch_notify") and not isinstance(value, bool):   # jh-optional-extras
+        connection.send_error(msg["id"], "invalid_" + key, "On or off only")
+        return
+    if key == "jh_watch_days":   # jh-optional-extras: whole days 1-90
+        try:
+            from .optional_extras import clean_watch_days
+            value = clean_watch_days(value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_jh_watch_days", str(exc))
+            return
+    if key in ("jh_history_days", "jh_opt_created"):   # jh-optional: checked here
+        try:
+            from .optional_pages import clean_created, clean_days
+            value = clean_days(value) if key == "jh_history_days" else clean_created(value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_" + key, str(exc))
+            return
+    if key == "location_sharing":   # Jarvis Home patch (2026-11-15): household or private
+        try:
+            from .presence import jh_clean_sharing
+            value = jh_clean_sharing(value)
+        except ValueError as exc:
+            connection.send_error(msg["id"], "invalid_location_sharing", str(exc))
+            return
+
+    entry = _get_entry(hass)
+    if entry is None:
+        connection.send_error(msg["id"], "no_entry", "No JARVIS config entry found")
+        return
+
+    try:
+        # Store in runtime_config — does NOT trigger entry reload
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        if data is None:
+            connection.send_error(msg["id"], "no_data", "JARVIS runtime data not found")
+            return
+        rc = data.setdefault("runtime_config", {})
+        updates = {key: value}
+        if key in {"review_provider", "review_model"} and value not in (None, ""):
+            updates["review_enabled"] = True
+        rc.update(updates)
+        _LOGGER.info("JARVIS panel: set %s = %s", key, str(value)[:80])
+
+        # Persist via centralized config module (survives restarts)
+        try:
+            from . import jarvis_config
+            await hass.async_add_executor_job(jarvis_config.set_many, updates)
+        except Exception as exc:
+            _LOGGER.debug("Config persist note: %s", exc)
+
+        # If toggling observer, start/stop immediately
+        if key == "observer_enabled":
+            from . import observer as observer_mod
+            if value:
+                from . import jarvis_config
+                observer_config = await hass.async_add_executor_job(
+                    jarvis_config.effective_config_with_runtime, entry, rc)
+                await observer_mod.start(hass, observer_config)
+                data["observer_running"] = True
+            else:
+                await observer_mod.stop()
+                data["observer_running"] = False
+        elif set(updates) & {
+            "llm_provider",
+            "model",
+            "llm_base_url",
+            "custom_base_url",
+            "ollama_base_url",
+            "classifier_provider",
+            "classifier_model",
+            "reasoning_provider",
+            "reasoning_model",
+            "review_provider",
+            "review_model",
+        }:
+            from . import observer as observer_mod
+            from .llm_provider import async_refresh_main_client
+
+            if set(updates) & {
+                "llm_provider",
+                "model",
+                "llm_base_url",
+                "custom_base_url",
+                "ollama_base_url",
+            }:
+                await async_refresh_main_client(hass, entry)
+            if observer_mod.is_running():
+                await observer_mod.refresh_tier_providers(hass, updates)
+
+        if key in ("jh_opt_created", "jh_opt_overview") and value:   # jh-optional-extras: build the Home overview now
+            from .optional_extras import async_overview_sync
+            hass.async_create_task(async_overview_sync(hass))
+        if key == "jh_opt_assist":   # jh-assist-history: the Assist pop-up add-on follows the switch
+            from .optional_looks import async_switch as _jh_assist_switch
+            await _jh_assist_switch(hass, key, value is True)
+        if key == "jh_opt_chatlog":   # jh-assist-history: the other assistants' turns are recorded while Chat history is on
+            from .optional_extras import async_assist_log as _jh_assist_log
+            await _jh_assist_log(hass, value is True)
+        if key in ("jh_opt_brand", "jh_opt_mediabar"):   # jh-optional-looks: the logo view and scripts follow the switch
+            from .optional_looks import async_switch as _jh_looks_switch
+            await _jh_looks_switch(hass, key, value is True)
+        if key == "jh_opt_tuya":   # jh-optional-looks: Tuya clean-up on, or undone
+            from .tuya_tidy import async_switch as _jh_tuya_switch
+            await _jh_tuya_switch(hass, value is True)
+        if key == "jh_opt_login":   # jh-login-screen: on registers the page once and fetches its media
+            from .login_screen import async_switch as _jh_login_switch
+            await _jh_login_switch(hass, value is True)
+        if key == "jh_opt_chat":   # jh-optional: the Chat switch starts or stops Household Chat at once
+            from .optional_pages import async_chat
+            await async_chat(hass, value is True)
+        if key == "jh_faces_from_profile" and value is True:   # jh-faces-profile: check the persons now
+            from .recognition import jh_profile_sync
+            hass.async_create_task(jh_profile_sync(hass, entry))
+        connection.send_result(msg["id"], {"key": key, "value": value})
+    except Exception as exc:
+        _LOGGER.warning("ws_update_config failed: %s", exc)
+        connection.send_error(msg["id"], "update_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_enforcement",
+})
+@websocket_api.async_response
+async def ws_get_enforcement(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the governance enforce switches for the panel's Governance tab:
+    each switch's name, explanation, category, shipped default, live value and
+    whether an owner override is stored."""
+    try:
+        from . import enforcement
+        switches = await hass.async_add_executor_job(enforcement.current)
+        connection.send_result(msg["id"], {"switches": switches})
+    except Exception as exc:
+        _LOGGER.warning("ws_get_enforcement failed: %s", exc)
+        connection.send_error(msg["id"], "enforcement_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/set_enforcement",
+    vol.Required("key"): str,
+    vol.Required("enabled"): bool,
+})
+@websocket_api.async_response
+async def ws_set_enforcement(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Persist an owner override for one enforce switch and update the live flag.
+
+    The write survives restarts (``jarvis_config``) and takes effect immediately.
+    An unknown key is rejected; everything else is defensive."""
+    key = msg["key"]
+    enabled = bool(msg["enabled"])
+    try:
+        from . import enforcement
+        entry = await hass.async_add_executor_job(
+            enforcement.set_switch, key, enabled)
+        if entry is None:
+            connection.send_error(
+                msg["id"], "invalid_key",
+                f"Unknown enforcement switch '{key}'")
+            return
+        _LOGGER.info("JARVIS panel: enforcement %s set to %s", key, enabled)
+        connection.send_result(msg["id"], {"switch": entry})
+    except Exception as exc:
+        _LOGGER.warning("ws_set_enforcement failed: %s", exc)
+        connection.send_error(msg["id"], "enforcement_set_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/floorplan_sources",
+})
+@websocket_api.async_response
+async def ws_floorplan_sources(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """List image/camera entities that look like a vacuum map or floor-plan image
+    the user could import as a floor-plan background (#405)."""
+    try:
+        from . import floorplan_import
+        connection.send_result(
+            msg["id"], {"sources": floorplan_import.list_sources(hass)})
+    except Exception as exc:
+        _LOGGER.warning("ws_floorplan_sources failed: %s", exc)
+        connection.send_error(msg["id"], "floorplan_sources_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/import_floorplan",
+    vol.Required("entity_id"): str,
+    vol.Optional("floor", default="1f"): str,
+})
+@websocket_api.async_response
+async def ws_import_floorplan(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Fetch a vacuum-map / dashboard image entity's current image and store it as
+    the floor-plan background for the given floor — no manual upload (#405).
+    Admin-gated (it writes the floor-plan config)."""
+    try:
+        from . import floorplan_import
+        res = await floorplan_import.async_import_to_floor(
+            hass, msg["entity_id"], msg.get("floor", "1f"))
+        _LOGGER.info("JARVIS panel: imported floor plan from %s", msg["entity_id"])
+        connection.send_result(msg["id"], res)
+    except ValueError as exc:
+        connection.send_error(msg["id"], "import_failed", str(exc))
+    except Exception as exc:
+        _LOGGER.warning("ws_import_floorplan failed: %s", exc)
+        connection.send_error(msg["id"], "import_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/segment_floorplan_rooms",
+    vol.Required("entity_id"): str,
+    vol.Optional("target_span", default=60.0): vol.Coerce(float),
+})
+@websocket_api.async_response
+async def ws_segment_floorplan_rooms(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Auto-detect room polygons from a vacuum/map image entity (#405 follow-up).
+
+    Fetches the entity's current image and segments it into room polygons the
+    floor-plan editor can render — read-only (it returns candidate rooms for the
+    panel to apply; it does not write the plan itself). Admin-gated and run off
+    the event loop (numpy/Pillow are blocking)."""
+    try:
+        from . import floorplan_import, floorplan_segment
+        content, _ctype = await floorplan_import._fetch_image_bytes(
+            hass, msg["entity_id"])
+        _span = float(msg.get("target_span", 60.0))
+        res = await hass.async_add_executor_job(
+            lambda: floorplan_segment.extract_rooms(content, target_span=_span))
+        if res.get("ok"):
+            _LOGGER.info("JARVIS panel: detected %d room(s) from %s",
+                         res.get("count", 0), msg["entity_id"])
+            connection.send_result(msg["id"], res)
+        else:
+            connection.send_error(msg["id"], res.get("error", "segment_failed"),
+                                  res.get("message", "Room detection failed."))
+    except ValueError as exc:
+        connection.send_error(msg["id"], "segment_failed", str(exc))
+    except Exception as exc:
+        _LOGGER.warning("ws_segment_floorplan_rooms failed: %s", exc)
+        connection.send_error(msg["id"], "segment_failed", str(exc))
+
+
+def _resolve_provider_key(hass: HomeAssistant, entry, provider: str) -> str:
+    """Deprecated synchronous shim — kept only so any stray caller doesn't hard
+    crash. Credentials live in secrets.yaml now; use ha_secrets.async_get_provider_key
+    (or get_provider_key_sync from the executor) instead, which this cannot be
+    since secrets.yaml reads are blocking file I/O."""
+    return ""
+
+
+async def _configured_providers(hass: HomeAssistant, entry) -> list[str]:
+    """Providers with a usable credential/endpoint today — drives the AI
+    Models role dropdowns so you can't pick a provider with nothing to call.
+    Ollama needs no key and uses the same default endpoint as create_provider;
+    a Custom endpoint is likewise valid with no key at all.
+    Credentials are read straight from secrets.yaml — the only place they live."""
+    from . import ha_secrets
+    out = []
+    from .const import resolve_provider_base_url
+    ollama_selected = False
+    ollama_base_url = _runtime_opt(hass, entry, CONF_OLLAMA_BASE_URL, "")
+    ollama_config = {
+        CONF_OLLAMA_BASE_URL: ollama_base_url,
+        "llm_base_url": "",
+    }
+    selected_providers = {
+        str(_runtime_opt(hass, entry, key, "") or "")
+        for key in (
+            "llm_provider", "classifier_provider", "reasoning_provider",
+            "review_provider", "vision_provider", "camera_reasoning_provider",
+        )
+    }
+    ollama_selected = "ollama" in selected_providers
+    if ollama_selected:
+        ollama_config["llm_base_url"] = _runtime_opt(hass, entry, "llm_base_url", "")
+    if ollama_selected and not resolve_provider_base_url(ollama_config, "ollama"):
+        ollama_config[CONF_OLLAMA_BASE_URL] = "http://homeassistant.local:11434/v1"
+    if resolve_provider_base_url(ollama_config, "ollama"):
+        out.append("ollama")
+    custom_selected = "custom" in selected_providers
+    custom_config = {
+        CONF_CUSTOM_BASE_URL: _runtime_opt(hass, entry, CONF_CUSTOM_BASE_URL, ""),
+    }
+    if custom_selected:
+        custom_config["llm_base_url"] = _runtime_opt(hass, entry, "llm_base_url", "")
+    if resolve_provider_base_url(custom_config, "custom"):
+        out.append("custom")
+    for provider, field in PROVIDER_API_KEY_FIELDS.items():
+        if provider in out:
+            continue
+        if field and await ha_secrets.async_get_provider_key(hass, provider):
+            out.append(provider)
+    return out
+
+
+def _ollama_tags_url(base_url: str) -> str:
+    """URL for Ollama's model list.
+
+    Ollama serves its model list at the NATIVE ``/api/tags`` endpoint, which
+    lives at the server root — not under the OpenAI-compatible ``/v1`` prefix
+    that JARVIS uses for chat. A base URL of ``http://host:11434/v1`` (the chat
+    default, and what the Settings "Ollama URL" field holds) must therefore drop
+    the ``/v1`` before ``/api/tags``; otherwise Ollama answers the resulting
+    ``/v1/api/tags`` with a plain ``404 page not found`` and no models load."""
+    base = (base_url or "").rstrip("/")
+    if not base:
+        base = "http://homeassistant.local:11434"
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")].rstrip("/")
+    return f"{base}/api/tags"
+
+
+_ALLOWED_FETCH_SCHEMES = ("http", "https")
+
+
+def _validate_fetch_url(url: str) -> str:
+    """Guard a provider's models endpoint before we fetch it: only http(s) is
+    allowed, so a configured ``base_url`` can't coerce the request into
+    ``file://``, ``gopher://`` or similar (SSRF hardening — GHSA-fx76-fcmp-phmq).
+
+    Private/loopback hosts stay allowed on purpose: a local LLM server (Ollama on
+    a LAN IP or ``localhost``) is the primary supported setup, so the trust
+    boundary for ``jarvis/list_models`` is its admin requirement, not an IP
+    allowlist. Returns ``url`` unchanged when valid; raises ``ValueError``
+    otherwise."""
+    from urllib.parse import urlsplit
+    scheme = urlsplit((url or "").strip()).scheme.lower()
+    if scheme not in _ALLOWED_FETCH_SCHEMES:
+        raise ValueError("provider endpoint must be an http(s) URL")
+    return url
+
+
+async def _fetch_models(hass, provider: str, api_key: str, base_url: str) -> list[str]:
+    """
+    Query a provider's models endpoint and return a sorted list of model IDs.
+    Uses the native google-genai SDK for Gemini and HA's shared aiohttp session
+    for other providers. Each provider has a different response shape; we
+    normalise to a list of strings.
+    """
+    provider = (provider or "").lower()
+    if provider == "gemini":
+        return await hass.async_add_executor_job(_fetch_gemini_models, api_key)
+
+    from homeassistant.helpers import aiohttp_client
+    import async_timeout
+
+    session = aiohttp_client.async_get_clientsession(hass)
+    url = ""
+    headers: dict = {}
+
+    if provider == "groq":
+        url = "https://api.groq.com/openai/v1/models"
+        headers = {"Authorization": "Bearer " + api_key}
+    elif provider == "openai":
+        url = "https://api.openai.com/v1/models"
+        headers = {"Authorization": "Bearer " + api_key}
+    elif provider == "anthropic":
+        url = "https://api.anthropic.com/v1/models"
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    elif provider == "ollama":
+        url = _ollama_tags_url(base_url)
+    elif provider == "custom":
+        base = (base_url or "").rstrip("/")
+        if not base:
+            raise ValueError("base URL required for this provider")
+        url = f"{base}/models"
+        headers = {"Authorization": "Bearer " + api_key} if api_key else {}
+    else:
+        raise ValueError(f"unknown provider: {provider}")
+
+    # SSRF hardening: only ever fetch http(s) endpoints (GHSA-fx76-fcmp-phmq).
+    _validate_fetch_url(url)
+
+    async with async_timeout.timeout(12):
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                # Do not reflect the upstream response body back to the caller —
+                # that is the information-exposure half of GHSA-fx76-fcmp-phmq.
+                raise RuntimeError(f"HTTP {resp.status}")
+            data = await resp.json()
+
+    # Normalise per provider
+    models: list[str] = []
+    if provider in ("ollama", "custom") and url.endswith("/api/tags"):
+        for m in data.get("models", []):
+            n = m.get("name")
+            if n:
+                models.append(n)
+    else:
+        # OpenAI-compatible shape: {"data": [{"id": ...}, ...]}
+        for m in data.get("data", []):
+            mid = m.get("id")
+            if mid:
+                models.append(mid)
+
+    return sorted(set(models))
+
+
+def _fetch_gemini_models(api_key: str) -> list[str]:
+    """List Gemini text-generation models via Google's current GenAI SDK."""
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    models = []
+    for model in client.models.list():
+        name = str(getattr(model, "name", "") or "").removeprefix("models/")
+        supported_actions = getattr(model, "supported_actions", None) or []
+        if name and (not supported_actions or "generateContent" in supported_actions):
+            models.append(name)
+    return sorted(set(models))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/list_models",
+    vol.Required("provider"): str,
+    vol.Optional("base_url"): str,
+})
+@websocket_api.async_response
+async def ws_list_models(hass: HomeAssistant, connection, msg) -> None:
+    """Return the live model list for a provider (Settings AI-Models dropdowns).
+
+    Admin-only (GHSA-fx76-fcmp-phmq): the handler fetches a caller-influenced
+    provider endpoint, so it must not be reachable by non-admin users. Listing
+    models is a provider-configuration action, which is already admin territory.
+    """
+    provider = (msg.get("provider") or "").lower()
+    entry = _get_entry(hass)
+    from . import ha_secrets
+    api_key = await ha_secrets.async_get_provider_key(hass, provider)
+    from .const import PROVIDER_BASE_URL_FIELDS
+    endpoint_field = PROVIDER_BASE_URL_FIELDS.get(provider)
+    base_url = msg.get("base_url") or str(
+        ((_runtime_opt(hass, entry, endpoint_field, "")
+          or _runtime_opt(hass, entry, "llm_base_url", "")) if endpoint_field else "")
+        or ""
+    )
+    try:
+        models = await _fetch_models(hass, provider, api_key, base_url)
+        connection.send_result(msg["id"], {"provider": provider, "models": models})
+    except Exception as exc:
+        # Log the specifics server-side only; return a generic message so the
+        # caller can't read back upstream responses/reachability
+        # (information-exposure half of GHSA-fx76-fcmp-phmq).
+        _LOGGER.info("list_models(%s) failed: %s", provider, exc)
+        connection.send_result(
+            msg["id"],
+            {
+                "provider": provider,
+                "models": [],
+                "error": "could not retrieve models — check the provider URL and "
+                         "API key; see the Home Assistant logs for details",
+            },
+        )
+
+def _get_memory_stats() -> dict:
+    """Return memory system stats for the panel."""
+    try:
+        from .memory import get_memory_stats
+        return get_memory_stats()
+    except Exception:
+        return {"backend": "unavailable", "total_memories": 0}
+
+
+def _available_labels(hass: HomeAssistant) -> list:
+    """[{id, name}] of Home Assistant labels, for the exclusion label picker.
+    Empty list if the label registry isn't available on this HA version."""
+    try:
+        from homeassistant.helpers import label_registry as _lr
+        reg = _lr.async_get(hass)
+        out = []
+        for lbl in reg.labels.values():
+            out.append({"id": lbl.label_id, "name": lbl.name})
+        out.sort(key=lambda x: (x.get("name") or "").lower())
+        return out
+    except Exception:
+        return []
+
+
+def _get_runtime_json(hass: HomeAssistant, entry, key: str, default):
+    """Read a JSON-encoded value from runtime_config → jarvis_config → entry options."""
+    import json as _json
+    # 1. In-memory runtime_config (fastest)
+    if entry is not None:
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+        raw = rc.get(key)
+        if raw is not None:
+            if isinstance(raw, (dict, list)):
+                return raw
+            try:
+                return _json.loads(raw)
+            except Exception:
+                pass
+
+    # 2. Persistent config file (survives restarts)
+    try:
+        from . import jarvis_config
+        val = jarvis_config.get(key)
+        if val is not None:
+            if isinstance(val, (dict, list)):
+                return val
+            try:
+                return _json.loads(val)
+            except Exception:
+                return val
+    except Exception:
+        pass
+
+    # 3. Entry options (bootstrap defaults)
+    if entry is not None:
+        raw = _entry_opt(entry, key, None)
+        if raw is not None:
+            if isinstance(raw, (dict, list)):
+                return raw
+            try:
+                return _json.loads(raw)
+            except Exception:
+                pass
+
+    return default
+
+
+def _get_runtime_str(hass: HomeAssistant, entry, key: str, default: str) -> str:
+    """Read a plain string from runtime_config → jarvis_config → entry options."""
+    # 1. In-memory runtime_config
+    if entry is not None:
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        rc = data.get("runtime_config", {}) if isinstance(data, dict) else {}
+        raw = rc.get(key)
+        if raw is not None:
+            return str(raw)
+
+    # 2. Persistent config file
+    try:
+        from . import jarvis_config
+        val = jarvis_config.get(key)
+        if val is not None:
+            return str(val)
+    except Exception:
+        pass
+
+    # 3. Entry options
+    if entry is not None:
+        raw = _entry_opt(entry, key, None)
+        if raw is not None:
+            return str(raw)
+
+    return default# ─── Memory search WebSocket command ─────────────────────────────────────────
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/search_memory",
+    vol.Required("query"): str,
+    vol.Optional("k", default=5): int,
+})
+@websocket_api.async_response
+async def ws_search_memory(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Search long-term memory for relevant past conversations."""
+    try:
+        from .memory import search_memory
+        # Jarvis Home patch: an admin searches everything, anyone else only their own memory.
+        _jh_k = max(1, min(int(msg["k"]), 50))
+        _jh_who = None if _is_admin(connection) else connection.user.id
+        results = await hass.async_add_executor_job(
+            lambda: search_memory(msg["query"], k=_jh_k, user_id=_jh_who)
+        )
+        connection.send_result(msg["id"], {"results": results})
+    except Exception as exc:
+        _LOGGER.warning("ws_search_memory failed: %s", exc)
+        connection.send_error(msg["id"], "search_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/briefings",
+    vol.Optional("limit", default=10): int,
+})
+@websocket_api.async_response
+async def ws_get_briefings(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Recent briefings in full, newest first (#232).
+
+    Phone notifications truncate long briefings; this lets the panel show the
+    whole text. Briefings are persisted as conversation rows tagged
+    device_id="briefing" with a "[Briefing] " content prefix (by both
+    briefing.async_briefing and proactive_briefing)."""
+    if not _is_admin(connection):   # review round 8 (jh-r8-briefings): briefings name who is home and away and every
+        # calendar's events, so under the where-is rule only an administrator reads them back
+        connection.send_result(msg["id"], {"briefings": [], "admin_only": True})
+        return
+    try:
+        from .database import get_recent_messages
+        limit = max(1, min(int(msg.get("limit", 10) or 10), 50))
+        rows = await hass.async_add_executor_job(
+            lambda: get_recent_messages(hours=24 * 30, device_id="briefing", limit=limit)
+        )
+        prefix = "[Briefing] "
+        out = []
+        for r in rows:
+            text = str(r.get("content") or "")
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+            out.append({"text": text, "timestamp": r.get("timestamp")})
+        out.reverse()  # get_recent_messages is oldest-first; show newest first
+        connection.send_result(msg["id"], {"briefings": out})
+    except Exception as exc:
+        _LOGGER.warning("ws_get_briefings failed: %s", exc)
+        connection.send_error(msg["id"], "briefings_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/area_lights",
+    vol.Required("area_id"): str,
+})
+@websocket_api.async_response
+async def ws_area_lights(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """The individual light entities in an area, with on/off state (#234).
+
+    Lets the panel's room light pill list the lights and toggle them one at a
+    time, instead of only turning them all off. Resolved through the same
+    _entities_in_area path the room light count uses (one source of truth,
+    respects excluded entities). Read-only — toggling is a plain HA service
+    call from the frontend."""
+    try:
+        area_id = str(msg.get("area_id") or "")
+
+        def _collect():
+            lights = []
+            for eid in _entities_in_area(hass, area_id):
+                if not eid.startswith("light."):
+                    continue
+                st = hass.states.get(eid)
+                if st is None:
+                    continue
+                name = str(st.attributes.get("friendly_name") or eid)
+                lights.append({
+                    "entity_id": eid,
+                    "name": name,
+                    "on": st.state == "on",
+                })
+            lights.sort(key=lambda x: x["name"].lower())
+            return lights
+
+        lights = await hass.async_add_executor_job(_collect)
+        _jh_mark_manual(hass, lights)   # jh-r22-lights (step 164, review round 22 #7): a manual heater is shown, never switched
+        connection.send_result(msg["id"], {
+            "area_id": area_id,
+            "name": _area_name(hass, area_id),
+            "lights": lights,
+        })
+    except Exception as exc:
+        _LOGGER.warning("ws_area_lights failed: %s", exc)
+        connection.send_error(msg["id"], "area_lights_failed", str(exc))
+
+
+def _jh_mark_manual(hass, rows) -> None:
+    """jh-r22-lights (step 164, review round 22 #7): mark each light row that is a manual heater (a switch_as_x light over a
+    labelled plug: local_engine._jh_is_manual, label ids and twin map built once). Fails closed: every row is marked."""
+    try:
+        from .local_engine import _jh_is_manual, _jh_manual_label_ids, _jh_device_twins
+        ids, twins = _jh_manual_label_ids(hass), _jh_device_twins(hass)
+        for r in rows:
+            r["manual"] = bool(_jh_is_manual(hass, r.get("entity_id"), ids, _twins=twins))
+    except Exception:  # noqa: BLE001
+        for r in rows:
+            r["manual"] = True
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/area_lights_set",
+    vol.Required("area_id"): str,
+    vol.Optional("entity_id"): str,
+    vol.Required("on"): bool,
+})
+@websocket_api.async_response
+async def ws_area_lights_set(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """jh-r22-lights (step 164, review round 22 #7): the room-lights popover's switch. One light of the room (entity_id) or every
+    light listed for the room, through the actuator seam, never a manual heater (also refused by the seam), only lights that
+    jarvis/area_lights lists for that room, and only while light control is on in Settings."""
+    try:
+        if not bool(_runtime_opt(hass, _get_entry(hass), "light_control_enabled", True)):
+            connection.send_error(msg["id"], "light_control_off", "Light control from the dashboard is off in Settings.")
+            return
+        area_id = str(msg.get("area_id") or "")
+        rows = [{"entity_id": e} for e in _entities_in_area(hass, area_id)
+                if e.startswith("light.") and hass.states.get(e) is not None]
+        _jh_mark_manual(hass, rows)
+        allowed = [r["entity_id"] for r in rows if not r.get("manual")]
+        want = msg.get("entity_id")
+        if want and want not in allowed:
+            connection.send_error(msg["id"], "not_switchable", "That light is not one this room's switch may change (a manual "
+                                  "heater is switched by hand).")
+            return
+        service = "turn_on" if msg.get("on") else "turn_off"
+        from . import actuation
+        done, failed, unconfirmed, left_out, left_names = [], [], [], [], []
+        if want:   # one light the person tapped
+            try:   # jh-r23-lights (step 165, review round 23 #12): an offline bulb that raises is a failed light, not an error
+                areq = actuation.request(f"light.{service}", want, params={"entity_id": want}, action=service)
+                ok, _detail = await actuation.execute_actuator(
+                    hass, capability=f"light.{service}", entity_id=want, domain="light", service=service,
+                    data={"entity_id": want}, action=service, areq=areq, verify=None, blocking=True)
+            except Exception as _jh_exc23:  # noqa: BLE001
+                _LOGGER.info("jarvis/area_lights_set: %s was not switched: %s", want, _jh_exc23)
+                ok = False
+            (done if ok else failed).append(want)
+        else:
+            # jh-r25-group (step 167), jh-r26-lights (step 168, review round 26 #2, #7, #11): every light of the room is a group
+            # order: THE group function decides the targets and THE group send switches them (send and confirm). The result
+            # names exactly what was switched (done: confirmed), what did not confirm, what failed and every light of the
+            # room the group left out that is not already in the end state (hidden, a heater light, a setting), with names,
+            # so the popover never says "lights off" for a light that is still on. A group that cannot be decided is an
+            # error (nothing switched), never an empty success.
+            from .local_engine import jh_group_targets, jh_group_act, jh_group_label
+            _jh_g26 = jh_group_targets(hass, "light", service, "light", None, "", candidates=allowed)
+            if _jh_g26.error:
+                raise RuntimeError("the group could not be decided (%s)" % _jh_g26.error)
+            _jh_end26 = "on" if service == "turn_on" else "off"
+
+            def _jh_st26(e):
+                return str(getattr(hass.states.get(e), "state", "")).lower()
+
+            def _jh_nm26(e):
+                st = hass.states.get(e)
+                return str(getattr(st, "attributes", {}).get("friendly_name") or e) if st is not None else e
+            for e, n, w in _jh_g26.left_out:
+                left_out.append(e)
+                left_names.append(jh_group_label(n, w))
+            for e, w in _jh_g26.skipped:
+                if w in ("kind", "setting", "excluded") and e.startswith("light.") and _jh_st26(e) != _jh_end26:
+                    left_out.append(e)
+                    left_names.append(_jh_nm26(e))
+            todo = [e for e in _jh_g26.ids if _jh_st26(e) != _jh_end26]
+            if todo:
+                _jh_c26, _jh_u26, _jh_f26 = await jh_group_act(hass, _jh_g26, service, todo)
+                done, unconfirmed, failed = list(_jh_c26), list(_jh_u26), list(_jh_f26)
+        connection.send_result(msg["id"], {"done": done, "failed": failed, "unconfirmed": unconfirmed, "left_out": left_out,
+                                           "left_out_names": left_names,
+                                           "manual": [r["entity_id"] for r in rows if r.get("manual")]})
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.warning("ws_area_lights_set failed: %s", exc)
+        connection.send_error(msg["id"], "area_lights_set_failed", "The lights could not be switched.")
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_debug_log",
+})
+@websocket_api.async_response
+async def ws_get_debug_log(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return JARVIS internal debug log entries. They hold what people said, so admins only; others get none."""
+    connection.send_result(msg["id"], {"entries": list(_DEBUG_LOG) if _is_admin(connection) else []})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_calibration",
+})
+@websocket_api.async_response
+async def ws_get_calibration(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Confidence calibration + interruption-budget health for the dashboard."""
+    try:
+        from . import decision_record
+        def _calibration_payload():
+            payload = {
+                "calibration": decision_record.calibration(),
+                "interruption_budget": decision_record.interruption_budget(),
+                "stats": decision_record.stats(),
+                "suggestion": decision_record.outcome_rate("suggestion"),
+            }
+            try:
+                from . import pattern_analyzer
+                payload["suggestion_threshold"] = {
+                    "base": round(pattern_analyzer.CONFIDENCE_THRESHOLD, 3),
+                    "effective": round(pattern_analyzer._effective_threshold(), 3),
+                    "learned_delta": round(pattern_analyzer._learned_threshold_delta(), 3),
+                }
+            except Exception:
+                pass
+            return payload
+
+        payload = await hass.async_add_executor_job(_calibration_payload)
+        connection.send_result(msg["id"], payload)
+    except Exception as exc:
+        connection.send_result(msg["id"], {
+            "calibration": {"n": 0}, "interruption_budget": {"judged": 0},
+            "error": str(exc),
+        })
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/run_analysis",
+})
+@websocket_api.async_response
+async def ws_run_analysis(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Force a pattern-analysis pass now (manual 'Analyze Now')."""
+    try:
+        from . import cognitive_core
+        res = await cognitive_core.run_analysis_now(hass)
+        connection.send_result(msg["id"], res)
+    except Exception as exc:
+        connection.send_result(msg["id"], {"ran": False, "error": str(exc)})
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_cognitive_status",
+})
+@websocket_api.async_response
+async def ws_get_cognitive_status(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return JARVIS cognitive core status for the dashboard."""
+    try:
+        from . import cognitive_core
+        status = cognitive_core.status()
+        if not _is_admin(connection):   # jh-r16-cog (review round 16): no other person's routines for a member
+            status = await _jh_member_cognitive(hass, getattr(getattr(connection, "user", None), "id", "") or "", status)
+        connection.send_result(msg["id"], status)
+    except Exception as exc:
+        connection.send_result(msg["id"], {
+            "running": False,
+            "error": str(exc),
+            "learning": {},
+        })
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/suggestion_action",
+    vol.Required("suggestion_id"): int,
+    vol.Required("action"): vol.In(["approve", "dismiss"]),
+})
+@websocket_api.async_response
+async def ws_suggestion_action(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Approve or dismiss a pattern-engine automation suggestion. Approval now
+    installs the automation into HA, not just flags it (v6.52.0)."""
+    try:
+        from .pattern_analyzer import get_analyzer, install_approved_suggestion
+        analyzer = get_analyzer()
+        sid = int(msg["suggestion_id"])
+        if msg["action"] == "approve":
+            res = await install_approved_suggestion(hass, sid)
+            if res.get("installed"):
+                jarvis_log("LEARN", f"Suggestion #{sid} approved & installed "
+                                    f"as '{res.get('alias')}'")
+            elif res.get("ok"):
+                jarvis_log("LEARN", f"Suggestion #{sid} approved "
+                                    f"(advisory — {res.get('reason')})")
+            connection.send_result(msg["id"], {
+                "ok": bool(res.get("ok")),
+                "installed": bool(res.get("installed")),
+                "reason": res.get("reason"),
+                "alias": res.get("alias"),
+            })
+            return
+        ok = await hass.async_add_executor_job(analyzer.dismiss_suggestion, sid)
+        jarvis_log("LEARN", f"Suggestion #{sid} dismissed (ok={ok})")
+        connection.send_result(msg["id"], {"ok": bool(ok)})
+    except Exception as exc:
+        _LOGGER.exception("ws_suggestion_action failed: %s", exc)
+        connection.send_error(msg["id"], "suggestion_action_failed", str(exc))
+
+
+def _resolve_llm_client(hass: HomeAssistant):
+    """The shared LLM provider the conversation entity created (hass.data), or
+    None when no provider is configured. Used by the Suggestions-tab composer."""
+    try:
+        for v in (hass.data.get(DOMAIN, {}) or {}).values():
+            if isinstance(v, dict) and v.get("client") is not None:
+                return v["client"]
+    except Exception:
+        pass
+    return None
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/compose_automation",
+    vol.Required("action"): vol.In(["draft", "install"]),
+    vol.Optional("text"): str,
+    vol.Optional("draft"): dict,
+})
+@websocket_api.async_response
+async def ws_compose_automation(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Natural-language automation composer for the Suggestions tab. 'draft' turns
+    a plain-language description into a validated, NOT-yet-installed automation for
+    review; 'install' writes a reviewed draft. Both validate every name against the
+    live home before anything is written."""
+    try:
+        from .automation_creator import draft_automation, create_automation
+        if msg["action"] == "draft":
+            client = _resolve_llm_client(hass)
+            res = await draft_automation(hass, msg.get("text", ""), client=client)
+            connection.send_result(msg["id"], res)
+            return
+        # install a reviewed draft
+        args = (msg.get("draft") or {}).get("args") or {}
+        res = await create_automation(
+            hass, alias=(args.get("alias") or "Automation"),
+            description=args.get("description", ""),
+            trigger=args.get("trigger"), condition=args.get("condition"),
+            action=args.get("action"), mode=args.get("mode", "single"),
+            validate=True, install=True)
+        if res.get("success"):
+            jarvis_log("LEARN", f"Composed automation installed: {res.get('alias')}")
+        connection.send_result(msg["id"], {
+            "ok": bool(res.get("success")),
+            "alias": res.get("alias"),
+            "error": res.get("error"),
+        })
+    except Exception as exc:
+        _LOGGER.exception("ws_compose_automation failed: %s", exc)
+        connection.send_error(msg["id"], "compose_automation_failed", str(exc))
+
+
+_SNAP_LOG_TS: dict[str, float] = {}
+
+
+def _snap_log(entity_id: str, msg: str) -> None:
+    """CAMERA-log a snapshot failure at most once per 5 min per entity —
+    the panel polls this tier every 6s, and a broken camera shouldn't
+    flood the log while still leaving a visible trail."""
+    now = time.time()
+    if now - _SNAP_LOG_TS.get(entity_id, 0) < 300:
+        return
+    _SNAP_LOG_TS[entity_id] = now
+    jarvis_log("CAMERA", f"{entity_id} snapshot: {msg}")
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/camera_snapshot",
+    vol.Required("entity_id"): str,
+})
+@websocket_api.async_response
+async def ws_camera_snapshot(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """A frame via JARVIS's camera backend registry (Nest event media,
+    Frigate snapshot, stream-wake). The panel's last-resort tile source for
+    cameras where /api/camera_proxy* fails — WebRTC-only Nest cams have no
+    MJPEG stream and can't produce stills while idle, so both proxy tiers
+    404 and the tile went permanently blank (v6.46.0)."""
+    import base64
+    entity_id = str(msg["entity_id"])
+    try:
+        if not hass.states.get(entity_id) or not entity_id.startswith("camera."):
+            connection.send_error(msg["id"], "unknown_camera", entity_id)
+            return
+        from . import camera as cam
+        img = await cam._get_best_image(hass, entity_id, poll=True)
+        if not img and getattr(cam, "_JH_DARK", None) and cam.resolve_camera_source(hass, entity_id) in cam._JH_DARK:   # Jarvis Home patch (2026-11-15): jh-cam-dark
+            _snap_log(entity_id, "live, but the picture is too dark to see (unlit room?)")
+            connection.send_result(msg["id"], {"image": None})
+            return
+        if not img:
+            _snap_log(entity_id,
+                      "no frame — backend and proxy paths all empty "
+                      "(Nest: check integration is loaded and events enabled)")
+            connection.send_result(msg["id"], {"image": None})
+            return
+        img = cam._downscale_jpeg(img, 960)
+        connection.send_result(
+            msg["id"], {"image": base64.b64encode(img).decode()})
+    except Exception as exc:
+        _LOGGER.debug("camera_snapshot failed for %s: %s", entity_id, exc)
+        _snap_log(entity_id, f"error — {exc}")
+        connection.send_error(msg["id"], "snapshot_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/rename_camera",
+    vol.Required("entity_id"): str,
+    vol.Required("name"): vol.Any(str, None),
+})
+@websocket_api.async_response
+async def ws_rename_camera(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Set a JARVIS-only display name for a camera (v6.48.0) — chips, strip,
+    and pickers use it; HA's entity name is untouched. Blank name reverts."""
+    entity_id = str(msg["entity_id"])
+    new_name = msg.get("name")
+    try:
+        if not entity_id.startswith("camera.") or not hass.states.get(entity_id):
+            connection.send_error(msg["id"], "unknown_camera", entity_id)
+            return
+        from . import jarvis_config
+        from .camera import merge_camera_name
+        names = merge_camera_name(_get_camera_names(), entity_id, new_name)
+        await hass.async_add_executor_job(jarvis_config.set, "camera_names", names)
+        shown = names.get(entity_id)
+        jarvis_log("CONFIG", f"camera {entity_id} "
+                             + (f"renamed to '{shown}'" if shown else "name reverted")
+                             + " (JARVIS only)")
+        connection.send_result(msg["id"], {
+            "ok": True, "camera_names": names, "cameras": _get_cameras(hass),
+        })
+    except Exception as exc:
+        _LOGGER.exception("rename_camera failed: %s", exc)
+        connection.send_error(msg["id"], "rename_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/biometrics",
+    vol.Required("action"): vol.In(["status", "enable", "disable"]),
+})
+@websocket_api.async_response
+async def ws_biometrics(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Wellbeing/biometric context for the panel (v6.63.0) — discover connected
+    wearable entities and toggle the feature. Context only; never medical."""
+    try:
+        from . import biometrics, jarvis_config
+        if msg["action"] in ("enable", "disable") and _deny_non_admin(connection, msg):
+            return
+        if msg["action"] == "enable":
+            await hass.async_add_executor_job(
+                jarvis_config.set, "biometrics_enabled", True
+            )
+            jarvis_log("BIO", "biometric context enabled")
+        elif msg["action"] == "disable":
+            await hass.async_add_executor_job(
+                jarvis_config.set, "biometrics_enabled", False
+            )
+            jarvis_log("BIO", "biometric context disabled")
+        enabled = bool(jarvis_config.get("biometrics_enabled", False))
+        states = (hass.states.async_all("sensor")
+                  + hass.states.async_all("binary_sensor"))
+        found = await hass.async_add_executor_job(
+            biometrics.discover, None, states
+        )
+        # flatten discovered entities for the panel
+        entities = []
+        for kind, ents in found.items():
+            for e in ents:
+                entities.append({"kind": kind, **e})
+        if not _is_admin(connection):   # jh-r15-bio (review round 15): a member sees only their own readings, or none
+            entities = await _jh_own_readings(hass, connection.user.id, entities)
+            from . import agent as _jh_ag   # jh-r20-private (step 162)
+            entities = await _jh_ag.jh_viewer_private(hass, connection.user.id, entities)
+        connection.send_result(msg["id"], {
+            "enabled": enabled,
+            "found": len(entities),
+            "entities": entities,
+        })
+    except Exception as exc:
+        _LOGGER.exception("ws_biometrics failed: %s", exc)
+        connection.send_error(msg["id"], "biometrics_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/energy",
+    vol.Required("action"): vol.In(["status", "set_agency"]),
+    vol.Optional("agency"): str,
+})
+@websocket_api.async_response
+async def ws_energy(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Energy management for the panel (v6.62.0): report the current power
+    picture + advice, or set the agency level (advisory/opt_in/autonomous)."""
+    try:
+        from . import energy, jarvis_config
+        states = {state.entity_id: state for state in hass.states.async_all()}
+        if msg["action"] == "set_agency" and _deny_non_admin(connection, msg):
+            return
+        if msg["action"] == "set_agency":
+            level = str(msg.get("agency", "") or "").lower()
+            if level not in (energy.AGENCY_ADVISORY, energy.AGENCY_OPT_IN,
+                             energy.AGENCY_AUTONOMOUS):
+                connection.send_error(msg["id"], "bad_agency",
+                                      f"unknown agency '{level}'")
+                return
+            await hass.async_add_executor_job(
+                jarvis_config.set, "energy_agency", level
+            )
+            jarvis_log("ENERGY", f"agency → {level}")
+            res = await hass.async_add_executor_job(energy.power_status, None, states)
+            connection.send_result(msg["id"], res)
+        else:
+            res = await hass.async_add_executor_job(energy.power_status, None, states)
+            connection.send_result(msg["id"], res)
+    except Exception as exc:
+        _LOGGER.exception("ws_energy failed: %s", exc)
+        connection.send_error(msg["id"], "energy_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/hazard",
+    vol.Required("action"): vol.In(["status", "scan"]),
+})
+@websocket_api.async_response
+async def ws_hazard(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Multi-hazard monitor for the panel (v6.71.0): 'status' returns config +
+    the resolved monitoring center; 'scan' runs a live read-only check of all
+    feeds so the user can confirm it's wired to their area (does not alert or
+    consume dedup)."""
+    try:
+        from . import hazard_monitor
+        if msg["action"] == "scan":
+            res = await hazard_monitor.scan_now(hass)
+        else:
+            res = await hazard_monitor.status(hass)
+        if not _is_admin(connection) and isinstance(res, dict):
+            res = {**res, "center": None}   # Jarvis Home patch (2026-11-07): hidden from non-admins, as in get_panel_data
+        connection.send_result(msg["id"], res)
+    except Exception as exc:
+        _LOGGER.exception("ws_hazard failed: %s", exc)
+        connection.send_error(msg["id"], "hazard_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/mode",
+    vol.Required("action"): vol.In(["status", "set"]),
+    vol.Optional("mode"): str,
+    vol.Optional("reason"): str,
+})
+@websocket_api.async_response
+async def ws_mode(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Operational mode control for the panel (Directive Layer, v6.61.0):
+    report the active mode + available modes, or switch modes. Modes shift the
+    whole behavior profile (proactivity, tone, event scope) but never disable
+    safety."""
+    try:
+        from . import modes
+        if msg["action"] == "set" and _deny_non_admin(connection, msg):
+            return
+        if msg["action"] == "set":
+            res = await hass.async_add_executor_job(
+                modes.set_mode, msg.get("mode", ""), msg.get("reason", ""))
+            if res.get("ok"):
+                jarvis_log("MODE", f"mode → {res['mode']} (panel)")
+                try:
+                    from . import mode_scene
+                    await mode_scene.apply_mode_entry(hass, res["mode"])
+                except Exception:
+                    pass
+            connection.send_result(msg["id"], {**res, **modes.mode_info()})
+        else:
+            connection.send_result(msg["id"], modes.mode_info())
+    except Exception as exc:
+        _LOGGER.exception("ws_mode failed: %s", exc)
+        connection.send_error(msg["id"], "mode_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/intrusion",
+    vol.Required("action"): vol.In(["status", "dismiss", "acknowledge",
+                                    "log", "label", "learning"]),
+    vol.Optional("reason"): str,
+    vol.Optional("event_id"): str,
+    vol.Optional("label"): vol.Any(str, None),
+    vol.Optional("limit"): int,
+})
+@websocket_api.async_response
+async def ws_intrusion(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Intrusion snapshot + call-off for the panel (v6.68.0): report the last
+    snapshot and call-off state, dismiss an active alert as a false alarm, or
+    acknowledge it (hold auto-escalation without cancelling) (v6.69.0)."""
+    try:
+        from . import intrusion
+        if msg["action"] in ("dismiss", "acknowledge", "label") \
+                and _deny_non_admin(connection, msg):
+            return
+        if msg["action"] == "dismiss":
+            res = await intrusion.async_dismiss_intrusion(
+                hass, msg.get("reason", "panel")
+            )
+            try:
+                from . import cognitive_core
+                core = getattr(cognitive_core, "_CORE", None)
+                if core and getattr(core, "safety_mgr", None):
+                    core.safety_mgr._investigation = None
+            except Exception:
+                pass
+            jarvis_log("SAFETY", "Intrusion called off from panel (false alarm)")
+            connection.send_result(msg["id"], {**res, **intrusion.status()})
+        elif msg["action"] == "acknowledge":
+            res = intrusion.acknowledge(msg.get("reason", "panel"))
+            jarvis_log("SAFETY", "Intrusion acknowledged from panel (holding escalation)")
+            connection.send_result(msg["id"], {**res, **intrusion.status()})
+        elif msg["action"] == "log":
+            # Reviewable event history with snapshots (v6.76.0)
+            await intrusion.async_load(hass)
+            connection.send_result(msg["id"], {
+                "events": intrusion.get_log(msg.get("limit", 50)) if _is_admin(connection) else [],
+                "learning": intrusion.learning_summary(),
+            })
+        elif msg["action"] == "label":
+            # The training signal: mark an event real or false
+            res = await intrusion.async_label_event(
+                hass, msg.get("event_id", ""), msg.get("label"))
+            jarvis_log("SAFETY", f"Intrusion event labelled: "
+                                 f"{msg.get('event_id')} = {msg.get('label')}")
+            connection.send_result(msg["id"], {
+                **res, "learning": intrusion.learning_summary()})
+        elif msg["action"] == "learning":
+            await intrusion.async_load(hass)
+            connection.send_result(msg["id"], intrusion.learning_summary())
+        else:
+            _jh_status = intrusion.status()
+            if not _is_admin(connection):
+                _jh_status = {**_jh_status, "last_snapshot": None}
+            connection.send_result(msg["id"], _jh_status)
+    except Exception as exc:
+        _LOGGER.exception("ws_intrusion failed: %s", exc)
+        connection.send_error(msg["id"], "intrusion_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/faces",
+    vol.Optional("action"): vol.In(
+        ["list", "add_resident", "remove_resident", "set_reference", "remove_reference"]),
+    vol.Optional("name"): str,
+    vol.Optional("image"): str,   # base64 JPEG for set_reference (#140 Phase 3)
+    vol.Optional("limit"): int,
+})
+@websocket_api.async_response
+async def ws_faces(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Household Faces panel (#140): list recently recognized / unknown faces
+    and manage the resident whitelist. JARVIS reads identity from the vision
+    backend; this only curates the 'who is a resident' flag layered on top."""
+    try:
+        from . import recognition, face_roster
+        action = msg.get("action", "list")
+        if action in ("add_resident", "remove_resident", "set_reference",
+                      "remove_reference") and _deny_non_admin(connection, msg):
+            return
+        if not _is_admin(connection):
+            # Jarvis Home patch (2026-11-06): faces and residents are for admins. An empty list keeps the panel calm.
+            connection.send_result(msg["id"], {
+                "recent": [], "residents": [], "references": [], "auto_references": [],
+                "llm_face_recognition": False, "llm_face_autotrain": False, "recognition_source": "both"})
+            return
+        # Roster file I/O happens on the executor; the read below then runs on the
+        # event loop against an already-loaded roster (no blocking file read).
+        if action == "add_resident" and msg.get("name"):
+            await hass.async_add_executor_job(face_roster.add_resident, msg["name"])
+            await hass.async_add_executor_job(recognition.jh_profile_note_added, msg["name"])   # jh-faces-profile
+            jarvis_log("CAMERA", f"Household resident added: {msg['name']}")
+        elif action == "remove_resident" and msg.get("name"):
+            await hass.async_add_executor_job(face_roster.remove_resident, msg["name"])
+            await hass.async_add_executor_job(recognition.jh_profile_note_removed, msg["name"])   # removed on purpose
+            # Drop the enrollment reference photo too, so it can't linger.
+            await hass.async_add_executor_job(recognition.remove_face_reference, msg["name"])
+            jarvis_log("CAMERA", f"Household resident removed: {msg['name']}")
+        elif action == "set_reference" and msg.get("name") and msg.get("image"):
+            import base64
+            try:
+                raw = base64.b64decode(str(msg["image"]).split(",", 1)[-1])
+            except Exception:
+                raw = b""
+            ok = await hass.async_add_executor_job(
+                recognition.set_face_reference, msg["name"], raw)
+            if not ok:
+                connection.send_error(msg["id"], "reference_failed",
+                                      "could not store the reference photo")
+                return
+            jarvis_log("CAMERA", f"Resident reference photo set: {msg['name']}")
+        elif action == "remove_reference" and msg.get("name"):
+            await hass.async_add_executor_job(recognition.remove_face_reference, msg["name"])
+            jarvis_log("CAMERA", f"Resident reference photo removed: {msg['name']}")
+        else:
+            await hass.async_add_executor_job(face_roster._load)
+        recent = await hass.async_add_executor_job(
+            recognition.inline_snapshots, recognition.recent_faces(hass, int(msg.get("limit", 20))))
+        refs = await hass.async_add_executor_job(recognition.list_face_references)
+        auto_refs = await hass.async_add_executor_job(recognition.list_auto_references)
+        profile_refs = await hass.async_add_executor_job(recognition.list_profile_references)
+        entry = _get_entry(hass)
+        connection.send_result(msg["id"], {
+            "recent": recent,
+            "residents": face_roster.residents(),
+            # Normalized names that have an enrolled reference photo (Phase 3).
+            "references": refs,
+            # Of those, the ones auto-enrolled from a backend recognition
+            # (Phase 3 training) rather than uploaded by hand.
+            "auto_references": auto_refs,
+            "profile_references": profile_refs,   # Jarvis Home patch (2026-11-15): from a profile picture
+            "llm_face_recognition": bool(
+                _runtime_opt(hass, entry, "llm_face_recognition", False)),
+            "llm_face_autotrain": bool(
+                _runtime_opt(hass, entry, "llm_face_autotrain", False)),
+            "recognition_source": str(
+                _runtime_opt(hass, entry, "recognition_source", "both") or "both"),
+        })
+    except Exception as exc:
+        _LOGGER.exception("ws_faces failed: %s", exc)
+        connection.send_error(msg["id"], "faces_failed", str(exc))
+
+
+def _read_reference_data_url(name: str) -> Optional[str]:
+    """Read a resident's enrolled reference photo and return it as a
+    ``data:image/jpeg;base64,…`` URL, or None if there is no reference. Does
+    file I/O — call on the executor. Never raises.
+
+    Reference photos live privately under ``<config>/jarvis/faces_ref`` (NOT in
+    ``www``, so they are never exposed at an unauthenticated ``/local`` URL).
+    Serving the bytes inline over this authenticated websocket is how the panel
+    displays the photo the user uploaded without weakening that privacy (#394)."""
+    try:
+        from . import recognition
+        path = recognition.face_reference_path(name)
+        if not path:
+            return None
+        with open(path, "rb") as f:
+            raw = f.read()
+        if not raw:
+            return None
+        import base64
+        return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOGGER.debug("read reference failed for %s: %s", name, exc)
+        return None
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/face_reference",
+    vol.Required("name"): str,
+})
+@websocket_api.async_response
+async def ws_face_reference(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return one resident's enrolled reference photo as an inline data URL so
+    the Faces panel can show the snapshot the user uploaded (#394). A read, so
+    it is not admin-gated — the whole Faces panel sits behind Home Assistant
+    auth, and this only ever returns a photo the user themselves enrolled."""
+    if not _is_admin(connection):  # Jarvis Home patch: a resident's photo is not for every login
+        connection.send_result(msg["id"], {"image": None})
+        return
+    try:
+        data_url = await hass.async_add_executor_job(
+            _read_reference_data_url, msg["name"])
+        connection.send_result(msg["id"], {"image": data_url})
+    except Exception as exc:
+        _LOGGER.exception("ws_face_reference failed: %s", exc)
+        connection.send_error(msg["id"], "face_reference_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/voices",
+    vol.Optional("action"): vol.In(["list", "enroll", "identify", "forget"]),
+    vol.Optional("name"): str,
+    vol.Optional("audio"): str,   # base64 WAV clip for enroll/identify (Path B)
+})
+@websocket_api.async_response
+async def ws_voices(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Voices panel (vocal biometrics, Path B; #397): enrolled voiceprints and
+    the live in-process speaker. Writes (enroll / forget) require an admin; the
+    list/identify reads stay open like the rest of the panel. Audio is embedded
+    on the executor (model inference) and only the embedding is kept — never the
+    clip."""
+    try:
+        from . import voice_roster, speaker_id, voice_recognition
+        action = msg.get("action", "list")
+        if action in ("enroll", "forget") and _deny_non_admin(connection, msg):
+            return
+
+        if action == "enroll" and msg.get("name") and msg.get("audio"):
+            import base64
+            try:
+                raw = base64.b64decode(str(msg["audio"]).split(",", 1)[-1])
+            except Exception:
+                raw = b""
+            emb = await hass.async_add_executor_job(speaker_id.embed_wav, raw)
+            if not emb:
+                connection.send_error(
+                    msg["id"], "enroll_failed",
+                    "could not embed that clip (backend off, clip too short, or unreadable)")
+                return
+            ok = await hass.async_add_executor_job(
+                voice_roster.enroll, msg["name"], emb)
+            if not ok:
+                connection.send_error(msg["id"], "enroll_failed",
+                                      "could not store the voiceprint")
+                return
+            jarvis_log("VOICE", f"Voiceprint enrolled: {msg['name']}")
+
+        elif action == "forget" and msg.get("name"):
+            await hass.async_add_executor_job(voice_roster.remove, msg["name"])
+            jarvis_log("VOICE", f"Voiceprint removed: {msg['name']}")
+
+        elif action == "identify" and msg.get("audio"):
+            import base64
+            try:
+                raw = base64.b64decode(str(msg["audio"]).split(",", 1)[-1])
+            except Exception:
+                raw = b""
+            emb = await hass.async_add_executor_job(speaker_id.embed_wav, raw)
+            match = await hass.async_add_executor_job(speaker_id.identify, emb) if emb else None
+            connection.send_result(msg["id"], {"match": match})
+            return
+
+        entry = _get_entry(hass)
+        profiles = await hass.async_add_executor_job(_voice_profiles_summary)
+        backend = await hass.async_add_executor_job(speaker_id.backend_available)
+        connection.send_result(msg["id"], {
+            "profiles": profiles,
+            "current": await _jh_voice_current(hass, connection, voice_recognition.current_local_speaker()),   # jh-r22-voices
+            "local_enabled": bool(_runtime_opt(hass, entry, "voice_recognition_local", False)),
+            "delegate_stt": str(_runtime_opt(hass, entry, "voice_recognition_delegate_stt", "") or ""),
+            "model_path": str(_runtime_opt(hass, entry, "voice_embedding_model_path", "") or ""),
+            "backend_available": bool(backend),
+        })
+    except Exception as exc:
+        _LOGGER.exception("ws_voices failed: %s", exc)
+        connection.send_error(msg["id"], "voices_failed", str(exc))
+
+
+async def _jh_voice_current(hass, connection, cur):
+    """jh-r22-voices (step 164, review round 22 #3): who is speaking now is presence. An administrator sees it; a login that is
+    no administrator only when the voice is a person the where-is rule lets it see (its own person, or household sharing:
+    presence.jh_hidden_people). A voice that is no known person, or any error: None (fail closed)."""
+    try:
+        if not cur:
+            return None
+        if getattr(connection.user, "is_admin", False):
+            return cur
+        name = str((cur or {}).get("name") or "").strip().casefold()
+        if not name:
+            return None
+        from .presence import jh_hidden_people
+        hidden = await jh_hidden_people(hass, connection.user.id)
+        if any(name in {str(n).casefold() for n in names} for names in hidden.values()):
+            return None
+        for st in hass.states.async_all("person"):
+            pname = str(st.attributes.get("friendly_name") or st.entity_id.split(".", 1)[1]).strip().casefold()
+            if name in (pname, pname.split()[0] if pname else "") and st.entity_id not in hidden:
+                return cur
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _voice_profiles_summary() -> list:
+    """Enrolled voiceprints as display rows (no embeddings) for the panel."""
+    try:
+        from . import voice_roster
+        return [
+            {"name": p["name"], "count": p["count"], "updated": p.get("updated", 0)}
+            for p in voice_roster.all_profiles()
+        ]
+    except Exception:
+        return []
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/mutes",
+    vol.Optional("action"): vol.In(["list", "mute", "unmute", "clear"]),
+    vol.Optional("entity_id"): str,
+    vol.Optional("category"): str,
+})
+@websocket_api.async_response
+async def ws_mutes(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Manage the announcement mute list from the panel (#181): the entities and
+    categories JARVIS has been told to stop announcing (without excluding them
+    from observation). Persisted across restarts by output_gate."""
+    try:
+        from . import output_gate
+        action = msg.get("action", "list")
+        if action in ("mute", "unmute", "clear") and _deny_non_admin(connection, msg):
+            return
+        eid = msg.get("entity_id")
+        cat = msg.get("category")
+        if action == "mute" and (eid or cat):
+            await hass.async_add_executor_job(
+                lambda: output_gate.shush(entity_id=eid, category=cat))
+            jarvis_log("OBSERVER", f"Muted announcements: {eid or cat}")
+        elif action == "unmute" and (eid or cat):
+            await hass.async_add_executor_job(
+                lambda: output_gate.unshush(entity_id=eid, category=cat))
+            jarvis_log("OBSERVER", f"Unmuted announcements: {eid or cat}")
+        elif action == "clear":
+            await hass.async_add_executor_job(output_gate.unshush)
+            jarvis_log("OBSERVER", "Cleared all announcement mutes")
+        mutes = await hass.async_add_executor_job(output_gate.current_mutes)
+        connection.send_result(msg["id"], mutes)
+    except Exception as exc:
+        _LOGGER.exception("ws_mutes failed: %s", exc)
+        connection.send_error(msg["id"], "mutes_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/voice_confirm_test",
+})
+@websocket_api.async_response
+async def ws_voice_confirm_test(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Fire the assist_satellite.announce test (v6.67.0) — the 'does it come out
+    the Nest?' check that decides whether native voice-confirm works. The user
+    listens and picks native vs gated based on whether they heard it."""
+    try:
+        from . import voice_confirm
+        res = await voice_confirm.announce_test(hass)
+        connection.send_result(msg["id"], res)
+    except Exception as exc:
+        _LOGGER.exception("ws_voice_confirm_test failed: %s", exc)
+        connection.send_error(msg["id"], "test_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/diagnostics",
+})
+@websocket_api.async_response
+async def ws_diagnostics(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Core dependency health for the panel (v6.60.0): LLM, embeddings, TTS,
+    STT. Returns per-service status so the user can see at a glance what's up
+    and get a specific reason for anything down."""
+    try:
+        from . import diagnostics
+        res = await diagnostics.run_service_health(hass)
+        if not _is_admin(connection):
+            res = jh_redact_secrets(_jh_hide_addresses(res))   # connection details are for admins (jh-r20-secrets, step 162)
+        connection.send_result(msg["id"], res)
+    except Exception as exc:
+        _LOGGER.exception("ws_diagnostics failed: %s", exc)
+        connection.send_error(msg["id"], "diagnostics_failed", _jh_for_viewer_secrets(connection, str(exc)))   # jh-r20-secrets
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/download_diagnostics",
+})
+@websocket_api.async_response
+async def ws_download_diagnostics(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Build the full JARVIS diagnostics dump and hand it to the panel so the user
+    can download it straight from Settings → General, without HA's own "Download
+    diagnostics" button (v9.78.0+). It returns exactly what that button would —
+    ``async_get_config_entry_diagnostics`` — which is credential-redacted and run
+    through ``_json_safe`` so the payload is always strict, parseable JSON. Admin
+    only, since the dump includes (redacted) config and recent logs."""
+    if _deny_non_admin(connection, msg):
+        return
+    try:
+        from . import diagnostics
+        from .const import DOMAIN
+        entries = hass.config_entries.async_entries(DOMAIN)
+        entry = entries[0] if entries else None
+        data = await diagnostics.async_get_config_entry_diagnostics(hass, entry)
+        connection.send_result(msg["id"], data)
+    except Exception as exc:
+        _LOGGER.exception("ws_download_diagnostics failed: %s", exc)
+        connection.send_error(msg["id"], "diagnostics_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/semantic_search",
+    vol.Required("action"): vol.In(["status", "enable", "disable", "test"]),
+})
+@websocket_api.async_response
+async def ws_semantic_search(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Local semantic search control (v6.57.0). Instead of ChromaDB (whose
+    onnxruntime dep has no Python-3.14 wheel), JARVIS embeds via the Ollama
+    server it already uses and stores vectors in its own SQLite DB. This
+    reports status, toggles it on/off, and runs a live embedding health check."""
+    action = msg["action"]
+    try:
+        from . import embeddings, jarvis_config
+        if action in ("enable", "disable") and _deny_non_admin(connection, msg):
+            return
+        if action == "enable":
+            await hass.async_add_executor_job(
+                jarvis_config.set, "semantic_search", True
+            )
+            await hass.async_add_executor_job(embeddings.init_store)
+            res = await embeddings.probe(hass)
+            res["enabled"] = True
+            if res.get("ok"):
+                jarvis_log("AGENT", f"semantic search enabled "
+                                    f"(Ollama {res.get('model')}, dim "
+                                    f"{res.get('dim')}) — re-ingest to embed docs")
+            else:
+                jarvis_log("AGENT", f"semantic search enabled but Ollama not "
+                                    f"ready: {res.get('error')}")
+            connection.send_result(msg["id"], res)
+        elif action == "disable":
+            await hass.async_add_executor_job(
+                jarvis_config.set, "semantic_search", False
+            )
+            jarvis_log("AGENT", "semantic search disabled — keyword (FTS) active")
+            connection.send_result(msg["id"], {"enabled": False, "ok": True})
+        elif action == "test":
+            res = await embeddings.probe(hass)
+            connection.send_result(msg["id"], _jh_for_viewer_secrets(connection, res))   # jh-r20-secrets (step 162)
+        else:  # status
+            enabled = bool(jarvis_config.get("semantic_search", False))
+            base = embeddings._ollama_base()
+            vcount = await hass.async_add_executor_job(embeddings.vector_count)
+            connection.send_result(msg["id"], {
+                "enabled": enabled,
+                "ollama_configured": bool(base),
+                "base": (base or "") if _is_admin(connection) else "",
+                "model": embeddings._model(),
+                "vector_count": vcount,
+            })
+    except Exception as exc:
+        _LOGGER.exception("ws_semantic_search failed: %s", exc)
+        connection.send_error(msg["id"], "semantic_search_failed", _jh_for_viewer_secrets(connection, str(exc)))   # jh-r20-secrets
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/documents",
+    vol.Required("action"): vol.In(["status", "ingest", "search", "upload",
+                                    "scan_watch", "delete"]),
+    vol.Optional("query"): str,
+    vol.Optional("filename"): str,
+    vol.Optional("content"): str,        # base64 for upload
+})
+@websocket_api.async_response
+async def ws_documents(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Document library control for the panel. status / ingest (rescan) /
+    search / upload (base64 file → save + ingest) / scan_watch (pull new files
+    from configured watch folders) / delete (remove a source). The retrieval
+    JARVIS uses in conversation is the search_documents agent tool; this exposes
+    the same store to the UI (v6.55.0; upload+watch v6.59.0)."""
+    action = msg["action"]
+    try:
+        from . import documents
+        if action in ("ingest", "upload", "scan_watch", "delete") \
+                and _deny_non_admin(connection, msg):
+            return
+        if action == "status":
+            res = await hass.async_add_executor_job(documents.library_status)
+        elif action == "ingest":
+            res = await documents.ingest_directory_async(hass)
+            extra = (f", {res.get('embedded_chunks',0)} embedded"
+                     if res.get("semantic") else "")
+            jarvis_log("AGENT", f"documents ingested via panel: "
+                                f"{res.get('files_ingested',0)} files, "
+                                f"{res.get('total_chunks',0)} chunks{extra}")
+        elif action == "upload":
+            res = await documents.save_and_ingest_upload(
+                hass, msg.get("filename", ""), msg.get("content", ""))
+            if res.get("ok"):
+                jarvis_log("AGENT", f"document uploaded: {res.get('filename')} "
+                                    f"({res.get('chunks',0)} chunks)")
+        elif action == "scan_watch":
+            res = await documents.scan_watch_folders(hass)
+            if res.get("new_files"):
+                jarvis_log("AGENT", f"watch-folder scan: {res['new_files']} "
+                                    f"new document(s) ingested")
+        elif action == "delete":
+            res = await hass.async_add_executor_job(
+                documents.delete_source, msg.get("filename", ""))
+            if res.get("ok"):
+                jarvis_log("AGENT", f"document removed: {msg.get('filename')}")
+        else:  # search
+            hits = await documents.search_documents_async(
+                hass, msg.get("query", ""), 5)
+            res = {"results": hits}
+        connection.send_result(msg["id"], _jh_for_viewer_secrets(connection, res))   # jh-r20-secrets (step 162)
+    except Exception as exc:
+        _LOGGER.exception("ws_documents failed: %s", exc)
+        connection.send_error(msg["id"], "documents_failed", _jh_for_viewer_secrets(connection, str(exc)))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/mmwave_overview",
+})
+@websocket_api.async_response
+async def ws_mmwave_overview(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Per-area mmWave presence overview for the residence tab (v6.53.0).
+
+    Distinct from the generic area grid: this reports *only* rooms with
+    presence/occupancy/motion sensors, and for each the live sensor breakdown —
+    how many sensors, how many currently detecting, the freshest detection age —
+    so the panel can show genuine mmWave coverage and live state rather than a
+    binary 'occupied' flag that could come from a door contact."""
+    import time as _t
+    try:
+        from . import audio_routing
+        rooms = []
+        total_sensors = 0
+        rooms_detecting = 0
+        for aid in _all_areas_with_anything(hass):
+            sensors = audio_routing.presence_entities_in_area(hass, aid)
+            if not sensors:
+                continue
+            detecting = 0
+            freshest = None            # seconds since most-recent change
+            sensor_rows = []
+            for eid in sensors:
+                st = hass.states.get(eid)
+                if st is None:
+                    continue
+                on = st.state == "on"
+                if on:
+                    detecting += 1
+                age = None
+                try:
+                    age = _t.time() - st.last_changed.timestamp()
+                    if freshest is None or age < freshest:
+                        freshest = age
+                except Exception:
+                    pass
+                sensor_rows.append({
+                    "entity_id": eid,
+                    "name": (st.attributes.get("friendly_name") or eid),
+                    "detecting": on,
+                    "age": _format_duration(age),
+                })
+            total_sensors += len(sensor_rows)
+            if detecting:
+                rooms_detecting += 1
+            rooms.append({
+                "area_id": aid,
+                "name": _area_name(hass, aid),
+                "outdoor": _is_outdoor_area(hass, aid),
+                "sensor_count": len(sensor_rows),
+                "detecting_count": detecting,
+                "state": ("detecting" if detecting else "clear"),
+                "freshest": _format_duration(freshest),
+                "sensors": sensor_rows,
+            })
+        # Detecting rooms first, then most-recently-active, then name
+        rooms.sort(key=lambda r: (r["detecting_count"] == 0, r["name"].lower()))
+        connection.send_result(msg["id"], {
+            "rooms": rooms,
+            "summary": {
+                "rooms_with_mmwave": len(rooms),
+                "rooms_detecting": rooms_detecting,
+                "total_sensors": total_sensors,
+            },
+        })
+    except Exception as exc:
+        _LOGGER.exception("mmwave_overview failed: %s", exc)
+        connection.send_error(msg["id"], "mmwave_overview_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/camera_location",
+    vol.Required("entity_id"): str,
+    vol.Required("mode"): vol.In(["auto", "indoor", "outdoor"]),
+})
+@websocket_api.async_response
+async def ws_camera_location(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Designate a camera indoor/outdoor (or auto = heuristics), v6.49.0.
+    Pins the exact entity id into the existing indoor_entities /
+    outdoor_entities lists — outdoor.py's most-authoritative layer — so the
+    designation immediately governs the intrusion investigator, the
+    notable-outdoor-event filter, and the motion scan alike."""
+    entity_id = str(msg["entity_id"])
+    mode = str(msg["mode"])
+    try:
+        if not entity_id.startswith("camera.") or not hass.states.get(entity_id):
+            connection.send_error(msg["id"], "unknown_camera", entity_id)
+            return
+        from . import jarvis_config, outdoor
+        new_in, new_out = outdoor.set_entity_location(
+            outdoor._cfg_list("indoor_entities"),
+            outdoor._cfg_list("outdoor_entities"),
+            entity_id, mode,
+        )
+        await hass.async_add_executor_job(
+            jarvis_config.set_many,
+            {"indoor_entities": new_in, "outdoor_entities": new_out},
+        )
+        jarvis_log("CONFIG", f"camera {entity_id} location → {mode.upper()}"
+                             + ("" if mode != "auto" else " (heuristics)"))
+        connection.send_result(msg["id"], {
+            "ok": True, "cameras": _get_cameras(hass),
+        })
+    except Exception as exc:
+        _LOGGER.exception("camera_location failed: %s", exc)
+        connection.send_error(msg["id"], "camera_location_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/camera_diagnostics",
+    vol.Optional("entity_id"): str,
+})
+@websocket_api.async_response
+async def ws_camera_diagnostics(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """End-to-end probe of one camera's frame sources, plus a platform
+    summary of every camera entity HA has — answers both "why is this tile
+    blank" and "do my Nest entities even exist" in one call (v6.46.2)."""
+    import asyncio as _aio
+    try:
+        summary = []
+        platforms: dict[str, int] = {}
+        try:
+            from homeassistant.helpers import entity_registry as er
+            reg = er.async_get(hass)
+        except Exception:
+            reg = None
+        for st in hass.states.async_all("camera"):
+            plat = None
+            if reg:
+                try:
+                    e = reg.async_get(st.entity_id)
+                    plat = e.platform if e else None
+                except Exception:
+                    plat = None
+            platforms[plat or "?"] = platforms.get(plat or "?", 0) + 1
+            summary.append({"entity_id": st.entity_id,
+                            "state": st.state, "platform": plat})
+
+        probe = None
+        entity_id = msg.get("entity_id")
+        if entity_id:
+            from . import camera as cam
+            try:
+                probe = await _aio.wait_for(
+                    cam.probe_camera(hass, str(entity_id)), timeout=30)
+            except _aio.TimeoutError:
+                probe = {"entity_id": entity_id, "tiers": [],
+                         "verdict": "probe timed out after 30s "
+                                    "(stream wake hanging?)"}
+            jarvis_log("CAMERA", f"diag {entity_id}: {probe.get('verdict', '?')}")
+
+        connection.send_result(msg["id"], _jh_for_viewer_secrets(connection, {   # jh-r20-secrets (step 162)
+            "summary": summary, "platforms": platforms, "probe": probe,
+        }))
+    except Exception as exc:
+        _LOGGER.exception("camera_diagnostics failed: %s", exc)
+        connection.send_error(msg["id"], "camera_diag_failed", _jh_for_viewer_secrets(connection, str(exc)))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_area_sparklines",
+})
+@websocket_api.async_response
+async def ws_get_area_sparklines(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Recent temp/humidity history per area, for dashboard sparklines.
+    Deliberately a separate, slow-polled command — recorder history queries
+    are heavier than the rest of the panel payload and shouldn't ride along
+    on the fast real-time-triggered refresh."""
+    try:
+        entity_map: dict[str, dict[str, Optional[str]]] = {}
+        for aid in _all_areas_with_anything(hass):
+            t_eid, h_eid = _area_temp_humidity_entities(hass, aid)
+            if t_eid or h_eid:
+                entity_map[aid] = {"temp": t_eid, "humidity": h_eid}
+        if not _is_admin(connection):   # jh-r20-private (step 162, review round 20 #3): no hidden sensor's history
+            from . import agent as _jh_ag
+            entity_map = await _jh_ag.jh_viewer_private(hass, connection.user.id, entity_map)
+            entity_map = {a: {k: (v if isinstance(v, str) and "." in v else None) for k, v in m.items()}
+                          for a, m in entity_map.items() if isinstance(m, dict)}
+        sparklines = await _get_area_sparklines(hass, entity_map)
+        connection.send_result(msg["id"], {"sparklines": sparklines})
+    except Exception as exc:
+        _LOGGER.exception("get_area_sparklines failed: %s", exc)
+        connection.send_error(msg["id"], "sparklines_failed", str(exc))
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/goal_action",
+    vol.Required("action"): vol.In(["cancel", "delete", "create"]),
+    vol.Optional("goal_id"): int,
+    vol.Optional("title"): str,
+    vol.Optional("outcome"): str,
+    vol.Optional("interval_min"): vol.Coerce(float),
+})
+@websocket_api.async_response
+async def ws_goal_action(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Manage goals from the panel: create a new one, cancel an active one
+    (keeps it in history), or delete one entirely (tidies the list). Goals also
+    close themselves via the headless runner as before."""
+    try:
+        from . import goals
+        action = msg["action"]
+        if action == "create":
+            outcome = str(msg.get("outcome", "") or "").strip()
+            if not outcome:
+                connection.send_error(msg["id"], "empty_outcome",
+                                      "a goal needs an outcome to work toward")
+                return
+            title = str(msg.get("title", "") or "").strip()
+            kwargs = {}
+            if msg.get("interval_min") is not None:
+                kwargs["check_interval_min"] = float(msg["interval_min"])
+            res = await hass.async_add_executor_job(
+                lambda: goals.create(title, outcome, user_id=connection.user.id, **kwargs))
+            if res.get("error"):
+                connection.send_error(msg["id"], "create_failed", res["error"])
+                return
+            jarvis_log("LEARN", f"Goal created from panel: {title or outcome[:50]}")
+            current_goals = await hass.async_add_executor_job(_get_goals)
+            connection.send_result(msg["id"], {"ok": True, "goal": res,
+                                               "goals": current_goals})
+            return
+
+        # cancel / delete both need a goal_id
+        gid = msg.get("goal_id")
+        if gid is None:
+            connection.send_error(msg["id"], "missing_goal_id",
+                                  f"{action} needs a goal_id")
+            return
+        gid = int(gid)
+        if action == "delete":
+            ok = await hass.async_add_executor_job(goals.delete, gid)
+            jarvis_log("LEARN", f"Goal #{gid} deleted from panel (ok={ok})")
+        else:  # cancel
+            ok = await hass.async_add_executor_job(goals.cancel, gid)
+            jarvis_log("LEARN", f"Goal #{gid} cancelled from panel (ok={ok})")
+        current_goals = await hass.async_add_executor_job(_get_goals)
+        connection.send_result(msg["id"], {"ok": bool(ok), "goals": current_goals})
+    except Exception as exc:
+        _LOGGER.exception("ws_goal_action failed: %s", exc)
+        connection.send_error(msg["id"], "goal_action_failed", str(exc))
+
+
+@websocket_api.websocket_command({
+    vol.Required("type"): "jarvis/get_person_routines",
+})
+@websocket_api.async_response
+async def ws_get_person_routines(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Per-person learned routines, grouped by person, for the Memory panel."""
+    try:
+        routines = await hass.async_add_executor_job(_get_person_routines)
+        if not _is_admin(connection):  # Jarvis Home patch: a non-admin sees only their own routines
+            from . import identity
+            mine = identity.subject_for_user(hass, connection.user.id)
+            routines = {k: v for k, v in routines.items() if identity.normalize(k) == mine}
+            from . import agent as _jh_ag   # jh-r20-private (step 162)
+            routines = await _jh_ag.jh_viewer_private(hass, connection.user.id, routines)
+        connection.send_result(msg["id"], {"routines": routines})
+    except Exception as exc:
+        _LOGGER.exception("get_person_routines failed: %s", exc)
+        connection.send_error(msg["id"], "person_routines_failed", str(exc))

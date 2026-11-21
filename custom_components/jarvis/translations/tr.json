@@ -1,0 +1,293 @@
+{
+  "config": {
+    "step": {
+      "provider_menu": {
+        "title": "JARVIS — Sağlayıcı Ekle",
+        "description": "{note}",
+        "menu_options": {
+          "groq": "Groq",
+          "openai": "OpenAI",
+          "anthropic": "Anthropic",
+          "gemini": "Gemini",
+          "custom": "Özel (OpenAI uyumlu)",
+          "ollama": "Ollama (yerel)",
+          "finish": "Kurulumu tamamla"
+        }
+      },
+      "groq": {
+        "title": "JARVIS — Groq",
+        "data": {
+          "api_key": "Groq API anahtarı"
+        }
+      },
+      "openai": {
+        "title": "JARVIS — OpenAI",
+        "data": {
+          "api_key": "OpenAI API anahtarı"
+        }
+      },
+      "anthropic": {
+        "title": "JARVIS — Anthropic",
+        "data": {
+          "api_key": "Anthropic API anahtarı"
+        }
+      },
+      "gemini": {
+        "title": "JARVIS — Gemini",
+        "data": {
+          "api_key": "Gemini API anahtarı"
+        }
+      },
+      "custom": {
+        "title": "JARVIS — Özel Sağlayıcı",
+        "data": {
+          "api_key": "API anahtarı (isteğe bağlı, uç nokta gerektiriyorsa)",
+          "custom_base_url": "API temel URL'si (OpenAI uyumlu)"
+        }
+      },
+      "ollama": {
+        "title": "JARVIS — Ollama",
+        "data": {
+          "ollama_base_url": "Temel URL"
+        }
+      },
+      "finish": {
+        "title": "JARVIS — Kurulumu Tamamla",
+        "description": "{note}",
+        "data": {
+          "llm_provider": "Ana Ajan sağlayıcısı",
+          "honorific": "Bana şöyle hitap et"
+        }
+      },
+      "finish_model": {
+        "title": "JARVIS — Conversation Model",
+        "data": {
+          "model": "Conversation model"
+        }
+      }
+    },
+    "error": {
+      "need_llm": "Bir bulut API anahtarı ya da yerel bir LLM URL'si girin.",
+      "cannot_connect": "LLM'ye ulaşılamadı. URL/uç noktanın doğru olduğunu ve sunucunun (ör. Ollama) çalıştığını kontrol edin.",
+      "invalid_auth": "API anahtarı reddedildi. Anahtarı kontrol edip tekrar deneyin.",
+      "unknown": "LLM bağlantısı doğrulanamadı. Ayarları kontrol edip tekrar deneyin.",
+      "no_models": "Bu sağlayıcı için kullanılabilir model yok. Sağlayıcı uç noktasını kontrol edip tekrar deneyin.",
+      "no_providers": "Henüz LLM sağlayıcısı yapılandırılmadı. Önce LLM bölümünden bir API anahtarı veya uç nokta ekleyin."
+    },
+    "abort": {
+      "already_configured": "JARVIS zaten yapılandırılmış.",
+      "import_failed": "Bir JARVIS yapılandırması bulundu ancak kullanılabilir bir LLM yok (API anahtarı ve yerel uç nokta yok)."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "JARVIS — Yapılandır",
+        "menu_options": {
+          "llm": "LLM — sağlayıcı anahtarlarını yönet",
+          "core": "Çekirdek — kişilik, direktif, sohbet modeli",
+          "routing": "Yönlendirme — yatak odası alanları, yayın grubu, bildirim servisi",
+          "observer": "Gözlemci — proaktif farkındalık (yapılandırılmış LLM sağlayıcılarını kullanır)",
+          "identity": "Kimlik — kişi bazlı tanıma",
+          "email": "E-posta — salt okunur gelen kutusu (parola secrets.yaml üzerinden)",
+          "agents": "Agents — specialised sub-agents (FRIDAY/HOMER), autonomy toggles"
+        }
+      },
+      "llm": {
+        "title": "JARVIS — LLM",
+        "description": "{note}",
+        "menu_options": {
+          "groq": "Groq",
+          "openai": "OpenAI",
+          "anthropic": "Anthropic",
+          "gemini": "Gemini",
+          "custom": "Özel (OpenAI uyumlu)",
+          "ollama": "Ollama (yerel)",
+          "back": "Yapılandırma menüsüne dön"
+        }
+      },
+      "groq": {
+        "title": "JARVIS — Groq",
+        "data": {
+          "api_key": "Groq API anahtarı"
+        }
+      },
+      "openai": {
+        "title": "JARVIS — OpenAI",
+        "data": {
+          "api_key": "OpenAI API anahtarı"
+        }
+      },
+      "anthropic": {
+        "title": "JARVIS — Anthropic",
+        "data": {
+          "api_key": "Anthropic API anahtarı"
+        }
+      },
+      "gemini": {
+        "title": "JARVIS — Gemini",
+        "data": {
+          "api_key": "Gemini API anahtarı"
+        }
+      },
+      "custom": {
+        "title": "JARVIS — Özel Sağlayıcı",
+        "data": {
+          "api_key": "API anahtarı (isteğe bağlı, uç nokta gerektiriyorsa)",
+          "custom_base_url": "API temel URL'si (OpenAI uyumlu)"
+        }
+      },
+      "ollama": {
+        "title": "JARVIS — Ollama",
+        "data": {
+          "ollama_base_url": "Temel URL"
+        }
+      },
+      "core": {
+        "title": "JARVIS — Çekirdek",
+        "description": "Kişilik, direktif ve sohbet modeli.",
+        "data": {
+          "honorific": "Bana şöyle hitap et",
+          "directive_preset": "Direktif ön ayarı",
+          "directive": "Özel direktif (isteğe bağlı, ön ayarı geçersiz kılar)",
+          "llm_provider": "Conversation model provider",
+          "use_hass_api": "Ev kontrolünü etkinleştir (ışıklar, iklim, kilitler vb.)",
+          "web_research_llm_fallback": "Varsayılan arka uç hiçbir şey bulamadığında web araştırmasının LLM'in kendi web aramasına yükseltilmesine izin ver",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
+        }
+      },
+      "core_model": {
+        "title": "JARVIS — Conversation Model",
+        "data": {
+          "model": "Conversation model"
+        }
+      },
+      "routing": {
+        "title": "JARVIS — Yönlendirme",
+        "description": "hangi HA alanlarının yatak odası olduğunu (uyku algılama için), yayınlar için hangi media_player grubunun kullanılacağını ve telefon bildirim servisinizi seçin.",
+        "data": {
+          "bedroom_areas": "Yatak odası alanları (sessiz saatlerde uyku algılama için)",
+          "broadcast_group": "Yayın hoparlör grubu (genellikle ev Cast grubunuz)",
+          "notify_service": "Telefon bildirim servisi (ör. notify.mobile_app_yourphone)"
+        },
+        "data_description": {
+          "bedroom_areas": "Bu alanlardaki herhangi bir varlık sensörü, sessiz saatlerde uyku modunu tetikler.",
+          "broadcast_group": "Kritik ve çok acil duyurular için kullanılır.",
+          "notify_service": "Evden uzaktayken veya uyurken kullanılır."
+        }
+      },
+      "observer": {
+        "title": "JARVIS — Gözlemci Modu",
+        "description": "proaktif farkındalık. JARVIS evinizi izler ve kayda değer bir şey olduğunda söz alır.",
+        "menu_options": {
+          "classifier": "Classifier (Tier 1 — cheap)",
+          "reasoning": "Reasoning (Tier 2 — main)",
+          "review": "Review (Tier 3 — periodic)",
+          "observer_settings": "Observer settings",
+          "back": "Yapılandırma menüsüne dön"
+        }
+      },
+      "classifier": {
+        "title": "JARVIS — Classifier Provider",
+        "data": {
+          "classifier_provider": "Classifier model provider"
+        }
+      },
+      "classifier_model": {
+        "title": "JARVIS — Classifier Model",
+        "data": {
+          "classifier_model": "Classifier model"
+        }
+      },
+      "reasoning": {
+        "title": "JARVIS — Reasoning Provider",
+        "data": {
+          "reasoning_provider": "Reasoning model provider"
+        }
+      },
+      "reasoning_model": {
+        "title": "JARVIS — Reasoning Model",
+        "data": {
+          "reasoning_model": "Reasoning model"
+        }
+      },
+      "review": {
+        "title": "JARVIS — Review Provider",
+        "data": {
+          "review_provider": "Review model provider"
+        }
+      },
+      "review_model": {
+        "title": "JARVIS — Review Model",
+        "data": {
+          "review_model": "Review model"
+        }
+      },
+      "observer_settings": {
+        "title": "JARVIS — Observer Settings",
+        "data": {
+          "observer_enabled": "Enable observer mode",
+          "observer_quiet_start": "Quiet hours start (HH:MM)",
+          "observer_quiet_end": "Quiet hours end (HH:MM)"
+        }
+      },
+      "identity": {
+        "title": "JARVIS — Kimlik",
+        "description": "kişi bazlı tanıma, böylece JARVIS kendini kimin konuştuğuna göre uyarlar. Özel donanım olmadan, varlık ve (ayarlanmışsa) kamera yüz tanıma kullanarak çalışır. Ses parmak izi en doğru olanıdır ancak yerel bir GPU gerektirir, bu yüzden varsayılan olarak kapalıdır.",
+        "data": {
+          "identity_enabled": "Kimin konuştuğunu tanı",
+          "identity_voice_fingerprint": "Ses parmak izi (yerel bir GPU gerektirir)",
+          "identity_min_confidence": "Bir kişiye atamadan önce minimum güven",
+          "voice_recognition_source": "Ses tanıma kaynağı (konuşmacı tanıma servisinden bir varlık, ör. binary_sensor.*_voice)",
+          "voice_recognition_auto_enroll": "İnsanlar konuştukça kaydedilecek sesleri otomatik işaretle"
+        },
+        "data_description": {
+          "identity_enabled": "Kimin evde olduğunu + son kamera yüz tanımasını kullanır. GPU gerekmez.",
+          "identity_voice_fingerprint": "Ses kimliği modeli çalıştıran bir GPU sunucunuz yoksa kapalı bırakın.",
+          "identity_min_confidence": "Yüksek = daha temkinli; emin olunmadığında tarafsız kalır."
+        }
+      },
+      "email": {
+        "title": "JARVIS — E-posta",
+        "description": "Salt okunur gelen kutusu erişimi. IMAP parolası Home Assistant'ın secrets.yaml dosyasından okunur — aşağıdaki anahtarın altına oraya ekleyin (varsayılan jarvis_imap_password); panel yapılandırmasında asla saklanmaz.",
+        "data": {
+          "imap_enabled": "E-posta okumayı etkinleştir",
+          "imap_host": "IMAP ana bilgisayarı (ör. imap.gmail.com)",
+          "imap_port": "IMAP bağlantı noktası (SSL: 993)",
+          "imap_user": "IMAP kullanıcı adı / e-posta adresi",
+          "imap_folder": "Posta kutusu klasörü (varsayılan INBOX)",
+          "imap_ssl": "SSL kullan (önerilir)",
+          "imap_secret_key": "Parolayı tutan secrets.yaml anahtarı"
+        }
+      },
+      "agents": {
+        "title": "JARVIS — Agents",
+        "description": "Specialised sub-agents and autonomy.\n\n⚠️ FRIDAY (background automator) can CONTROL DEVICES, run scenes, and run scripts on its own — unlike every other sub-agent, which is read-only. Leave it OFF unless you understand that it can actuate your home autonomously. To enable it you must also tick the acknowledgement box.",
+        "data": {
+          "friday_automator": "Enable FRIDAY automator (can control devices) — advanced",
+          "friday_confirm": "I understand FRIDAY can actuate my home; enable it",
+          "proximity_volume": "Dampen TTS volume when I'm close to the speaker (needs mmWave distance sensors)",
+          "host_telemetry": "Monitor host hardware (CPU temp, memory pressure, NVMe I/O)"
+        }
+      }
+    },
+    "error": {
+      "need_llm": "Bir bulut API anahtarı ya da yerel bir LLM URL'si girin.",
+      "cannot_connect": "LLM'ye ulaşılamadı. URL/uç noktanın doğru olduğunu ve sunucunun (ör. Ollama) çalıştığını kontrol edin.",
+      "invalid_auth": "API anahtarı reddedildi. Anahtarı kontrol edip tekrar deneyin.",
+      "unknown": "LLM bağlantısı doğrulanamadı. Ayarları kontrol edip tekrar deneyin.",
+      "no_models": "Bu sağlayıcı için kullanılabilir model yok. Sağlayıcı uç noktasını kontrol edip tekrar deneyin.",
+      "no_providers": "Henüz LLM sağlayıcısı yapılandırılmadı. Önce LLM bölümünden bir API anahtarı veya uç nokta ekleyin.",
+      "friday_confirm_required": "You enabled FRIDAY but didn't tick the acknowledgement box. FRIDAY can actuate your home, so it stays off until you confirm."
+    }
+  },
+  "issues": {
+    "llm_unavailable": {
+      "title": "JARVIS akıl yürütme arka ucu kullanılamıyor",
+      "description": "JARVIS akıl yürütme modeline ulaşamadı, bu yüzden sınırlı modda çalışıyor — cihaz kontrolü, durum ve sahneler hâlâ çalışıyor. Neden: {detail}\n\nJARVIS panelini açın → Ayarlar ve sağlayıcınızı, modelinizi ve API anahtarınızı kontrol edin. Sağlayıcınız modeli kaldırdıysa listeden yeniden seçin. Bu bildirim, akıl yürütme yeniden çalıştığında otomatik olarak kaybolur."
+    }
+  }
+}

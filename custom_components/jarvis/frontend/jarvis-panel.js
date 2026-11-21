@@ -1,0 +1,16643 @@
+/**
+ * JARVIS Command Center Panel
+ * v7.94.0 (session 2 · audio routing fix, areas with icons+codes)
+ *
+ * Registered as a custom element via panel_custom. Home Assistant sets:
+ *   - this.hass   — the hass object (live state, services, connection)
+ *   - this.panel  — panel config from registration
+ *   - this.narrow — true when viewport is narrow (mobile)
+ *   - this.route  — route object
+ *
+ * This session: visual port of the HTML mockup. Live clock, mock data
+ * elsewhere. Real HA data wiring comes in session 2.
+ */
+
+/* ===================================================================
+ * JARVIS3D — rotatable axonometric 3D residence model (SVG).
+ * Self-contained, no build/CDN. The DEFAULT HOUSE spec (dimensions,
+ * room layout, garage doors, dormers) lives at the top of this IIFE;
+ * edit it for a different home. Occupancy is data-driven from HA areas.
+ * =================================================================== */
+/* JARVIS Residence — 3D house core (v3 rebuild)
+ * Real dimensions from the architect's ApexSketch; labels/layout from the JARVIS editor.
+ * Pure-geometry axonometric projection rendered to SVG so it is (a) rotatable in the
+ * browser and (b) rasterizable here via cairosvg for verification. Same math both places.
+ * Works under Node (module.exports) and in the browser (window.JARVIS3D).
+ */
+/* JARVIS Residence — 3D house core (v3 rebuild)
+ * Real dimensions from the architect's ApexSketch; labels/layout from the JARVIS editor.
+ * Pure-geometry axonometric projection rendered to SVG so it is (a) rotatable in the
+ * browser and (b) rasterizable here via cairosvg for verification. Same math both places.
+ * Works under Node (module.exports) and in the browser (window.JARVIS3D).
+ */
+/* JARVIS Residence — 3D house core (v3 rebuild)
+ * Real dimensions from the architect's ApexSketch; labels/layout from the JARVIS editor.
+ * Pure-geometry axonometric projection rendered to SVG so it is (a) rotatable in the
+ * browser and (b) rasterizable here via cairosvg for verification. Same math both places.
+ * Works under Node (module.exports) and in the browser (window.JARVIS3D).
+ */
+/* JARVIS Residence — 3D house core (v3 rebuild)
+ * Real dimensions from the architect's ApexSketch; labels/layout from the JARVIS editor.
+ * Pure-geometry axonometric projection rendered to SVG so it is (a) rotatable in the
+ * browser and (b) rasterizable here via cairosvg for verification. Same math both places.
+ * Works under Node (module.exports) and in the browser (window.JARVIS3D).
+ */
+const JARVIS3D = (function () {
+  'use strict';
+
+  // ---------- real dimensions (feet) ----------
+  var GW = 30, HW = 33, D = 24;                 // garage W, house W, depth
+  var XG0 = 0, XGH = GW, XHE = GW + HW;         // garage 0..30, house 30..63
+  var WALL = 9;                                 // 1st-floor wall height = main eave
+  var BASE_RISE = 11, GBASE_RISE = 5;           // roof rises at pitch 1.0
+  var RISE = BASE_RISE, RIDGE = WALL + RISE;    // main roof: eave 9 -> ridge 20
+  var GWALL = 9, GRISE = GBASE_RISE, GRIDGE = GWALL + GRISE; // garage roof: eave 9 -> ridge 14
+  var RY = D / 2;                               // ridge centerline (depth) = 12
+  var OVH = 1.2;                                // roof overhang
+  var SCALE = 8.6;                              // feet -> px
+  var PITCH = 30 * Math.PI / 180;               // camera elevation
+  var CENTER = [(XG0 + XHE) / 2, RY, WALL * 0.5]; // rotate about model center
+
+  // ---------- per-render home spec (type/specs); fields left unset = approved default ----------
+  // garageBays, dormersFront, dormersRear: counts · chimney: 'right'|'left'|'none' · pitch: roof-rise scale
+  var SPEC = {};
+  function applySpec(s) {
+    SPEC = s || {};
+    var p = SPEC.pitch > 0 ? SPEC.pitch : 1;
+    RISE = BASE_RISE * p; RIDGE = WALL + RISE;
+    GRISE = GBASE_RISE * p; GRIDGE = GWALL + GRISE;
+  }
+
+  // ---------- palette (JARVIS dark-cyan HUD) ----------
+  var C = {
+    wallF: 'rgba(22,46,66,0.34)', wallS: 'rgba(0,242,254,0.5)',
+    wallDk:'rgba(14,32,48,0.40)', wallSdk:'rgba(0,242,254,0.34)',
+    roofF: 'rgba(10,24,36,0.94)', roofS: 'rgba(0,206,247,0.5)',
+    roofDk:'rgba(6,17,27,0.96)',  roofSdk:'rgba(0,206,247,0.3)',
+    gableF:'rgba(18,38,56,0.6)',  gableS:'rgba(0,242,254,0.46)',
+    chimF: 'rgba(13,28,42,0.97)', chimS:'rgba(0,242,254,0.42)',
+    doorOff:'rgba(0,242,254,0.10)', doorOn:'rgba(0,242,254,0.30)', doorS:'rgba(0,242,254,0.6)',
+    doorOpen:'rgba(255,170,40,0.32)', doorOpenS:'rgba(255,190,72,0.95)', doorOpenGlow:'rgba(255,170,40,0.42)',
+    winOff:'rgba(0,242,254,0.07)', winOn:'rgba(0,242,254,0.72)', winDom:'rgba(0,245,160,0.82)',
+    glassOff:'rgba(0,242,254,0.32)', glassOn:'rgba(120,240,255,0.92)', glassDom:'rgba(150,255,210,0.95)',
+    edge:'rgba(0,242,254,0.5)', dim:'rgba(0,242,254,0.26)', faint:'rgba(0,242,254,0.13)',
+    glowOn:'rgba(0,242,254,0.5)', glowDom:'rgba(0,245,160,0.55)'
+  };
+
+  // ---------- projection (turntable axonometric, orthographic) ----------
+  function rot(p, t) {
+    var x = p[0] - CENTER[0], y = p[1] - CENTER[1], z = p[2] - CENTER[2];
+    var c = Math.cos(t), s = Math.sin(t);
+    return [x * c - y * s, x * s + y * c, z]; // rotated (rx, ry, z)
+  }
+  function project(p, thetaDeg) {
+    var r = rot(p, thetaDeg * Math.PI / 180);
+    return [-r[0] * SCALE, -(r[1] * Math.sin(PITCH) + r[2] * Math.cos(PITCH)) * SCALE];
+  }
+  function faceDepth(face, thetaDeg) {
+    var t = thetaDeg * Math.PI / 180, cy = 0, cz = 0, n = face.p.length, i, r;
+    for (i = 0; i < n; i++) { r = rot(face.p[i], t); cy += r[1]; cz += r[2]; }
+    cy /= n; cz /= n;
+    return cy * Math.cos(PITCH) - cz * Math.sin(PITCH); // larger = farther from camera
+  }
+
+  // ---------- face helpers ----------
+  function F(list, pts, fill, stroke, sw, extra) {
+    var o = { p: pts, f: fill, s: stroke || C.edge, w: (sw == null ? 0.9 : sw) };
+    if (extra) for (var k in extra) o[k] = extra[k];
+    list.push(o);
+  }
+  // quad on a vertical plane y=const (a wall facing front/back)
+  function wallY(L, y, x0, x1, z0, z1, f, s, w) { F(L, [[x0,y,z0],[x1,y,z0],[x1,y,z1],[x0,y,z1]], f, s, w); }
+  // gable end on plane x=const: wall rect + triangle to ridge
+  function gableEnd(L, x, yA, yB, zWall, yPk, zPk, f, s, w) {
+    F(L, [[x,yA,0],[x,yB,0],[x,yB,zWall],[x,yPk,zPk],[x,yA,zWall]], f, s, w);
+  }
+
+  // ---------- a lit window on the front/back plane (y=const) ----------
+  function winY(L, GL, y, x0, x1, z0, z1, state, mull, faceOut, cols) {
+    var f = state === 'dom' ? C.winDom : state === 'on' ? C.winOn : C.winOff;
+    var st = state === 'dom' ? C.glassDom : state === 'on' ? C.glassOn : C.glassOff;
+    var n = faceOut == null ? -0.06 : faceOut;
+    var yy = y + n;
+    F(L, [[x0,yy,z0],[x1,yy,z0],[x1,yy,z1],[x0,yy,z1]], f, st, 0.7);
+    if (mull) {
+      F(L, [[x0,yy,(z0+z1)/2],[x1,yy,(z0+z1)/2]], 'none', st, 0.4);
+      var nc = cols || 2, k;
+      for (k = 1; k < nc; k++) { var xm = x0 + (x1 - x0) * k / nc; F(L, [[xm,yy,z0],[xm,yy,z1]], 'none', st, 0.4); }
+    }
+    if (state !== 'off' && GL) {
+      var g = state === 'dom' ? C.glowDom : C.glowOn;
+      GL.push({ p: [[x0-1.4,yy,z0-1.4],[x1+1.4,yy,z0-1.4],[x1+1.4,yy,z1+1.4],[x0-1.4,yy,z1+1.4]], f: g });
+    }
+  }
+  // window on the end plane (x=const)
+  function winX(L, GL, x, y0, y1, z0, z1, state, mull, faceOut) {
+    var f = state === 'dom' ? C.winDom : state === 'on' ? C.winOn : C.winOff;
+    var st = state === 'dom' ? C.glassDom : state === 'on' ? C.glassOn : C.glassOff;
+    var n = faceOut == null ? 0.06 : faceOut;
+    var xx = x + n;
+    F(L, [[xx,y0,z0],[xx,y1,z0],[xx,y1,z1],[xx,y0,z1]], f, st, 0.7);
+    if (mull) {
+      F(L, [[xx,y0,(z0+z1)/2],[xx,y1,(z0+z1)/2]], 'none', st, 0.4);
+      F(L, [[xx,(y0+y1)/2,z0],[xx,(y0+y1)/2,z1]], 'none', st, 0.4);
+    }
+    if (state !== 'off' && GL) {
+      var g = state === 'dom' ? C.glowDom : C.glowOn;
+      GL.push({ p: [[xx,y0-1.4,z0-1.4],[xx,y1+1.4,z0-1.4],[xx,y1+1.4,z1+1.4],[xx,y0-1.4,z1+1.4]], f: g });
+    }
+  }
+
+  // ---------- a door on a front/back plane (y=const). hinge 'left'|'right'; ----------
+  // state 'open' → swings out (amber + glow), else flush cyan-dim. faceOut sets the side.
+  function doorY(L, GL, y, x0, x1, z0, z1, faceOut, hinge, state) {
+    var n = faceOut, yy = y + n;
+    if (state !== 'open') {
+      F(L, [[x0,yy,z0],[x1,yy,z0],[x1,yy,z1],[x0,yy,z1]], C.doorOff, C.doorS, 0.8, { cls: 'door' });
+      return;
+    }
+    var w = x1 - x0, ang = 66 * Math.PI / 180, dir = n >= 0 ? 1 : -1;
+    var dx = w * Math.cos(ang), dy = dir * w * Math.sin(ang);
+    var hx = hinge === 'right' ? x1 : x0;
+    var fx = hinge === 'right' ? x1 - dx : x0 + dx;
+    var fy = yy + dy;
+    if (GL) GL.push({ p: [[hx,yy,z0],[fx,fy,z0],[fx,fy,z1],[hx,yy,z1]], f: C.doorOpenGlow });
+    F(L, [[x0,yy,z0],[x1,yy,z0],[x1,yy,z1],[x0,yy,z1]], 'rgba(2,8,14,0.92)', C.doorOpenS, 0.45);   // dark opening
+    F(L, [[hx,yy,z0],[fx,fy,z0],[fx,fy,z1],[hx,yy,z1]], C.doorOpen, C.doorOpenS, 0.9, { cls: 'door door-open' }); // swung leaf
+  }
+  // ---------- a slanted cellar bulkhead at the base of the rear wall ----------
+  function bulkhead(L, GL, x0, x1, state) {
+    var open = state === 'open', yTop = D, zTop = 3.0, yBot = D + 2.6, xm = (x0 + x1) / 2;
+    F(L, [[x0,yTop,0],[x0,yTop,zTop],[x0,yBot,0]], 'rgba(8,19,29,0.92)', C.dim, 0.5);   // left cheek
+    F(L, [[x1,yTop,0],[x1,yTop,zTop],[x1,yBot,0]], 'rgba(8,19,29,0.92)', C.dim, 0.5);   // right cheek
+    if (!open) {
+      F(L, [[x0,yTop,zTop],[x1,yTop,zTop],[x1,yBot,0],[x0,yBot,0]], 'rgba(11,26,38,0.95)', C.doorS, 0.8, { cls: 'door' });
+      F(L, [[xm,yTop,zTop],[xm,yBot,0]], 'none', C.doorS, 0.4);   // center seam
+    } else {
+      if (GL) GL.push({ p: [[x0,yTop,zTop],[x1,yTop,zTop],[x1,yTop,zTop+3.4],[x0,yTop,zTop+3.4]], f: C.doorOpenGlow });
+      F(L, [[x0,yTop,zTop],[x1,yTop,zTop],[x1,yBot,0],[x0,yBot,0]], 'rgba(2,8,14,0.95)', C.doorOpenS, 0.5);  // hole into ground
+      F(L, [[x0,yTop,zTop],[x1,yTop,zTop],[x1,yTop,zTop+3.4],[x0,yTop,zTop+3.4]], C.doorOpen, C.doorOpenS, 0.85, { cls: 'door door-open' }); // raised leaves
+    }
+  }
+
+  function dormerFront(L, GL, cx, state) {
+    var w = 6, yF = 1.6, zSill = WALL + 2.2, zHead = WALL + 6.2, zPk = WALL + 8.2, yBack = 6.2;
+    var wf = 'rgba(14,30,44,0.96)', rf = 'rgba(8,19,29,0.97)', es = C.roofSdk;
+    // side walls (triang│ following slope back into roof)
+    F(L, [[cx-w/2,yF,zSill],[cx-w/2,yF,zHead],[cx-w/2,yBack,WALL+RISE*(1-(yBack)/RY)]], wf, es, 0.55);
+    F(L, [[cx+w/2,yF,zSill],[cx+w/2,yF,zHead],[cx+w/2,yBack,WALL+RISE*(1-(yBack)/RY)]], wf, es, 0.55);
+    // little gable roof (two slopes from the dormer peak back to the main slope)
+    F(L, [[cx-w/2,yF,zHead],[cx,yF,zPk],[cx,yBack,WALL+RISE*(1-(yBack)/RY)+1.2],[cx-w/2,yBack,WALL+RISE*(1-(yBack)/RY)]], rf, es, 0.55);
+    F(L, [[cx+w/2,yF,zHead],[cx,yF,zPk],[cx,yBack,WALL+RISE*(1-(yBack)/RY)+1.2],[cx+w/2,yBack,WALL+RISE*(1-(yBack)/RY)]], rf, es, 0.55);
+    // front face (the bit that holds the window)
+    F(L, [[cx-w/2,yF,zSill],[cx+w/2,yF,zSill],[cx+w/2,yF,zHead],[cx-w/2,yF,zHead]], wf, C.wallS, 0.7);
+    F(L, [[cx-w/2,yF,zHead],[cx+w/2,yF,zHead],[cx,yF,zPk]], wf, C.wallS, 0.7);
+    // window
+    winY(L, GL, yF, cx-1.95, cx+1.95, zSill+0.4, zHead-0.4, state, true, -0.05);
+  }
+  // ---------- the rear dormer with a ROUND window (the upstairs bath) ----------
+  function dormerRearRound(L, GL, cx, state) {
+    var w = 7, yB = D - 1.6, zSill = WALL + 2.0, zHead = WALL + 6.6, zPk = WALL + 8.4, yFwd = D - 6.2;
+    var wf = 'rgba(14,30,44,0.96)', rf = 'rgba(8,19,29,0.97)', es = C.roofSdk;
+    var zSlope = function (yy) { return WALL + RISE * (1 - (D - yy) / RY); };
+    F(L, [[cx-w/2,yB,zSill],[cx-w/2,yB,zHead],[cx-w/2,yFwd,zSlope(yFwd)]], wf, es, 0.55);
+    F(L, [[cx+w/2,yB,zSill],[cx+w/2,yB,zHead],[cx+w/2,yFwd,zSlope(yFwd)]], wf, es, 0.55);
+    F(L, [[cx-w/2,yB,zHead],[cx,yB,zPk],[cx,yFwd,zSlope(yFwd)+1.2],[cx-w/2,yFwd,zSlope(yFwd)]], rf, es, 0.55);
+    F(L, [[cx+w/2,yB,zHead],[cx,yB,zPk],[cx,yFwd,zSlope(yFwd)+1.2],[cx+w/2,yFwd,zSlope(yFwd)]], rf, es, 0.55);
+    F(L, [[cx-w/2,yB,zSill],[cx+w/2,yB,zSill],[cx+w/2,yB,zHead],[cx-w/2,yB,zHead]], wf, C.wallS, 0.7);
+    F(L, [[cx-w/2,yB,zHead],[cx+w/2,yB,zHead],[cx,yB,zPk]], wf, C.wallS, 0.7);
+    // round window approximated by an octagon on the y=yB plane
+    var cz = (zSill + zHead) / 2 + 0.3, r = 1.7, pts = [], i, a;
+    var f = state === 'dom' ? C.winDom : state === 'on' ? C.winOn : C.winOff;
+    var stk = state === 'dom' ? C.glassDom : state === 'on' ? C.glassOn : C.glassOff;
+    for (i = 0; i < 8; i++) { a = Math.PI / 8 + i * Math.PI / 4; pts.push([cx + r * Math.cos(a), yB - 0.05, cz + r * Math.sin(a)]); }
+    F(L, pts, f, stk, 0.7);
+    if (state !== 'off' && GL) GL.push({ p: [[cx-r-1.2,yB-0.05,cz-r-1.2],[cx+r+1.2,yB-0.05,cz-r-1.2],[cx+r+1.2,yB-0.05,cz+r+1.2],[cx-r-1.2,yB-0.05,cz+r+1.2]], f: state==='dom'?C.glowDom:C.glowOn });
+  }
+
+  // ---------- garage doors (count = SPEC.garageBays, default 3; fill the garage front) ----------
+  function garageDoors(L, GL, state, openState) {
+    var bays = SPEC.garageBays > 0 ? SPEC.garageBays : 3, gap = 1.8;
+    var dw = (GW - gap * (bays + 1)) / bays, z0 = 0.4, z1 = 7.4, i, x0;
+    var open = openState === 'open', lit = state === 'on' || state === 'dom';
+    var f = open ? C.doorOpen : lit ? C.doorOn : C.doorOff;
+    var s = open ? C.doorOpenS : lit ? C.glassOn : C.doorS;
+    var cls = open ? 'gdoor door-open' : 'gdoor';
+    for (i = 0; i < bays; i++) {
+      x0 = gap + i * (dw + gap);
+      F(L, [[x0,-0.06,z0],[x0+dw,-0.06,z0],[x0+dw,-0.06,z1],[x0,-0.06,z1]], f, s, 1.0, { cls: cls });
+      for (var k = 1; k < 4; k++) { var zz = z0 + (z1 - z0) * k / 4; F(L, [[x0,-0.06,zz],[x0+dw,-0.06,zz]], 'none', s, 0.45); }
+      if ((open || lit) && GL) GL.push({ p: [[x0-1.2,-0.06,z0],[x0+dw+1.2,-0.06,z0],[x0+dw+1.2,-0.06,z1+1.2],[x0-1.2,-0.06,z1+1.2]], f: open ? C.doorOpenGlow : C.glowOn });
+    }
+  }
+
+  // ---------- BUILD: exterior shell + roof ----------
+  // A roof slope drawn as fill strips (so a protruding dormer in front sorts correctly
+  // per-strip instead of being swallowed by one big quad) plus a single crisp outline.
+  function roofPlane(L, xL, xR, yE, zE, yR, zR, fill, stroke, sw) {
+    var N = 12, i, xa, xb;
+    for (i = 0; i < N; i++) {
+      xa = xL + (xR - xL) * i / N; xb = xL + (xR - xL) * (i + 1) / N;
+      F(L, [[xa,yE,zE],[xb,yE,zE],[xb,yR,zR],[xa,yR,zR]], fill, 'none', 0);
+    }
+    F(L, [[xL,yE,zE],[xR,yE,zE],[xR,yR,zR],[xL,yR,zR]], 'none', stroke, sw);
+  }
+
+  function buildShell(L, GL) {
+    // garage walls
+    wallY(L, 0, XG0, XGH, 0, GWALL, C.wallF, C.wallS, 0.85);            // garage front
+    wallY(L, D, XG0, XGH, 0, GWALL, C.wallDk, C.wallSdk, 0.7);          // garage back
+    gableEnd(L, XG0, 0, D, GWALL, RY, GRIDGE, C.gableF, C.gableS, 0.8); // garage left gable
+    // house walls
+    wallY(L, 0, XGH, XHE, 0, WALL, C.wallF, C.wallS, 0.85);             // house front
+    wallY(L, D, XGH, XHE, 0, WALL, C.wallDk, C.wallSdk, 0.7);           // house back
+    gableEnd(L, XHE, 0, D, WALL, RY, RIDGE, C.gableF, C.gableS, 0.85);  // house right gable (chimney end)
+    gableEnd(L, XGH, 0, D, WALL, RY, RIDGE, C.gableF, C.gableSdk || C.gableS, 0.7); // house left gable (above garage)
+
+    // garage roof (ridge ∥ house, lower)
+    F(L, [[XG0-OVH,-OVH,GWALL],[XGH,-OVH,GWALL],[XGH,RY,GRIDGE],[XG0-OVH,RY,GRIDGE]], C.roofF, C.roofS, 0.85);  // front slope
+    F(L, [[XG0-OVH,D+OVH,GWALL],[XGH,D+OVH,GWALL],[XGH,RY,GRIDGE],[XG0-OVH,RY,GRIDGE]], C.roofDk, C.roofSdk, 0.7); // back slope
+
+    // main roof (strip-split so dormers in front sort correctly)
+    roofPlane(L, XGH - OVH, XHE + OVH, -OVH, WALL, RY, RIDGE, C.roofF, C.roofS, 0.9);   // front slope
+    roofPlane(L, XGH - OVH, XHE + OVH, D + OVH, WALL, RY, RIDGE, C.roofDk, C.roofSdk, 0.7); // back slope
+  }
+
+  function chimney(L, side) {
+    if (side === 'none') return;
+    var ya = 9.6, yb = 13.2, zt, x0, x1;
+    if (side === 'left') { x0 = XG0; x1 = XG0 - 2.2; zt = GRIDGE + 4; }   // west gable (garage end)
+    else { x0 = XHE; x1 = XHE + 2.2; zt = RIDGE + 4; }                    // default: east gable
+    F(L, [[x1,ya,0],[x1,yb,0],[x1,yb,zt],[x1,ya,zt]], C.chimF, C.chimS, 0.7);      // outer
+    F(L, [[x0,ya,0],[x1,ya,0],[x1,ya,zt],[x0,ya,zt]], 'rgba(8,19,29,0.97)', C.chimS, 0.6); // front side
+    F(L, [[x0,yb,0],[x1,yb,0],[x1,yb,zt],[x0,yb,zt]], 'rgba(8,19,29,0.97)', C.dim, 0.5);    // back side
+    F(L, [[x0,ya,zt],[x1,ya,zt],[x1,yb,zt],[x0,yb,zt]], 'rgba(0,242,254,0.08)', C.chimS, 0.5); // cap
+  }
+
+  // ---------- interior rooms (labels/layout from JARVIS editor; sizes from the plan) ----------
+  // [x0, y0, w, d, label, occupancy-key]   (front y=0 .. rear y=24; garage 0..30, house 30..63)
+  var ROOMS = {
+    '1f': [
+      [0, 0, 30, 24, 'GARAGE', 'garage'],
+      [30, 0, 13, 11, 'DINING', 'dining room'],
+      [43, 0, 20, 11, 'LIVING ROOM', 'living room'],
+      [30, 13, 14, 11, 'KITCHEN', 'kitchen'],
+      [49, 13, 14, 11, 'GUEST RM', 'guest room'],
+      [44, 16.5, 5, 7.5, 'BATH', 'bath'],
+      [43, 11, 20, 2, 'HALL', 'downstairs hallway'],
+      [44, 3, 4, 8, 'STAIRS', 'stairs']
+    ],
+    '2f': [
+      [31, 2, 15, 20, "ELIANA'S", "eliana's room"],
+      [48, 2, 14, 20, 'MASTER', 'master bedroom'],
+      [44, 16, 7, 8, 'BATH', 'bath'],
+      [45, 11, 6, 5, 'U.HALL', 'upstairs hallway'],
+      [45.5, 7, 4, 4, 'STAIRS', 'stairs']
+    ],
+    'b': [
+      [30, 0, 33, 24, 'BASEMENT', 'basement']
+    ]
+  };
+  var BSMT_ITEMS = [[34, 4, 'SUMP'], [34, 9.5, 'DEHUM'], [58, 9.5, 'ENERGY'], [58, 18, 'WASHER'], [46, 12, 'STAIRS']];
+  var FLOOR_Z = { '1f': [0.4, 8.6], '2f': [9.0, 13.8], 'b': [-7, -0.6] };
+
+  function roomBox(L, LBL, x0, y0, w, d, z0, z1, name, state) {
+    var x1 = x0 + w, y1 = y0 + d, occ = state !== 'off';
+    var mm = state === 'mmwave';
+    // dom → mint; mmwave (active sensor) → punchy aqua-green, brighter than a
+    // bare area flag so live detection reads at a glance; plain occ → cyan
+    var ff = state === 'dom' ? 'rgba(0,245,160,0.15)' : mm ? 'rgba(30,255,180,0.22)' : occ ? 'rgba(0,242,254,0.13)' : 'rgba(0,242,254,0.035)';
+    var ss = state === 'dom' ? 'rgba(130,255,205,0.9)' : mm ? 'rgba(70,255,195,1)' : occ ? 'rgba(0,242,254,0.62)' : 'rgba(0,242,254,0.24)';
+    var sw = mm ? 1.3 : occ ? 1.0 : 0.6;
+    var wf = state === 'dom' ? 'rgba(0,245,160,0.06)' : mm ? 'rgba(20,255,170,0.1)' : occ ? 'rgba(0,242,254,0.05)' : 'rgba(0,242,254,0.018)';
+    F(L, [[x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0]], ff, ss, sw * 0.7);            // floor
+    F(L, [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]], wf, ss, sw * 0.5);
+    F(L, [[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]], wf, ss, sw * 0.5);
+    F(L, [[x0,y0,z0],[x0,y1,z0],[x0,y1,z1],[x0,y0,z1]], wf, ss, sw * 0.5);
+    F(L, [[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]], wf, ss, sw * 0.5);
+    LBL.push({ x: (x0 + x1) / 2, y: (y0 + y1) / 2, z: z0 + 0.2, t: name, st: state, big: w > 14 });
+    if (occ) LBL.push({ x: (x0 + x1) / 2, y: (y0 + y1) / 2, z: z1 - 0.5, st: state, dot: true });
+  }
+
+  // Extrude a room from its actual polygon (3b-1): floor = the polygon, one wall
+  // quad per edge. Same occupancy styling as roomBox.
+  function roomPrism(L, LBL, pts, z0, z1, name, state) {
+    var occ = state !== 'off', mm = state === 'mmwave';
+    var ff = state === 'dom' ? 'rgba(0,245,160,0.15)' : mm ? 'rgba(30,255,180,0.22)' : occ ? 'rgba(0,242,254,0.13)' : 'rgba(0,242,254,0.035)';
+    var ss = state === 'dom' ? 'rgba(130,255,205,0.9)' : mm ? 'rgba(70,255,195,1)' : occ ? 'rgba(0,242,254,0.62)' : 'rgba(0,242,254,0.24)';
+    var sw = mm ? 1.3 : occ ? 1.0 : 0.6;
+    var wf = state === 'dom' ? 'rgba(0,245,160,0.06)' : mm ? 'rgba(20,255,170,0.1)' : occ ? 'rgba(0,242,254,0.05)' : 'rgba(0,242,254,0.018)';
+    F(L, pts.map(function (p) { return [p[0], p[1], z0]; }), ff, ss, sw * 0.7);   // floor polygon
+    for (var i = 0; i < pts.length; i++) {                                        // walls: one quad per edge
+      var a = pts[i], b = pts[(i + 1) % pts.length];
+      F(L, [[a[0], a[1], z0], [b[0], b[1], z0], [b[0], b[1], z1], [a[0], a[1], z1]], wf, ss, sw * 0.5);
+    }
+    var cx = 0, cy = 0, mnx = 1e9, mxx = -1e9;
+    pts.forEach(function (p) { cx += p[0]; cy += p[1]; mnx = Math.min(mnx, p[0]); mxx = Math.max(mxx, p[0]); });
+    cx /= pts.length; cy /= pts.length;
+    LBL.push({ x: cx, y: cy, z: z0 + 0.2, t: name, st: state, big: (mxx - mnx) > 14 });
+    if (occ) LBL.push({ x: cx, y: cy, z: z1 - 0.5, st: state, dot: true });
+  }
+
+  // interior door on an x=const wall (shown on the floor-plan views)
+  function intDoorX(L, x, y0, y1, z0, z1, state) {
+    if (state === 'open') {
+      var w = y1 - y0, ang = 58 * Math.PI / 180;
+      var fy = y0 + w * Math.cos(ang), fx = x + w * Math.sin(ang);   // swing into the kitchen (+x)
+      F(L, [[x,y0,z0],[fx,fy,z0],[fx,fy,z1],[x,y0,z1]], C.doorOpen, C.doorOpenS, 0.8, { cls: 'door door-open' });
+    } else {
+      F(L, [[x,y0,z0],[x,y1,z0],[x,y1,z1],[x,y0,z1]], 'rgba(0,242,254,0.14)', C.doorS, 0.7, { cls: 'door' });
+    }
+  }
+  // interior door on a y=const wall (e.g. the basement door in the rear foundation wall)
+  function intDoorY(L, y, x0, x1, z0, z1, faceOut, hinge, state) {
+    var n = faceOut == null ? -0.06 : faceOut, yy = y + n;
+    if (state !== 'open') {
+      F(L, [[x0,yy,z0],[x1,yy,z0],[x1,yy,z1],[x0,yy,z1]], 'rgba(0,242,254,0.14)', C.doorS, 0.7, { cls: 'door' });
+      return;
+    }
+    var w = x1 - x0, ang = 58 * Math.PI / 180, dir = n >= 0 ? 1 : -1;
+    var dx = w * Math.cos(ang), dy = dir * w * Math.sin(ang);
+    var hx = hinge === 'right' ? x1 : x0, fx = hinge === 'right' ? x1 - dx : x0 + dx, fy = yy + dy;
+    F(L, [[hx,yy,z0],[fx,fy,z0],[fx,fy,z1],[hx,yy,z1]], C.doorOpen, C.doorOpenS, 0.8, { cls: 'door door-open' });
+  }
+
+  function buildRooms(floor, lit, doors, L, LBL) {
+    var stOf = function (n) { var s = lit[String(n).toLowerCase()]; return s === 'dom' ? 'dom' : s === 'mmwave' ? 'mmwave' : s ? 'on' : 'off'; };
+    var dOf = function (k) { return doors && doors[k] === 'open' ? 'open' : 'closed'; };
+    var z = FLOOR_Z[floor] || FLOOR_Z['1f'];
+    (ROOMS[floor] || []).forEach(function (r) { roomBox(L, LBL, r[0], r[1], r[2], r[3], z[0], z[1], r[4], stOf(r[5])); });
+    if (floor === '1f') intDoorX(L, XGH, 19.5, 22.5, z[0], z[0] + 6.5, dOf('kitchen_garage')); // kitchen ↔ garage
+    if (floor === 'b') {
+      intDoorY(L, D, 33.5, 38.5, z[0] + 0.3, z[1] - 0.1, -0.06, 'left', dOf('basement'));      // basement door (foot of the cellar stairs, inline w/ the bulkhead above)
+      BSMT_ITEMS.forEach(function (it) { LBL.push({ x: it[0], y: it[1], z: z[1] - 0.3, t: it[2], st: 'off', small: true }); });
+    }
+  }
+
+  function buildContext(L, floor) {
+    var fe = 'rgba(0,242,254,0.13)';
+    F(L, [[XG0,0,0],[XHE,0,0],[XHE,D,0],[XG0,D,0]], 'none', fe, 0.5);   // footprint
+    F(L, [[XGH,0,0],[XGH,D,0]], 'none', fe, 0.4);                       // garage/house split
+    if (floor === '2f') {
+      var rw = 'rgba(0,242,254,0.10)';
+      F(L, [[XGH,-OVH,WALL],[XHE,-OVH,WALL],[XHE,RY,RIDGE],[XGH,RY,RIDGE]], 'none', rw, 0.4);
+      F(L, [[XGH,D+OVH,WALL],[XHE,D+OVH,WALL],[XHE,RY,RIDGE],[XGH,RY,RIDGE]], 'none', rw, 0.4);
+      F(L, [[XGH,RY,RIDGE],[XHE,RY,RIDGE]], 'none', 'rgba(0,242,254,0.16)', 0.5);
+    }
+  }
+
+  // ---------- data-driven build: geometry from the editor's rooms (feet) (v7.94.0) ----------
+  var DEFAULT_CENTER = [(XG0 + XHE) / 2, RY, WALL * 0.5];
+  function _planZ(fk) { var A = { bsmt: 'b', basement: 'b' }; return FLOOR_Z[fk] || FLOOR_Z[A[fk]] || FLOOR_Z['1f']; }
+  function _planFloorKey(plan, floor) { if (plan[floor]) return floor; var A = { b: 'bsmt', bsmt: 'b' }; return plan[A[floor]] ? A[floor] : floor; }
+  function extWalls(L, x0, y0, x1, y1, z0, z1) {
+    F(L, [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]], C.wallF,  C.wallS,   0.7); // front  (y=y0)
+    F(L, [[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]], C.wallDk, C.wallSdk, 0.7); // back   (y=y1)
+    F(L, [[x0,y0,z0],[x0,y1,z0],[x0,y1,z1],[x0,y0,z1]], C.wallDk, C.wallSdk, 0.7); // left   (x=x0)
+    F(L, [[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]], C.wallF,  C.wallS,   0.7); // right  (x=x1)
+  }
+  function _roomCorners(r) {
+    if (r.points && r.points.length >= 3) return r.points;
+    var x = r.x || 0, y = r.y || 0, w = r.w || 0, d = r.d || 0;
+    return [[x, y], [x + w, y], [x + w, y + d], [x, y + d]];
+  }
+  function _ptInPoly(px, py, pts) {
+    var inside = false;
+    for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      var xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  // Exterior walls from the real outline (3b-2a): an edge is an outside wall unless the
+  // point just past it lands inside another enclosed room (i.e. it's a shared wall).
+  // Decompose an orthogonal footprint (axis-aligned room bboxes) into rectangular masses.
+  // One rectangle for a rectangular footprint; several for an L/T. (v7.94.0)
+  // x-intervals of an orthogonal room polygon at scanline y (bay-aware decomposition, v7.94.0).
+  function _polyScanX(pts, ym) {
+    var xs = [];
+    for (var i = 0; i < pts.length; i++) {
+      var a = pts[i], b = pts[(i + 1) % pts.length];
+      if ((a[1] <= ym && b[1] > ym) || (b[1] <= ym && a[1] > ym)) xs.push(a[0] + (ym - a[1]) / (b[1] - a[1]) * (b[0] - a[0]));
+    }
+    xs.sort(function (p, q) { return p - q; });
+    var ivs = [];
+    for (var k = 0; k + 1 < xs.length; k += 2) ivs.push([xs[k], xs[k + 1]]);
+    return ivs;
+  }
+  function _footprintMasses(rooms) {
+    var encl = (rooms || []).filter(function (r) { return r.type !== 'outdoor' && r.type !== 'stairs' && r.type !== 'door'; });
+    if (!encl.length) return [];
+    var ys = [];
+    encl.forEach(function (r) { _roomCorners(r).forEach(function (p) { ys.push(p[1]); }); });
+    ys = ys.sort(function (a, b) { return a - b; }).filter(function (v, i, a) { return i === 0 || Math.abs(v - a[i - 1]) > 0.01; });
+    var rects = [];
+    for (var i = 0; i < ys.length - 1; i++) {
+      var y0 = ys[i], y1 = ys[i + 1], ym = (y0 + y1) / 2, ivs = [];
+      encl.forEach(function (r) { _polyScanX(_roomCorners(r), ym).forEach(function (iv) { ivs.push(iv); }); });
+      ivs.sort(function (a, b) { return a[0] - b[0]; });
+      var merged = [];
+      // Bridge small gaps (<=2.5 ft): rooms drawn a few units apart are the same
+      // building sketched loosely — joining them yields ONE roof mass instead of
+      // a gable per room. Detached buildings sit far enough away to stay split.
+      ivs.forEach(function (iv) { var last = merged[merged.length - 1]; if (last && iv[0] <= last[1] + 2.5) last[1] = Math.max(last[1], iv[1]); else merged.push([iv[0], iv[1]]); });
+      merged.forEach(function (iv) { rects.push({ x0: iv[0], y0: y0, x1: iv[1], y1: y1 }); });
+    }
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (var a = 0; a < rects.length; a++) {
+        if (!rects[a]) continue;
+        for (var b = a + 1; b < rects.length; b++) {
+          if (!rects[b]) continue;
+          var A = rects[a], B = rects[b];
+          if (Math.abs(A.x0 - B.x0) < 0.01 && Math.abs(A.x1 - B.x1) < 0.01 && (Math.abs(A.y1 - B.y0) < 2.5 || Math.abs(B.y1 - A.y0) < 2.5)) {
+            A.y0 = Math.min(A.y0, B.y0); A.y1 = Math.max(A.y1, B.y1); rects[b] = null; changed = true;
+          }
+        }
+      }
+      rects = rects.filter(Boolean);
+    }
+    return rects;
+  }
+  function extWallsPoly(L, rooms, z0, z1) {
+    var encl = (rooms || []).filter(function (r) { return r.type !== 'outdoor' && r.type !== 'stairs' && r.type !== 'door'; });
+    var corners = [];
+    encl.forEach(function (r) { _roomCorners(r).forEach(function (c) { corners.push(c); }); });
+    function inAny(px, py, skip) { return encl.some(function (rr) { return rr !== skip && _ptInPoly(px, py, _roomCorners(rr)); }); }
+    var segs = [];
+    encl.forEach(function (r) {
+      var pts = _roomCorners(r), cx = 0, cy = 0;
+      pts.forEach(function (p) { cx += p[0]; cy += p[1]; }); cx /= pts.length; cy /= pts.length;
+      for (var i = 0; i < pts.length; i++) {
+        var a = pts[i], b = pts[(i + 1) % pts.length];
+        var dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+        if (L2 < 1e-6) continue;
+        var ts = [0, 1];
+        corners.forEach(function (c) {
+          var t = ((c[0] - a[0]) * dx + (c[1] - a[1]) * dy) / L2;
+          if (t <= 0.001 || t >= 0.999) return;
+          if (Math.hypot(c[0] - (a[0] + dx * t), c[1] - (a[1] + dy * t)) < 0.05) ts.push(t);
+        });
+        ts.sort(function (p, q) { return p - q; });
+        var nx = -dy, ny = dx, len = Math.hypot(nx, ny) || 1; nx /= len; ny /= len;
+        var mmx = (a[0] + b[0]) / 2, mmy = (a[1] + b[1]) / 2;
+        if ((mmx + nx - cx) * (mmx + nx - cx) + (mmy + ny - cy) * (mmy + ny - cy) < (mmx - nx - cx) * (mmx - nx - cx) + (mmy - ny - cy) * (mmy - ny - cy)) { nx = -nx; ny = -ny; }
+        var front = ny < -0.3;
+        for (var k = 0; k < ts.length - 1; k++) {
+          var t0 = ts[k], t1 = ts[k + 1]; if (t1 - t0 < 0.001) continue;
+          var tm = (t0 + t1) / 2, smx = a[0] + dx * tm, smy = a[1] + dy * tm;
+          if (inAny(smx + nx * 1.5, smy + ny * 1.5, r)) continue;
+          segs.push({ a: [a[0] + dx * t0, a[1] + dy * t0], b: [a[0] + dx * t1, a[1] + dy * t1], front: front });
+        }
+      }
+    });
+    // Merge collinear + adjacent same-shade segments into continuous runs so each wall is
+    // ONE stroked quad, not one per room edge (that seam was the "break") (v7.94.0).
+    function nr(p, q) { return Math.abs(p[0] - q[0]) < 0.06 && Math.abs(p[1] - q[1]) < 0.06; }
+    function coll(a, b, c) { var LL = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1; return Math.abs(((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / LL) < 0.06; }
+    var used = new Array(segs.length).fill(false);
+    for (var s = 0; s < segs.length; s++) {
+      if (used[s]) continue;
+      used[s] = true;
+      var A = segs[s].a, B = segs[s].b, fr = segs[s].front, grew = true;
+      while (grew) {
+        grew = false;
+        for (var j = 0; j < segs.length; j++) {
+          if (used[j] || segs[j].front !== fr) continue;
+          var ta = segs[j].a, tb = segs[j].b;
+          if (!coll(A, B, ta) || !coll(A, B, tb)) continue;
+          if (nr(tb, A)) { A = ta; used[j] = true; grew = true; }
+          else if (nr(ta, A)) { A = tb; used[j] = true; grew = true; }
+          else if (nr(ta, B)) { B = tb; used[j] = true; grew = true; }
+          else if (nr(tb, B)) { B = ta; used[j] = true; grew = true; }
+        }
+      }
+      F(L, [[A[0], A[1], z0], [B[0], B[1], z0], [B[0], B[1], z1], [A[0], A[1], z1]], fr ? C.wallF : C.wallDk, fr ? C.wallS : C.wallSdk, 0.7);
+    }
+  }
+  // ----- generalized roofs over the derived footprint (v7.94.0) -----
+  function _oneFloorTop() { return FLOOR_Z['1f'][1]; }                                  // 1st-floor eave
+  function _roofRise(spanShort) { var p = SPEC.pitch != null ? SPEC.pitch : 1; return (spanShort / 2) * 0.9 * Math.max(p, 0.08); }
+
+  function gableRoofOver(L, GL, x0, y0, x1, y1, zE, minRise, pitchOv) {
+    var W = x1 - x0, Dd = y1 - y0, ov = OVH, alongX = W >= Dd, span = alongX ? Dd : W;
+    var p = pitchOv != null ? pitchOv : (SPEC.pitch != null ? SPEC.pitch : 1);
+    var rise = Math.max((span / 2) * 0.9 * Math.max(p, 0.08), minRise || 0), zR = zE + rise;
+    if (alongX) {
+      var yC = (y0 + y1) / 2;
+      roofPlane(L, x0 - ov, x1 + ov, y0 - ov, zE, yC, zR, C.roofF, C.roofS, 0.85);                       // front
+      F(L, [[x0-ov,y1+ov,zE],[x1+ov,y1+ov,zE],[x1+ov,yC,zR],[x0-ov,yC,zR]], C.roofDk, C.roofSdk, 0.7);   // back
+      gableEnd(L, x0, y0, y1, zE, yC, zR, C.gableF, C.gableS, 0.8);
+      gableEnd(L, x1, y0, y1, zE, yC, zR, C.gableF, C.gableS, 0.8);
+      return { axis: 'x', front: y0, back: y1, eave: zE, ridge: zR, mid: yC, a: x0, b: x1 };
+    }
+    var xC = (x0 + x1) / 2;
+    F(L, [[x0-ov,y0-ov,zE],[x0-ov,y1+ov,zE],[xC,y1+ov,zR],[xC,y0-ov,zR]], C.roofF, C.roofS, 0.85);
+    F(L, [[x1+ov,y0-ov,zE],[x1+ov,y1+ov,zE],[xC,y1+ov,zR],[xC,y0-ov,zR]], C.roofDk, C.roofSdk, 0.7);
+    F(L, [[x0,y0,zE],[x1,y0,zE],[xC,y0,zR]], C.gableF, C.gableS, 0.8);
+    F(L, [[x0,y1,zE],[x1,y1,zE],[xC,y1,zR]], C.gableF, C.gableS, 0.8);
+    return { axis: 'y', eave: zE, ridge: zR };
+  }
+
+  // ---------- gambrel (Dutch Colonial "barn") gable end: wall + steep lower + shallow upper ----------
+  function gambrelEnd(L, x, yA, yB, zWall, yKa, yKb, zK, yPk, zPk, f, s) {
+    F(L, [[x,yA,0],[x,yB,0],[x,yB,zWall],[x,yKb,zK],[x,yPk,zPk],[x,yKa,zK],[x,yA,zWall]], f, s, 0.8);
+  }
+  function gambrelEndY(L, y, xA, xB, zWall, xKa, xKb, zK, xPk, zPk, f, s) {
+    F(L, [[xA,y,0],[xB,y,0],[xB,y,zWall],[xKb,y,zK],[xPk,y,zPk],[xKa,y,zK],[xA,y,zWall]], f, s, 0.8);
+  }
+  // gambrel roof: two slopes per face (steep lower ~60deg, shallow upper). Knuckle at KH of the
+  // half-span in / KV of the rise up — 2nd-floor windows live in the steep lower slope, high off
+  // the wall. Returns a gable-compatible object plus knuckle data so dormers ride the lower slope.
+  function gambrelRoofOver(L, GL, x0, y0, x1, y1, zE, minRise, pitchOv) {
+    var W = x1 - x0, Dd = y1 - y0, ov = OVH, alongX = W >= Dd, span = alongX ? Dd : W;
+    var p = pitchOv != null ? pitchOv : (SPEC.pitch != null ? SPEC.pitch : 1);
+    var rise = Math.max((span / 2) * 0.9 * Math.max(p, 0.08), minRise || 0), zR = zE + rise;
+    var KH = 0.42, KV = 0.64, zK = zE + rise * KV;
+    if (alongX) {
+      var yC = (y0 + y1) / 2, yKa = y0 + (yC - y0) * KH, yKb = y1 - (y1 - yC) * KH;
+      roofPlane(L, x0 - ov, x1 + ov, y0 - ov, zE, yKa, zK, C.roofF, C.roofS, 0.85);                 // front lower (steep)
+      roofPlane(L, x0 - ov, x1 + ov, yKa, zK, yC, zR, C.roofF, C.roofS, 0.85);                       // front upper (shallow)
+      F(L, [[x0-ov,y1+ov,zE],[x1+ov,y1+ov,zE],[x1+ov,yKb,zK],[x0-ov,yKb,zK]], C.roofDk, C.roofSdk, 0.7);   // back lower
+      F(L, [[x0-ov,yKb,zK],[x1+ov,yKb,zK],[x1+ov,yC,zR],[x0-ov,yC,zR]], C.roofDk, C.roofSdk, 0.7);          // back upper
+      gambrelEnd(L, x0, y0, y1, zE, yKa, yKb, zK, yC, zR, C.gableF, C.gableS);
+      gambrelEnd(L, x1, y0, y1, zE, yKa, yKb, zK, yC, zR, C.gableF, C.gableS);
+      return { axis: 'x', front: y0, back: y1, eave: zE, ridge: zR, mid: yC, a: x0, b: x1, knuckleZ: zK, knuckleFront: yKa, knuckleBack: yKb };
+    }
+    var xC = (x0 + x1) / 2, xKa = x0 + (xC - x0) * KH, xKb = x1 - (x1 - xC) * KH;
+    F(L, [[x0-ov,y0-ov,zE],[x0-ov,y1+ov,zE],[xKa,y1+ov,zK],[xKa,y0-ov,zK]], C.roofF, C.roofS, 0.85);       // left lower
+    F(L, [[xKa,y0-ov,zK],[xKa,y1+ov,zK],[xC,y1+ov,zR],[xC,y0-ov,zR]], C.roofF, C.roofS, 0.85);             // left upper
+    F(L, [[x1+ov,y0-ov,zE],[x1+ov,y1+ov,zE],[xKb,y1+ov,zK],[xKb,y0-ov,zK]], C.roofDk, C.roofSdk, 0.7);     // right lower
+    F(L, [[xKb,y0-ov,zK],[xKb,y1+ov,zK],[xC,y1+ov,zR],[xC,y0-ov,zR]], C.roofDk, C.roofSdk, 0.7);           // right upper
+    gambrelEndY(L, y0, x0, x1, zE, xKa, xKb, zK, xC, zR, C.gableF, C.gableS);
+    gambrelEndY(L, y1, x0, x1, zE, xKa, xKb, zK, xC, zR, C.gableF, C.gableS);
+    return { axis: 'y', eave: zE, ridge: zR };
+  }
+
+  function hipRoofOver(L, GL, x0, y0, x1, y1, zE, minRise) {
+    var W = x1 - x0, Dd = y1 - y0, ov = OVH, span = Math.min(W, Dd);
+    var rise = Math.max(_roofRise(span), minRise || 0), zR = zE + rise, inset = span / 2;
+    if (Dd > W) {   // deeper than wide → ridge runs along y, not a pyramid
+      var xC = (x0 + x1) / 2, a = y0 + inset, b = y1 - inset;
+      if (b < a) { a = b = (y0 + y1) / 2; }
+      F(L, [[x0-ov,y0-ov,zE],[x0-ov,y1+ov,zE],[xC,b,zR],[xC,a,zR]], C.roofF, C.roofS, 0.85);   // left
+      F(L, [[x1+ov,y0-ov,zE],[x1+ov,y1+ov,zE],[xC,b,zR],[xC,a,zR]], C.roofDk, C.roofSdk, 0.7); // right
+      F(L, [[x0-ov,y0-ov,zE],[x1+ov,y0-ov,zE],[xC,a,zR]], C.roofF, C.roofS, 0.8);              // front hip
+      F(L, [[x0-ov,y1+ov,zE],[x1+ov,y1+ov,zE],[xC,b,zR]], C.roofDk, C.roofSdk, 0.7);           // back hip
+      return { axis: 'y', front: y0, eave: zE, ridge: zR, mid: xC, a: x0, b: x1 };
+    }
+    var yC = (y0 + y1) / 2;
+    var a = x0 + inset, b = x1 - inset; if (b < a) { a = b = (x0 + x1) / 2; }
+    F(L, [[x0-ov,y0-ov,zE],[x1+ov,y0-ov,zE],[b,yC,zR],[a,yC,zR]], C.roofF, C.roofS, 0.85);   // front
+    F(L, [[x0-ov,y1+ov,zE],[x1+ov,y1+ov,zE],[b,yC,zR],[a,yC,zR]], C.roofDk, C.roofSdk, 0.7); // back
+    F(L, [[x0-ov,y0-ov,zE],[x0-ov,y1+ov,zE],[a,yC,zR]], C.roofF, C.roofS, 0.8);              // left hip
+    F(L, [[x1+ov,y0-ov,zE],[x1+ov,y1+ov,zE],[b,yC,zR]], C.roofDk, C.roofSdk, 0.7);           // right hip
+    return { axis: 'x', front: y0, eave: zE, ridge: zR, mid: yC, a: a, b: b };
+  }
+
+  function flatRoofOver(L, GL, x0, y0, x1, y1, zTop) {
+    var ov = OVH * 0.5;
+    F(L, [[x0-ov,y0-ov,zTop],[x1+ov,y0-ov,zTop],[x1+ov,y1+ov,zTop],[x0-ov,y1+ov,zTop]], C.roofF, C.roofS, 0.85);
+    extWalls(L, x0 - ov, y0 - ov, x1 + ov, y1 + ov, zTop, zTop + 1.0);   // parapet
+    return { axis: 'flat', eave: zTop, ridge: zTop + 1.0 };
+  }
+
+  function dormersOn(L, GL, roof, count, wSt, rear, positions, states) {
+    wSt = wSt || 'off';
+    var nD = positions && positions.length ? positions.length : count;
+    if (!nD || nD < 1 || !roof || roof.axis !== 'x') return;
+    var a = roof.a, b = roof.b, eave = roof.eave, ridge = roof.ridge, mid = roof.mid;
+    if (roof.knuckleZ != null) { ridge = roof.knuckleZ; mid = rear ? roof.knuckleBack : roof.knuckleFront; }  // gambrel: dormers ride the steep lower slope
+    var edge = rear ? (roof.back != null ? roof.back : (2 * mid - roof.front)) : roof.front;
+    var sgn = rear ? -1 : 1;
+    var slope = (mid - edge) !== 0 ? (ridge - eave) / Math.abs(mid - edge) : 0;
+    var dw = 5, proj = 5.5, i;
+    for (i = 0; i < nD; i++) {
+      var frac = positions && positions.length ? positions[i] : (i + 1) / (nD + 1);
+      var cx = a + (b - a) * frac;
+      var yFace = edge + sgn * 1.4, yBack = edge + sgn * proj;
+      var zBack = eave + Math.abs(yBack - edge) * slope;
+      var zSill = eave + 0.9, zHead = zSill + 3.4, zPk = zHead + 1.5, out = sgn * -0.06;
+      F(L, [[cx-dw/2,yFace,zSill],[cx+dw/2,yFace,zSill],[cx+dw/2,yFace,zHead],[cx-dw/2,yFace,zHead]], 'rgba(14,30,44,0.97)', C.wallS, 0.7);
+      F(L, [[cx-dw/2,yFace,zHead],[cx+dw/2,yFace,zHead],[cx,yFace,zPk]], 'rgba(14,30,44,0.97)', C.wallS, 0.7);
+      F(L, [[cx-dw/2,yFace,zSill],[cx-dw/2,yFace,zHead],[cx-dw/2,yBack,zBack]], 'rgba(9,22,34,0.94)', C.roofSdk, 0.55);   // cheek L
+      F(L, [[cx+dw/2,yFace,zSill],[cx+dw/2,yFace,zHead],[cx+dw/2,yBack,zBack]], 'rgba(9,22,34,0.94)', C.roofSdk, 0.55);   // cheek R
+      F(L, [[cx-dw/2,yFace,zHead],[cx,yFace,zPk],[cx,yBack,zBack],[cx-dw/2,yBack,zBack]], C.roofF, C.roofS, 0.6);         // gable slope L
+      F(L, [[cx+dw/2,yFace,zHead],[cx,yFace,zPk],[cx,yBack,zBack],[cx+dw/2,yBack,zBack]], C.roofF, C.roofS, 0.6);         // gable slope R
+      var _dst = (states && states[i] != null) ? states[i] : wSt;
+      winY(L, GL, yFace, cx - 1.7, cx + 1.7, zSill + 0.3, zHead - 0.3, _dst, true, out);
+    }
+  }
+
+  function garageDoorsOn(L, GL, x0, x1, yF, state, baysState) {
+    var bays = SPEC.garageBays > 0 ? SPEC.garageBays : 3, gap = 1.8;
+    var W = x1 - x0, dw = (W - gap * (bays + 1)) / bays, z0 = 0.4, z1 = 7.2, n = -0.06, i, gx, k;
+    if (dw <= 1) { gap = 0.6; dw = (W - gap * (bays + 1)) / bays; }
+    if (dw <= 0) return;
+    var litD = state === 'on' || state === 'dom';
+    var f = litD ? C.doorOn : C.doorOff, s = litD ? C.glassOn : C.doorS;
+    for (i = 0; i < bays; i++) {
+      gx = x0 + gap + i * (dw + gap);
+      var bayOpen = baysState && baysState[i] && baysState[i].open;
+      if (bayOpen) {
+        // door rolled up: amber opening + a raised panel at the top
+        F(L, [[gx,yF+n-0.35,z0],[gx+dw,yF+n-0.35,z0],[gx+dw,yF+n-0.35,z1-1.4],[gx,yF+n-0.35,z1-1.4]], 'rgba(255,170,40,0.12)', C.doorOpenS, 0.6, { cls: 'door-open' });
+        F(L, [[gx,yF+n,z1-1.4],[gx+dw,yF+n,z1-1.4],[gx+dw,yF+n,z1],[gx,yF+n,z1]], C.doorOpen, C.doorOpenS, 1.0, { cls: 'gdoor door-open' });
+        if (GL) GL.push({ p: [[gx-1.2,yF+n,z0],[gx+dw+1.2,yF+n,z0],[gx+dw+1.2,yF+n,z1+1.2],[gx-1.2,yF+n,z1+1.2]], f: C.doorOpenGlow });
+      } else {
+        F(L, [[gx,yF+n,z0],[gx+dw,yF+n,z0],[gx+dw,yF+n,z1],[gx,yF+n,z1]], f, s, 1.0, { cls: 'gdoor' });
+        for (k = 1; k < 4; k++) { var zz = z0 + (z1 - z0) * k / 4; F(L, [[gx,yF+n,zz],[gx+dw,yF+n,zz]], 'none', s, 0.45); }
+        if (litD && GL) GL.push({ p: [[gx-1.2,yF+n,z0],[gx+dw+1.2,yF+n,z0],[gx+dw+1.2,yF+n,z1+1.2],[gx-1.2,yF+n,z1+1.2]], f: C.glowOn });
+      }
+    }
+  }
+
+  function chimneyAt(L, xEdge, yc, zTop, outward) {
+    var ya = yc - 1.8, yb = yc + 1.8, x0 = xEdge, x1 = xEdge + outward * 2.2;
+    F(L, [[x1,ya,0],[x1,yb,0],[x1,yb,zTop],[x1,ya,zTop]], C.chimF, C.chimS, 0.7);
+    F(L, [[x0,ya,0],[x1,ya,0],[x1,ya,zTop],[x0,ya,zTop]], 'rgba(8,19,29,0.97)', C.chimS, 0.6);
+    F(L, [[x0,yb,0],[x1,yb,0],[x1,yb,zTop],[x0,yb,zTop]], 'rgba(8,19,29,0.97)', C.dim, 0.5);
+    F(L, [[x0,ya,zTop],[x1,ya,zTop],[x1,yb,zTop],[x0,yb,zTop]], 'rgba(0,242,254,0.08)', C.chimS, 0.5);
+  }
+  // #324: a free-standing chimney stack that rises through the roof at an
+  // interior (x,y) — a European central chimney, vs chimneyAt's edge stack.
+  function chimneyStack(L, cx, cy, zBase, zTop) {
+    var r = 1.3, xa = cx - r, xb = cx + r, ya = cy - r, yb = cy + r;
+    F(L, [[xb,ya,zBase],[xb,yb,zBase],[xb,yb,zTop],[xb,ya,zTop]], C.chimF, C.chimS, 0.7);               // east
+    F(L, [[xa,ya,zBase],[xa,yb,zBase],[xa,yb,zTop],[xa,ya,zTop]], 'rgba(8,19,29,0.97)', C.dim, 0.5);    // west
+    F(L, [[xa,ya,zBase],[xb,ya,zBase],[xb,ya,zTop],[xa,ya,zTop]], 'rgba(8,19,29,0.97)', C.chimS, 0.6);  // front
+    F(L, [[xa,yb,zBase],[xb,yb,zBase],[xb,yb,zTop],[xa,yb,zTop]], 'rgba(8,19,29,0.97)', C.dim, 0.5);    // back
+    F(L, [[xa,ya,zTop],[xb,ya,zTop],[xb,yb,zTop],[xa,yb,zTop]], 'rgba(0,242,254,0.08)', C.chimS, 0.5);  // cap
+  }
+
+  // A Bilco-style bulkhead cellar door: a sloped wedge against the wall, high at
+  // the house and low at the outer edge, split into two door panels (v7.94.0).
+  function bulkheadDoor(L, GL, wall, cx, cy, w, open) {
+    var depth = Math.max(w, 5.5), zHigh = 3.2, zLow = 0.2;   // ~28\u00b0 slope, low enough to clear windows
+    var f = open ? C.doorOpen : C.doorOff, s = open ? C.doorOpenS : C.doorS, cls = open ? 'cellar-door door-open' : 'cellar-door';
+    var dk = 'rgba(9,22,34,0.94)';
+    if (wall === 'front' || wall === 'back') {
+      var sgn = wall === 'front' ? -1 : 1, yw = cy, yo = cy + sgn * depth;
+      F(L, [[cx-w/2,yw,zHigh],[cx,yw,zHigh],[cx,yo,zLow],[cx-w/2,yo,zLow]], f, s, 0.9, { cls: cls });      // left panel
+      F(L, [[cx,yw,zHigh],[cx+w/2,yw,zHigh],[cx+w/2,yo,zLow],[cx,yo,zLow]], f, s, 0.9, { cls: cls });      // right panel
+      F(L, [[cx-w/2,yw,0],[cx-w/2,yw,zHigh],[cx-w/2,yo,zLow],[cx-w/2,yo,0]], dk, s, 0.6);                  // left side
+      F(L, [[cx+w/2,yw,0],[cx+w/2,yw,zHigh],[cx+w/2,yo,zLow],[cx+w/2,yo,0]], dk, s, 0.6);                  // right side
+      F(L, [[cx-w/2,yo,0],[cx+w/2,yo,0],[cx+w/2,yo,zLow],[cx-w/2,yo,zLow]], dk, s, 0.6);                   // outer end
+    } else {
+      var sgnx = wall === 'left' ? -1 : 1, xw = cx, xo = cx + sgnx * depth;
+      F(L, [[xw,cy-w/2,zHigh],[xw,cy,zHigh],[xo,cy,zLow],[xo,cy-w/2,zLow]], f, s, 0.9, { cls: cls });
+      F(L, [[xw,cy,zHigh],[xw,cy+w/2,zHigh],[xo,cy+w/2,zLow],[xo,cy,zLow]], f, s, 0.9, { cls: cls });
+      F(L, [[xw,cy-w/2,0],[xw,cy-w/2,zHigh],[xo,cy-w/2,zLow],[xo,cy-w/2,0]], dk, s, 0.6);
+      F(L, [[xw,cy+w/2,0],[xw,cy+w/2,zHigh],[xo,cy+w/2,zLow],[xo,cy+w/2,0]], dk, s, 0.6);
+      F(L, [[xo,cy-w/2,0],[xo,cy+w/2,0],[xo,cy+w/2,zLow],[xo,cy-w/2,zLow]], dk, s, 0.6);
+    }
+    if (open && GL) GL.push({ p: [[cx-w/2,cy,zHigh],[cx+w/2,cy,zHigh],[cx+w/2,cy,zHigh+1.5],[cx-w/2,cy,zHigh+1.5]], f: C.doorOpenGlow });
+  }
+
+  // A door on a footprint wall, open (swung) or closed, for placed exterior/cellar doors (v7.94.0).
+  // A cased opening (open doorway / pass-through): a doorway frame with no leaf —
+  // you see straight through it. Always open; marks a visual + flow connection
+  // between the two rooms the wall separates (v7.94.0).
+  function casedOnWall(L, GL, wall, cx, cy, w, z0, z1) {
+    var horiz = (wall === 'front' || wall === 'back');
+    var f = 'rgba(70,120,150,0.12)', s = 'rgba(120,185,215,0.8)';
+    if (horiz) {
+      var yy = cy + (wall === 'front' ? -0.06 : 0.06);
+      F(L, [[cx-w/2,yy,z0],[cx+w/2,yy,z0],[cx+w/2,yy,z1],[cx-w/2,yy,z1]], f, s, 0.7, { cls: 'cased' });
+    } else {
+      var xx = cx + (wall === 'left' ? -0.06 : 0.06);
+      F(L, [[xx,cy-w/2,z0],[xx,cy+w/2,z0],[xx,cy+w/2,z1],[xx,cy-w/2,z1]], f, s, 0.7, { cls: 'cased' });
+    }
+  }
+  function doorOnWall(L, GL, wall, cx, cy, w, z0, z1, open) {
+    var horiz = (wall === 'front' || wall === 'back');
+    var f = open ? C.doorOpen : C.doorOff, s = open ? C.doorOpenS : C.doorS, cls = open ? 'door door-open' : 'door';
+    var ang = 55 * Math.PI / 180;
+    if (horiz) {
+      var n = wall === 'front' ? -0.06 : 0.06, yy = cy + n;
+      if (!open) { F(L, [[cx-w/2,yy,z0],[cx+w/2,yy,z0],[cx+w/2,yy,z1],[cx-w/2,yy,z1]], f, s, 0.9, { cls: cls }); }
+      else {
+        var dir = wall === 'front' ? -1 : 1, dx = w * Math.cos(ang), dy = dir * w * Math.sin(ang);
+        F(L, [[cx-w/2,yy,z0],[cx-w/2+dx,yy+dy,z0],[cx-w/2+dx,yy+dy,z1],[cx-w/2,yy,z1]], f, s, 0.9, { cls: cls });
+        if (GL) GL.push({ p: [[cx-w/2-1,yy,z0],[cx+w/2+1,yy,z0],[cx+w/2+1,yy+dy,z1+1],[cx-w/2-1,yy+dy,z1+1]], f: C.doorOpenGlow });
+      }
+    } else {
+      var nx = wall === 'left' ? -0.06 : 0.06, xx = cx + nx;
+      if (!open) { F(L, [[xx,cy-w/2,z0],[xx,cy+w/2,z0],[xx,cy+w/2,z1],[xx,cy-w/2,z1]], f, s, 0.9, { cls: cls }); }
+      else {
+        var dir2 = wall === 'left' ? -1 : 1, dx2 = dir2 * w * Math.sin(ang), dy2 = w * Math.cos(ang);
+        F(L, [[xx,cy-w/2,z0],[xx+dx2,cy-w/2+dy2,z0],[xx+dx2,cy-w/2+dy2,z1],[xx,cy-w/2,z1]], f, s, 0.9, { cls: cls });
+        if (GL) GL.push({ p: [[xx,cy-w/2-1,z0],[xx+dx2,cy+w/2+1,z0],[xx+dx2,cy+w/2+1,z1+1],[xx,cy-w/2-1,z1+1]], f: C.doorOpenGlow });
+      }
+    }
+  }
+
+  // Clean exterior shell for the whole-house view — presence shows as lit
+  // windows, exactly like the original approved model, but built from the
+  // editor's footprint + rooms + home type (v7.94.0).
+  function buildExteriorFromPlan(opts, plan, minx, miny, maxx, maxy, ztop) {
+    var lit = opts.lit || {}, L = [], GL = [], LBL = [];
+    var wOf = function (n) { var s = lit[String(n).toLowerCase()]; return s === 'dom' ? 'dom' : s ? 'on' : 'off'; };
+    var stories = SPEC.stories != null ? SPEC.stories : 1.5;
+    var has2f = !!(plan['2f'] && plan['2f'].length);
+    var rt = SPEC.roof || 'gable';
+    var eave = (rt !== 'flat' && stories < 2 && has2f) ? _oneFloorTop() : ztop;
+    var minRise = (rt !== 'flat' && stories < 2 && has2f) ? (ztop - eave) + 2.5 : 0;
+
+    if ((plan['1f'] || []).length) extWallsPoly(L, plan['1f'], 0, eave);
+    else extWalls(L, minx, miny, maxx, maxy, 0, eave);
+
+    var TOL = 1.5, EDGE = 3, z0 = 3, z1 = 7, garageRoom = null;
+    (plan['1f'] || []).forEach(function (r) { if (String(r.name).toLowerCase().indexOf('garage') >= 0 && !garageRoom) garageRoom = r; });
+
+    // Returns true when (cx,cy) is inside room r or within 1 unit of its boundary.
+    // Uses bbox fast-path; for polygon rooms adds a pip + edge-proximity check so
+    // the notch of an L-shaped room is not falsely matched.
+    var _inRoom = function (r, cx, cy) {
+      if (!(cx >= r.x - 1 && cx <= r.x + r.w + 1 && cy >= r.y - 1 && cy <= r.y + r.d + 1)) return false;
+      if (!r.points || r.points.length < 3) return true;
+      var pts = r.points, inside = false;
+      for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        var xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+        if (((yi > cy) !== (yj > cy)) && (cx < (xj - xi) * (cy - yi) / (yj - yi) + xi)) inside = !inside;
+        var dx = xj - xi, dy = yj - yi, L2 = dx * dx + dy * dy;
+        if (L2 > 0) { var t = Math.max(0, Math.min(1, ((cx - xi) * dx + (cy - yi) * dy) / L2)); var ex = xi + t * dx - cx, ey = yi + t * dy - cy; if (ex * ex + ey * ey <= 1) return true; }
+      }
+      return inside;
+    };
+    var winOcc = function (cx, cy) {
+      var best = 'off';
+      (plan['1f'] || []).forEach(function (r) {
+        if (_inRoom(r, cx, cy)) { var s = wOf(r.name); if (s === 'dom') best = 'dom'; else if (s === 'on' && best !== 'dom') best = 'on'; }
+      });
+      return best;
+    };
+    var winOcc2f = function (cx, cy) {
+      var best = 'off';
+      (plan['2f'] || []).forEach(function (r) {
+        if (_inRoom(r, cx, cy)) { var s = wOf(r.name); if (s === 'dom') best = 'dom'; else if (s === 'on' && best !== 'dom') best = 'on'; }
+      });
+      return best;
+    };
+    var wallXY = function (wall, p) {
+      if (wall === 'front') return [minx + p * (maxx - minx), miny];
+      if (wall === 'back') return [minx + p * (maxx - minx), maxy];
+      if (wall === 'left') return [minx, miny + p * (maxy - miny)];
+      return [maxx, miny + p * (maxy - miny)];
+    };
+    var placed = ((opts.elements && opts.elements['1f']) || []).filter(function (e) { return e.type === 'window' || (e.type === 'door' && e.kind !== 'interior' && e.kind !== 'cased'); });
+
+    if (placed.length) {
+      // user-placed exterior openings — windows lit by the room they front, doors open/closed from their sensor
+      placed.forEach(function (e) {
+        var p = e.pos != null ? e.pos : 0.5, w = e.w || 4, horiz = (e.wall === 'front' || e.wall === 'back');
+        var xy = (e.x != null) ? [e.x, e.y] : wallXY(e.wall, p), cx = xy[0], cy = xy[1];
+        if (e.type === 'window') {
+          var st = winOcc(cx, cy);
+          if (horiz) winY(L, GL, cy, cx - w / 2, cx + w / 2, z0, z1, st, true, e.wall === 'front' ? -0.06 : 0.06);
+          else winX(L, GL, cx, cy - w / 2, cy + w / 2, z0, z1, st, true, e.wall === 'left' ? -0.06 : 0.06);
+        } else if (e.kind === 'cellar') {
+          bulkheadDoor(L, GL, e.wall, cx, cy, Math.max(w, 5), e.open);
+        } else {
+          doorOnWall(L, GL, e.wall, cx, cy, Math.max(w, 3), 0.4, 6.8, e.open);
+        }
+      });
+    } else {
+      // auto: a window on each room's exterior-facing wall (fallback when nothing placed)
+      (plan['1f'] || []).forEach(function (r) {
+        if (String(r.name).toLowerCase().indexOf('garage') >= 0) return;
+        if (r.type && r.type !== 'room' && r.type !== 'bath') return;
+        var x0r = r.x, x1r = r.x + r.w, y0r = r.y, y1r = r.y + r.d, st = wOf(r.name);
+        if (x1r - x0r < 6 || y1r - y0r < 6) return;
+        if (Math.abs(y0r - miny) < TOL) winY(L, GL, miny, x0r + EDGE, x1r - EDGE, z0, z1, st, true, -0.06);
+        if (Math.abs(y1r - maxy) < TOL) winY(L, GL, maxy, x0r + EDGE, x1r - EDGE, z0, z1, st, true, 0.06);
+        if (Math.abs(x0r - minx) < TOL) winX(L, GL, minx, y0r + EDGE, y1r - EDGE, z0, z1, st, true, -0.06);
+        if (Math.abs(x1r - maxx) < TOL) winX(L, GL, maxx, y0r + EDGE, y1r - EDGE, z0, z1, st, true, 0.06);
+      });
+    }
+
+    if (garageRoom) {
+      var g = garageRoom;
+      var gy = Math.abs(g.y - miny) < TOL ? miny : (Math.abs(g.y + g.d - maxy) < TOL ? maxy : g.y);
+      garageDoorsOn(L, GL, g.x + 0.5, g.x + g.w - 0.5, gy, wOf(g.name), opts.garage);
+    }
+
+    var roof, gLow = ((rt === 'gable' || rt === 'gambrel') && garageRoom && garageRoom.w > 8);
+    // Shared-roof attachment (UK semi/terrace): the main mass's roofed span is
+    // widened by one house-width across the party wall so the ridge lands above
+    // it — one continuous roof for the pair, not two parallel gables.
+    var attach = SPEC.attached || 'none';
+    var _mCnt = _footprintMasses(plan['1f'] || []).length;
+    var _roofExt = function (m, isMain) {
+      var r = { x0: m.x0, y0: m.y0, x1: m.x1, y1: m.y1 };
+      if (attach === 'none' || !isMain) return r;
+      var w = r.x1 - r.x0, h = r.y1 - r.y0;
+      if (attach === 'left' || attach === 'both') r.x0 -= w;
+      if (attach === 'right' || attach === 'both') r.x1 += w;
+      if (attach === 'top') r.y0 -= h;
+      if (attach === 'bottom') r.y1 += h;
+      return r;
+    };
+    // Per-building roof: a room may carry `roof` — the first override found
+    // inside a mass wins (merged masses are one building, so they can't split).
+    var _roomRoof = function (m) {
+      var t = null;
+      (plan['1f'] || []).forEach(function (r) {
+        if (t || !r.roof) return;
+        // Any corner (or polygon vertex) inside the mass counts as membership —
+        // an L-room decomposes into several masses and must carry its override
+        // to all of them, not just the one holding its centre.
+        var pts = [[r.x, r.y], [r.x + r.w, r.y], [r.x + r.w, r.y + r.d], [r.x, r.y + r.d], [r.x + r.w / 2, r.y + r.d / 2]];
+        (r.points || []).forEach(function (p) { pts.push(p); });
+        for (var i = 0; i < pts.length; i++) {
+          var p = pts[i];
+          if (p[0] >= m.x0 - 0.01 && p[0] <= m.x1 + 0.01 && p[1] >= m.y0 - 0.01 && p[1] <= m.y1 + 0.01) { t = r.roof; break; }
+        }
+      });
+      return t || rt;
+    };
+    // Extra roof styles — each draws into L and returns {a,b} for dormer refs.
+    function shedRoofOver(L, GL, x0, y0, x1, y1, eave, rise) {   // lean-to: one slope, high at front
+      var z0 = eave + (rise || _roofRise(y1 - y0));
+      F(L, [[x0,y0,z0],[x1,y0,z0],[x1,y1,eave],[x0,y1,eave]], C.roofF, C.roofS, 1);
+      F(L, [[x0,y0,eave],[x1,y0,eave],[x1,y0,z0],[x0,y0,z0]], C.wallF, C.wallS, 1);          // raised front fascia
+      F(L, [[x0,y0,eave],[x0,y0,z0],[x0,y1,eave]], C.roofF, C.roofS, 1);
+      F(L, [[x1,y0,eave],[x1,y0,z0],[x1,y1,eave]], C.roofF, C.roofS, 1);
+      return { a: x0, b: x1 };
+    }
+    function mansardOver(L, GL, x0, y0, x1, y1, eave, rise) {    // steep skirt ring + flat cap
+      var rs = rise || _roofRise(Math.min(x1 - x0, y1 - y0)), z1 = eave + rs;
+      var ix0 = x0 + (x1 - x0) * 0.2, ix1 = x1 - (x1 - x0) * 0.2, iy0 = y0 + (y1 - y0) * 0.2, iy1 = y1 - (y1 - y0) * 0.2;
+      F(L, [[x0,y0,eave],[x1,y0,eave],[ix1,iy0,z1],[ix0,iy0,z1]], C.roofF, C.roofS, 1);
+      F(L, [[x0,y1,eave],[x1,y1,eave],[ix1,iy1,z1],[ix0,iy1,z1]], C.roofF, C.roofS, 1);
+      F(L, [[x0,y0,eave],[x0,y1,eave],[ix0,iy1,z1],[ix0,iy0,z1]], C.roofF, C.roofS, 1);
+      F(L, [[x1,y0,eave],[x1,y1,eave],[ix1,iy1,z1],[ix1,iy0,z1]], C.roofF, C.roofS, 1);
+      F(L, [[ix0,iy0,z1],[ix1,iy0,z1],[ix1,iy1,z1],[ix0,iy1,z1]], C.roofF, C.roofS, 1);
+      return { a: x0, b: x1 };
+    }
+    function butterflyOver(L, GL, x0, y0, x1, y1, eave, rise) {  // inverted: valley at the centre
+      var cx = (x0 + x1) / 2, zl = eave - Math.max(1.5, (rise || _roofRise(x1 - x0)) * 0.4);
+      F(L, [[x0,y0,eave],[x0,y1,eave],[cx,y1,zl],[cx,y0,zl]], C.roofF, C.roofS, 1);
+      F(L, [[x1,y0,eave],[x1,y1,eave],[cx,y1,zl],[cx,y0,zl]], C.roofF, C.roofS, 1);
+      F(L, [[x0,y0,eave],[x1,y0,eave],[cx,y0,zl]], C.roofF, C.roofS, 1);
+      F(L, [[x0,y1,eave],[x1,y1,eave],[cx,y1,zl]], C.roofF, C.roofS, 1);
+      return { a: x0, b: x1 };
+    }
+    function mshapeOver(L, GL, x0, y0, x1, y1, eave, rise) {     // twin gables side by side
+      var cx = (x0 + x1) / 2;
+      gableRoofOver(L, GL, x0, y0, cx, y1, eave, rise);
+      return gableRoofOver(L, GL, cx, y0, x1, y1, eave, rise);
+    }
+    function crossGableOver(L, GL, x0, y0, x1, y1, eave, rise) { // main gable + perpendicular wing
+      var r = gableRoofOver(L, GL, x0, y0, x1, y1, eave, rise);
+      var pk = eave + (rise || _roofRise(Math.min(x1 - x0, y1 - y0))) * 0.8;
+      var wy0 = y0 + (y1 - y0) * 0.3, wy1 = y0 + (y1 - y0) * 0.7, wx0 = x0 + (x1 - x0) * 0.12, wx1 = x1 - (x1 - x0) * 0.12;
+      if (r.axis === 'x') {   // main ridge along x → wing ridge along y
+        var rcx = (wx0 + wx1) / 2;
+        F(L, [[wx0,wy0,eave],[wx0,wy1,eave],[rcx,wy1,pk],[rcx,wy0,pk]], C.roofF, C.roofS, 1);
+        F(L, [[wx1,wy0,eave],[wx1,wy1,eave],[rcx,wy1,pk],[rcx,wy0,pk]], C.roofDk, C.roofSdk, 0.7);
+        F(L, [[wx0,wy0,eave],[wx1,wy0,eave],[rcx,wy0,pk]], C.roofF, C.roofS, 1);
+        F(L, [[wx0,wy1,eave],[wx1,wy1,eave],[rcx,wy1,pk]], C.roofDk, C.roofSdk, 0.7);
+      } else {                // main ridge along y → wing ridge along x
+        var rc = (wy0 + wy1) / 2;
+        F(L, [[wx0,wy0,eave],[wx1,wy0,eave],[wx1,rc,pk],[wx0,rc,pk]], C.roofF, C.roofS, 1);
+        F(L, [[wx0,wy1,eave],[wx1,wy1,eave],[wx1,rc,pk],[wx0,rc,pk]], C.roofDk, C.roofSdk, 0.7);
+        F(L, [[wx0,wy0,eave],[wx0,wy1,eave],[wx0,rc,pk]], C.roofF, C.roofS, 1);
+        F(L, [[wx1,wy0,eave],[wx1,wy1,eave],[wx1,rc,pk]], C.roofDk, C.roofSdk, 0.7);
+      }
+      return r;
+    }
+    function jerkinheadOver(L, GL, x0, y0, x1, y1, eave, rise) { // clipped gable — shortened ridge + hip end caps
+      var W = x1 - x0, Dd = y1 - y0, alongX = W >= Dd, span = alongX ? Dd : W;
+      var p = SPEC.pitch != null ? SPEC.pitch : 1;
+      var zR = eave + Math.max((span / 2) * 0.9 * Math.max(p, 0.08), rise || 0);
+      if (alongX) {   // ridge along x at yC, clipped at both x ends
+        var yC = (y0 + y1) / 2, clip = W * 0.15;
+        F(L, [[x0,y0,eave],[x1,y0,eave],[x1 - clip,yC,zR],[x0 + clip,yC,zR]], C.roofF, C.roofS, 0.85);   // front slope
+        F(L, [[x0,y1,eave],[x1,y1,eave],[x1 - clip,yC,zR],[x0 + clip,yC,zR]], C.roofDk, C.roofSdk, 0.7); // back slope
+        F(L, [[x0,y0,eave],[x0,y1,eave],[x0 + clip,yC,zR]], C.roofF, C.roofS, 0.8);                      // left hip cap
+        F(L, [[x1,y0,eave],[x1,y1,eave],[x1 - clip,yC,zR]], C.roofDk, C.roofSdk, 0.7);                   // right hip cap
+      } else {        // ridge along y at xC, clipped at both y ends
+        var xC = (x0 + x1) / 2, clip = Dd * 0.15;
+        F(L, [[x0,y0,eave],[x0,y1,eave],[xC,y1 - clip,zR],[xC,y0 + clip,zR]], C.roofF, C.roofS, 0.85);
+        F(L, [[x1,y0,eave],[x1,y1,eave],[xC,y1 - clip,zR],[xC,y0 + clip,zR]], C.roofDk, C.roofSdk, 0.7);
+        F(L, [[x0,y0,eave],[x1,y0,eave],[xC,y0 + clip,zR]], C.roofF, C.roofS, 0.8);
+        F(L, [[x0,y1,eave],[x1,y1,eave],[xC,y1 - clip,zR]], C.roofDk, C.roofSdk, 0.7);
+      }
+      return { a: x0, b: x1 };
+    }
+    function roofOver(L, GL, rt, x0, y0, x1, y1, eave, rise, ztop) {
+      if (rt === 'flat')        return flatRoofOver(L, GL, x0, y0, x1, y1, ztop || eave);
+      if (rt === 'hip')         return hipRoofOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'gambrel')     return gambrelRoofOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'shed')        return shedRoofOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'mansard')     return mansardOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'butterfly')   return butterflyOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'mshape')      return mshapeOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'crossgable')  return crossGableOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'jerkinhead')  return jerkinheadOver(L, GL, x0, y0, x1, y1, eave, rise);
+      if (rt === 'hipvalley')   return hipRoofOver(L, GL, x0, y0, x1, y1, eave, rise);
+      return gableRoofOver(L, GL, x0, y0, x1, y1, eave, rise);   // gable / dormer / unknown
+    }
+    if (rt === 'flat' || rt === 'hip') {
+      // Per-mass: a flat or hip roof belongs to EACH building — one slab must
+      // never span from the main house across every detached outbuilding.
+      var _fm = _footprintMasses(plan['1f'] || []);
+      if (!_fm.length) _fm = [{ x0: minx, y0: miny, x1: maxx, y1: maxy }];
+      _fm.sort(function (a, b) { return (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0); });
+      _fm.forEach(function (m, mi) {
+        var _rs = _roofExt(m, mi === 0);
+        var _r = roofOver(L, GL, _roomRoof(m), _rs.x0, _rs.y0, _rs.x1, _rs.y1, eave, minRise, ztop);
+        if (mi === 0) roof = _r;
+      });
+    }
+    else if (gLow) {
+      // House = non-garage 1f rooms. If they nearly fill their bbox it's a rectangle -> one
+      // gable (un-roomed interior gaps don't fragment it); a real notch (<85%) -> per mass.
+      var houseRooms = (plan['1f'] || []).filter(function (r) { return r !== garageRoom && r.type !== 'outdoor' && r.type !== 'stairs' && r.type !== 'door'; });
+      var hb = null, harea = 0;
+      houseRooms.forEach(function (r) { harea += r.w * r.d; if (!hb) hb = { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.d }; else { hb.x0 = Math.min(hb.x0, r.x); hb.y0 = Math.min(hb.y0, r.y); hb.x1 = Math.max(hb.x1, r.x + r.w); hb.y1 = Math.max(hb.y1, r.y + r.d); } });
+      var hbArea = hb ? (hb.x1 - hb.x0) * (hb.y1 - hb.y0) : 0;
+      var houseRect = !hb || hbArea <= 0 || (harea / hbArea) >= 0.85;
+      if (!houseRect) {
+        var hmasses = _footprintMasses(houseRooms);
+        hmasses.sort(function (a, b) { return (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0); });
+        hmasses.forEach(function (m, mi) { var _rs = _roofExt(m, mi === 0); var _r = roofOver(L, GL, _roomRoof(m), _rs.x0, _rs.y0, _rs.x1, _rs.y1, eave, minRise, ztop); if (mi === 0) roof = _r; });
+      } else {
+        var _rsh = _roofExt({ x0: hb.x0, y0: hb.y0, x1: hb.x1, y1: hb.y1 }, true);
+        roof = roofOver(L, GL, _roomRoof({ x0: hb.x0, y0: hb.y0, x1: hb.x1, y1: hb.y1 }), _rsh.x0, _rsh.y0, _rsh.x1, _rsh.y1, eave, minRise, ztop);
+      }
+      // attached garage: low, shallow-pitch roof over its ACTUAL bbox (spans its real depth)
+      // — honor a per-room roof override when the user set one.
+      if (garageRoom.roof) roofOver(L, GL, garageRoom.roof, garageRoom.x, garageRoom.y, garageRoom.x + garageRoom.w, garageRoom.y + garageRoom.d, _oneFloorTop(), 0, ztop);
+      else gableRoofOver(L, GL, garageRoom.x, garageRoom.y, garageRoom.x + garageRoom.w, garageRoom.y + garageRoom.d, _oneFloorTop(), 0, 0.20);
+    } else {
+      var _masses = _footprintMasses(plan['1f'] || []);
+      if (_masses.length > 1) {   // irregular footprint (L/T) -> a gable per rectangular mass
+        _masses.sort(function (a, b) { return (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0); });
+        _masses.forEach(function (m, mi) {
+          var _rs = _roofExt(m, mi === 0);
+          var _r = roofOver(L, GL, _roomRoof(m), _rs.x0, _rs.y0, _rs.x1, _rs.y1, eave, minRise, ztop);
+          if (mi === 0) roof = _r;   // largest mass is the dormer reference
+        });
+      } else {
+        var _rs2 = _roofExt({ x0: minx, y0: miny, x1: maxx, y1: maxy }, _mCnt <= 1);
+        roof = roofOver(L, GL, _roomRoof({ x0: minx, y0: miny, x1: maxx, y1: maxy }), _rs2.x0, _rs2.y0, _rs2.x1, _rs2.y1, eave, minRise, ztop);
+      }
+    }
+
+    var d2 = 'off';
+    (plan['2f'] || []).forEach(function (r) { var s = wOf(r.name); if (s === 'dom') d2 = 'dom'; else if (s === 'on' && d2 !== 'dom') d2 = 'on'; });
+    if (rt !== 'flat') {
+      var dormF = ((opts.elements && opts.elements['2f']) || []).filter(function (e) { return e.type === 'dormer' && e.slope !== 'rear'; });
+      var dormR = ((opts.elements && opts.elements['2f']) || []).filter(function (e) { return e.type === 'dormer' && e.slope === 'rear'; });
+      // occupancy of the 2f room sitting under a dormer at fraction `frac` along the
+      // roof — so each dormer lights for ITS room, not the whole floor (v7.94.0).
+      var _dSt = function (frac) { var cx = roof.a + (roof.b - roof.a) * frac; var rm = (plan['2f'] || []).filter(function (r) { return cx >= r.x && cx <= r.x + r.w; })[0]; return rm ? wOf(rm.name) : 'off'; };
+      var _autoPos = function (n) { var ps = []; for (var k = 0; k < n; k++) ps.push((k + 1) / (n + 1)); return ps; };
+      if (dormF.length) { var _pf = dormF.map(function (e) { return e.pos != null ? e.pos : 0.5; }); dormersOn(L, GL, roof, 0, d2, false, _pf, _pf.map(_dSt)); }
+      else if (SPEC.dormersFront) { var _pfa = _autoPos(SPEC.dormersFront); dormersOn(L, GL, roof, 0, d2, false, _pfa, _pfa.map(_dSt)); }
+      if (dormR.length) { var _pr = dormR.map(function (e) { return e.pos != null ? e.pos : 0.5; }); dormersOn(L, GL, roof, 0, d2, true, _pr, _pr.map(_dSt)); }
+      else if (SPEC.dormersRear) { var _pra = _autoPos(SPEC.dormersRear); dormersOn(L, GL, roof, 0, d2, true, _pra, _pra.map(_dSt)); }
+    }
+
+    // Attached housing (UK semi / terrace): the neighbour's mirrored mass as a
+    // dim ghost — party wall + shared-roof read, without claiming lit windows.
+    var attach = SPEC.attached || 'none';
+    if (attach !== 'none') {
+      // Only the MAIN mass gets a neighbour — mirroring every mass would drop a
+      // ghost into the gap between the house and any detached outbuilding.
+      var _gm = _footprintMasses(plan['1f'] || []);
+      var _main = null;
+      _gm.forEach(function (m) { if (!_main || (m.x1 - m.x0) * (m.y1 - m.y0) > (_main.x1 - _main.x0) * (_main.y1 - _main.y0)) _main = m; });
+      if (!_main && (plan['1f'] || []).length) _main = { x0: minx, y0: miny, x1: maxx, y1: maxy };
+      var gFill = 'rgba(10,20,30,0.55)', gStroke = 'rgba(90,130,160,0.3)', gRoof = 'rgba(8,17,26,0.88)', gRoofS = 'rgba(90,130,160,0.22)';
+      if (_main) {
+        var m = _main, mw = m.x1 - m.x0, mh = m.y1 - m.y0;
+        [['left', m.x0 - mw, m.x0, m.y0, m.y1],
+         ['right', m.x1, m.x1 + mw, m.y0, m.y1],
+         ['top', m.x0, m.x1, m.y0 - mh, m.y0],
+         ['bottom', m.x0, m.x1, m.y1, m.y1 + mh]].forEach(function (s) {
+          // 'both' = terrace = left+right only; top/bottom ghosts would be unroofed
+          if (attach === 'both' ? (s[0] !== 'left' && s[0] !== 'right') : attach !== s[0]) return;
+          var gx0 = s[1], gx1 = s[2], gy0 = s[3], gy1 = s[4];
+          // Walls only — the widened main roof already spans this ghost mass,
+          // so the pair shares ONE roof instead of two parallel gables.
+          F(L, [[gx0,gy0,0],[gx1,gy0,0],[gx1,gy0,eave],[gx0,gy0,eave]], gFill, gStroke, 0.4);
+          F(L, [[gx0,gy1,0],[gx1,gy1,0],[gx1,gy1,eave],[gx0,gy1,eave]], gFill, gStroke, 0.4);
+          F(L, [[gx0,gy0,0],[gx0,gy1,0],[gx0,gy1,eave],[gx0,gy0,eave]], gFill, gStroke, 0.4);
+          F(L, [[gx1,gy0,0],[gx1,gy1,0],[gx1,gy1,eave],[gx1,gy0,eave]], gFill, gStroke, 0.4);
+        });
+      }
+    }
+
+    // 2nd-floor placed windows: side walls land on the gable ends, front/back on the
+    // roof slope (front-facing 2F windows are the dormers). Lit by upstairs occupancy.
+    var h2 = null;
+    (plan['2f'] || []).forEach(function (r) {
+      if (!h2) h2 = { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.d };
+      else { h2.x0 = Math.min(h2.x0, r.x); h2.y0 = Math.min(h2.y0, r.y); h2.x1 = Math.max(h2.x1, r.x + r.w); h2.y1 = Math.max(h2.y1, r.y + r.d); }
+    });
+    if (!h2) h2 = { x0: minx, y0: miny, x1: maxx, y1: maxy };
+    // 2nd-floor gable-end windows ride high on the gable, but clamped under the actual
+    // roofline at their position — so they clear the low garage roof yet never poke through
+    // the slope (v7.94.0). Front/back 2F glazing stays lower: that face is roof, so it reads
+    // as dormers. ridgeApprox = eave + minRise is the gable peak height (story-driven).
+    var gyC = (h2.y0 + h2.y1) / 2, gHalf = Math.max((h2.y1 - h2.y0) / 2, 0.1), ridgeApprox = eave + (minRise || 0);
+    ((opts.elements && opts.elements['2f']) || []).filter(function (e) { return e.type === 'window'; }).forEach(function (e) {
+      var p = e.pos != null ? e.pos : 0.5, w = e.w || 4;
+      if (e.x != null) {
+        // edge-anchored: resolved centre + cardinal hint from the real wall
+        if (e.wall === 'front' || e.wall === 'back') winY(L, GL, e.y, e.x - w / 2, e.x + w / 2, 10.8, 13.8, winOcc2f(e.x, e.y), true, e.wall === 'front' ? -0.3 : 0.3);
+        else {
+          var roofAtEx = eave + (1 - Math.min(1, Math.abs(e.y - gyC) / gHalf)) * (ridgeApprox - eave);
+          var zHiE = Math.min(15.0, roofAtEx - 0.5), zLoE = Math.max(zHiE - 2.8, 10.2);
+          winX(L, GL, e.x, e.y - w / 2, e.y + w / 2, zLoE, zHiE, winOcc2f(e.x, e.y), true, e.wall === 'left' ? -0.06 : 0.06);
+        }
+      } else if (e.wall === 'left' || e.wall === 'right') {
+        var xg = e.wall === 'left' ? ((h2.x0 - minx < 3) ? minx : h2.x0) : ((maxx - h2.x1 < 3) ? maxx : h2.x1), yc = h2.y0 + p * (h2.y1 - h2.y0);
+        var roofAtYc = eave + (1 - Math.min(1, Math.abs(yc - gyC) / gHalf)) * (ridgeApprox - eave);
+        var zHi = Math.min(15.0, roofAtYc - 0.5), zLo = Math.max(zHi - 2.8, 10.2);
+        winX(L, GL, xg, yc - w / 2, yc + w / 2, zLo, zHi, winOcc2f(xg, yc), true, e.wall === 'left' ? -0.06 : 0.06);
+      } else {
+        var cx2 = h2.x0 + p * (h2.x1 - h2.x0), yf = e.wall === 'front' ? h2.y0 + 3.5 : h2.y1 - 3.5;
+        winY(L, GL, yf, cx2 - w / 2, cx2 + w / 2, 10.8, 13.8, winOcc2f(cx2, yf), true, e.wall === 'front' ? -0.3 : 0.3);
+      }
+    });
+
+    // basement exterior openings — walkout doors / egress windows at grade (v7.94.0)
+    var hb = null;
+    (plan['bsmt'] || []).forEach(function (r) {
+      if (!hb) hb = { x0: r.x, y0: r.y, x1: r.x + r.w, y1: r.y + r.d };
+      else { hb.x0 = Math.min(hb.x0, r.x); hb.y0 = Math.min(hb.y0, r.y); hb.x1 = Math.max(hb.x1, r.x + r.w); hb.y1 = Math.max(hb.y1, r.y + r.d); }
+    });
+    var placedB = ((opts.elements && opts.elements['bsmt']) || []).filter(function (e) { return e.type === 'window' || (e.type === 'door' && e.kind !== 'interior' && e.kind !== 'cased'); });
+    if (hb && placedB.length) {
+      placedB.forEach(function (e) {
+        var p = e.pos != null ? e.pos : 0.5, w = e.w || 4, horiz = (e.wall === 'front' || e.wall === 'back'), cx, cy;
+        if (e.x != null) { cx = e.x; cy = e.y; }
+        else if (e.wall === 'front') { cx = hb.x0 + p * (hb.x1 - hb.x0); cy = miny; }
+        else if (e.wall === 'back') { cx = hb.x0 + p * (hb.x1 - hb.x0); cy = maxy; }
+        else if (e.wall === 'left') { cx = (hb.x0 - minx < 3) ? minx : hb.x0; cy = hb.y0 + p * (hb.y1 - hb.y0); }
+        else { cx = (maxx - hb.x1 < 3) ? maxx : hb.x1; cy = hb.y0 + p * (hb.y1 - hb.y0); }
+        if (e.type === 'window') {
+          if (horiz) winY(L, GL, cy, cx - w / 2, cx + w / 2, 0.6, 3.4, 'off', true, e.wall === 'front' ? -0.06 : 0.06);
+          else winX(L, GL, cx, cy - w / 2, cy + w / 2, 0.6, 3.4, 'off', true, e.wall === 'left' ? -0.06 : 0.06);
+        } else if (e.kind === 'cellar') {
+          bulkheadDoor(L, GL, e.wall, cx, cy, Math.max(w, 5), e.open);
+        } else {
+          doorOnWall(L, GL, e.wall, cx, cy, Math.max(w, 3), 0.3, 6.4, e.open);
+        }
+      });
+    }
+    // auto bulkhead only when nothing is placed on the 1st floor or basement —
+    // and not when the household says the basement is entered from INSIDE (the
+    // European norm: dig the hole, build on it, reach the cellar by interior
+    // stairs), which would make an exterior bulkhead plain wrong (#324).
+    if (SPEC.basementEntrance !== 'interior'
+        && !placed.length && !placedB.length && plan['bsmt'] && plan['bsmt'].length) {
+      bulkheadDoor(L, GL, 'back', (minx + maxx) / 2, maxy, 6, false);
+    }
+
+    // Chimney: single edge stack (right/left) as before, or one-or-more central
+    // stacks rising through the ridge (common on European houses) (#324).
+    var side = SPEC.chimney, yc = (miny + maxy) / 2;
+    var cn = Math.max(1, Math.min(4, Math.round(SPEC.chimneyCount || 1)));
+    var ridgeZ = (roof && roof.ridge != null) ? roof.ridge : ztop;
+    var _cfrac = function (i) { return (i + 1) / (cn + 1); };
+    var ci;
+    if (side === 'center') {
+      for (ci = 0; ci < cn; ci++) {
+        var ccx, ccy;
+        if (roof && roof.axis === 'x' && roof.a != null) { ccx = roof.a + (roof.b - roof.a) * _cfrac(ci); ccy = (roof.mid != null ? roof.mid : yc); }
+        else if (roof && roof.axis === 'y') { ccx = (minx + maxx) / 2; ccy = miny + (maxy - miny) * _cfrac(ci); }
+        else { ccx = minx + (maxx - minx) * _cfrac(ci); ccy = yc; }  // flat / unknown roof
+        chimneyStack(L, ccx, ccy, ridgeZ - 1.5, ridgeZ + 4);
+      }
+    } else if (side === 'left' && roof.ridge) {
+      for (ci = 0; ci < cn; ci++) chimneyAt(L, minx, cn === 1 ? yc : miny + (maxy - miny) * _cfrac(ci), roof.ridge + 4, -1);
+    } else if (side === 'right' && roof.ridge) {
+      for (ci = 0; ci < cn; ci++) chimneyAt(L, maxx, cn === 1 ? yc : miny + (maxy - miny) * _cfrac(ci), roof.ridge + 4, 1);
+    }
+
+    return { faces: L, glow: GL, labels: LBL };
+  }
+
+  function buildFromPlan(opts) {
+    var plan = opts.plan || {}, lit = opts.lit || {}, floor = opts.floor || 'all';
+    var L = [], GL = [], LBL = [];
+    var stOf = function (n) { var s = lit[String(n).toLowerCase()]; return s === 'dom' ? 'dom' : s === 'mmwave' ? 'mmwave' : s ? 'on' : 'off'; };
+    // footprint bbox across all floors -> center + exterior walls
+    var minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9, ztop = -1e9;
+    Object.keys(plan).forEach(function (fk) {
+      var z = _planZ(fk);
+      if (fk !== 'b' && fk !== 'bsmt' && z[1] > ztop) ztop = z[1];
+      (plan[fk] || []).forEach(function (r) {
+        if (r.x < minx) minx = r.x; if (r.y < miny) miny = r.y;
+        if (r.x + r.w > maxx) maxx = r.x + r.w; if (r.y + r.d > maxy) maxy = r.y + r.d;
+      });
+    });
+    if (minx > maxx) { minx = XG0; miny = 0; maxx = XHE; maxy = D; }
+    if (ztop < 0) ztop = RIDGE;
+    CENTER = [(minx + maxx) / 2, (miny + maxy) / 2, WALL * 0.5];
+    var draw = function (fk) {
+      var z = _planZ(fk);
+      (plan[fk] || []).forEach(function (r) {
+        if (r.points && r.points.length >= 3) roomPrism(L, LBL, r.points, z[0], z[1], r.label || r.name, stOf(r.name));
+        else roomBox(L, LBL, r.x, r.y, r.w, r.d, z[0], z[1], r.label || r.name, stOf(r.name));
+      });
+    };
+    if (floor !== 'all') {
+      var pf = _planFloorKey(plan, floor);
+      draw(pf);
+      // interior doors on this floor's rooms, open/closed from their sensor (v7.94.0)
+      var zf = _planZ(pf);
+      ((opts.elements && opts.elements[pf]) || []).filter(function (e) { return e.type === 'door' && e.kind === 'interior'; }).forEach(function (e) {
+        var rname = String(e.room || '').toLowerCase();
+        var rr = (plan[pf] || []).filter(function (r) { return String(r.name).toLowerCase() === rname; })[0];
+        if (!rr && e.x == null) return;
+        var p = e.pos != null ? e.pos : 0.5, w = Math.max(e.w || 3, 3);
+        var rx0 = rr ? rr.x : 0, ry0 = rr ? rr.y : 0, rx1 = rr ? rr.x + rr.w : 0, ry1 = rr ? rr.y + rr.d : 0, cx, cy;
+        if (e.x != null) { cx = e.x; cy = e.y; }
+        else if (e.wall === 'front') { cx = rx0 + p * (rx1 - rx0); cy = ry0; }
+        else if (e.wall === 'back') { cx = rx0 + p * (rx1 - rx0); cy = ry1; }
+        else if (e.wall === 'left') { cx = rx0; cy = ry0 + p * (ry1 - ry0); }
+        else { cx = rx1; cy = ry0 + p * (ry1 - ry0); }
+        doorOnWall(L, GL, e.wall, cx, cy, w, zf[0] + 0.3, Math.min(zf[0] + 7, zf[1] - 0.2), e.open);
+      });
+      ((opts.elements && opts.elements[pf]) || []).filter(function (e) { return e.type === 'door' && e.kind === 'cased'; }).forEach(function (e) {
+        var rname = String(e.room || '').toLowerCase();
+        var rr = (plan[pf] || []).filter(function (r) { return String(r.name).toLowerCase() === rname; })[0];
+        if (!rr && e.x == null) return;
+        var p = e.pos != null ? e.pos : 0.5, w = Math.max(e.w || 3, 3);
+        var rx0 = rr ? rr.x : 0, ry0 = rr ? rr.y : 0, rx1 = rr ? rr.x + rr.w : 0, ry1 = rr ? rr.y + rr.d : 0, cx, cy;
+        if (e.x != null) { cx = e.x; cy = e.y; }
+        else if (e.wall === 'front') { cx = rx0 + p * (rx1 - rx0); cy = ry0; }
+        else if (e.wall === 'back') { cx = rx0 + p * (rx1 - rx0); cy = ry1; }
+        else if (e.wall === 'left') { cx = rx0; cy = ry0 + p * (ry1 - ry0); }
+        else { cx = rx1; cy = ry0 + p * (ry1 - ry0); }
+        casedOnWall(L, GL, e.wall, cx, cy, w, zf[0] + 0.3, Math.min(zf[0] + 7, zf[1] - 0.2));
+      });
+      // interior windows — glazing on a chosen room's wall: between two rooms,
+      // or facing an interior courtyard/balcony between two masses. Not bound to
+      // the four outer walls like exterior windows (#324).
+      ((opts.elements && opts.elements[pf]) || []).filter(function (e) { return e.type === 'window' && e.kind === 'interior'; }).forEach(function (e) {
+        var rr = (plan[pf] || []).filter(function (r) { return String(r.name).toLowerCase() === String(e.room || '').toLowerCase(); })[0];
+        if (!rr && e.x == null) return;
+        var p = e.pos != null ? e.pos : 0.5, w = Math.max(e.w || 3, 2);
+        var rx0 = rr ? rr.x : 0, ry0 = rr ? rr.y : 0, rx1 = rr ? rr.x + rr.w : 0, ry1 = rr ? rr.y + rr.d : 0;
+        var zw0 = zf[0] + 2.5, zw1 = Math.min(zf[0] + 6.5, zf[1] - 0.4), cx, cy;
+        if (e.x != null) { cx = e.x; cy = e.y; }
+        else if (e.wall === 'front') { cx = rx0 + p * (rx1 - rx0); cy = ry0; }
+        else if (e.wall === 'back')  { cx = rx0 + p * (rx1 - rx0); cy = ry1; }
+        else if (e.wall === 'left')  { cx = rx0; cy = ry0 + p * (ry1 - ry0); }
+        else                         { cx = rx1; cy = ry0 + p * (ry1 - ry0); }
+        if (e.wall === 'front' || e.wall === 'back') winY(L, GL, cy, cx - w / 2, cx + w / 2, zw0, zw1, 'off', true, e.wall === 'front' ? -0.06 : 0.06);
+        else winX(L, GL, cx, cy - w / 2, cy + w / 2, zw0, zw1, 'off', true, e.wall === 'left' ? -0.06 : 0.06);
+      });
+      // balcony / French doors — a full-height glazed door on a chosen room's
+      // wall (floor-to-head glass), lit when its sensor says open (#324).
+      ((opts.elements && opts.elements[pf]) || []).filter(function (e) { return e.type === 'door' && e.kind === 'french'; }).forEach(function (e) {
+        var rr = (plan[pf] || []).filter(function (r) { return String(r.name).toLowerCase() === String(e.room || '').toLowerCase(); })[0];
+        if (!rr && e.x == null) return;
+        var p = e.pos != null ? e.pos : 0.5, w = Math.max(e.w || 4, 3), stt = e.open ? 'on' : 'off';
+        var rx0 = rr ? rr.x : 0, ry0 = rr ? rr.y : 0, rx1 = rr ? rr.x + rr.w : 0, ry1 = rr ? rr.y + rr.d : 0;
+        var zd0 = zf[0] + 0.3, zd1 = Math.min(zf[0] + 7, zf[1] - 0.2), cx, cy;
+        if (e.x != null) { cx = e.x; cy = e.y; }
+        else if (e.wall === 'front') { cx = rx0 + p * (rx1 - rx0); cy = ry0; }
+        else if (e.wall === 'back')  { cx = rx0 + p * (rx1 - rx0); cy = ry1; }
+        else if (e.wall === 'left')  { cx = rx0; cy = ry0 + p * (ry1 - ry0); }
+        else                         { cx = rx1; cy = ry0 + p * (ry1 - ry0); }
+        if (e.wall === 'front' || e.wall === 'back') winY(L, GL, cy, cx - w / 2, cx + w / 2, zd0, zd1, stt, true, e.wall === 'front' ? -0.07 : 0.07, 2);
+        else winX(L, GL, cx, cy - w / 2, cy + w / 2, zd0, zd1, stt, true, e.wall === 'left' ? -0.07 : 0.07);
+      });
+      return { faces: L, glow: GL, labels: LBL };
+    }
+    // Whole-house view: clean exterior shell with presence as lit windows.
+    return buildExteriorFromPlan(opts, plan, minx, miny, maxx, maxy, ztop);
+  }
+
+  // ---------- assemble a frame for given options ----------
+  function build(opts) {
+    opts = opts || {};
+    applySpec(opts.spec);                           // home type/specs (empty = default)
+    if (opts.plan) return buildFromPlan(opts);      // data-driven: geometry from the editor's rooms
+    CENTER = DEFAULT_CENTER;                         // hardcoded path uses the fixed model center
+    var lit = opts.lit || {};                       // { 'master bedroom':'on'|'mmwave'|'dom', ... }
+    var doors = opts.doors || {};                   // { front:'open'|'closed', garage:..., cellar:..., ... }
+    var floor = opts.floor || 'all';
+    var stOf = function (name) { var s = lit[String(name).toLowerCase()]; return s === 'dom' ? 'dom' : s === 'mmwave' ? 'mmwave' : s ? 'on' : 'off'; };
+    var dOf = function (k) { return doors[k] === 'open' ? 'open' : 'closed'; };
+    var L = [], GL = [], LBL = [];
+
+    if (floor !== 'all') {
+      // floor isolation: faint shell context + translucent labeled rooms for this level
+      buildContext(L, floor);
+      buildRooms(floor, lit, doors, L, LBL);
+      return { faces: L, glow: GL, labels: LBL };
+    }
+
+    buildShell(L, GL);
+    chimney(L, SPEC.chimney);
+    garageDoors(L, GL, stOf('garage'), dOf('garage'));
+
+    // dormers — counts configurable; unset = the approved default layout
+    if (SPEC.dormersFront == null) {
+      dormerFront(L, GL, XGH + 9, stOf("eliana's room"));
+      dormerFront(L, GL, XGH + 24, stOf('master bedroom'));
+    } else {
+      var fKeys = ["eliana's room", 'master bedroom'], df;
+      for (df = 0; df < SPEC.dormersFront; df++)
+        dormerFront(L, GL, XGH + HW * (df + 1) / (SPEC.dormersFront + 1), stOf(fKeys[df] || fKeys[fKeys.length - 1]));
+    }
+    if (SPEC.dormersRear == null) {
+      dormerRearRound(L, GL, XGH + 16, stOf('bath'));
+    } else {
+      var dr;
+      for (dr = 0; dr < SPEC.dormersRear; dr++)
+        dormerRearRound(L, GL, XGH + HW * (dr + 1) / (SPEC.dormersRear + 1), stOf('bath'));
+    }
+
+    // front facade: Dining (one window, L) · front door (centered) · Living Room (one window, R) — matching pair
+    winY(L, GL, 0, XGH + 4, XGH + 8.5, 3, 7, stOf('dining room'), true);              // dining window
+    doorY(L, GL, 0, XGH + 14.5, XGH + 17.5, 0, 7, -0.06, 'left', dOf('front'));        // front entry (centered)
+    winY(L, GL, 0, XGH + 23.5, XGH + 28, 3, 7, stOf('living room'), true);            // living-room window (matches dining)
+    // right (east) gable corners: Living Rm front (SE), Guest Rm rear (NE) — flank the chimney
+    winX(L, GL, XHE, 3.5, 7.5, 3, 7, stOf('living room'), true);
+    winX(L, GL, XHE, 16.5, 20.5, 3, 7, stOf('guest room'), true);
+    // rear (north) facade: Kitchen (NW) · Guest (NE) windows · garage man-door · cellar bulkhead
+    winY(L, GL, D, XGH + 3, XGH + 9, 3, 7, stOf('kitchen'), true, 0.06);
+    winY(L, GL, D, XGH + 22, XGH + 28, 3, 7, stOf('guest room'), true, 0.06);
+    doorY(L, GL, D, 25.2, 28.2, 0, 6.8, 0.06, 'right', dOf('garage_rear'));            // garage rear man-door (~3ft W of junction)
+    bulkhead(L, GL, 33.5, 38.5, dOf('cellar'));                                        // cellar door under the kitchen window
+
+    return { faces: L, glow: GL, labels: LBL };
+  }
+
+  // ---------- render to SVG ----------
+  function renderSVG(opts) {
+    opts = opts || {};
+    var theta = opts.theta == null ? 35 : opts.theta;
+    var built = build(opts);
+    var faces = built.faces, glow = built.glow, labels = built.labels || [];
+    // depth sort: farthest first
+    faces.sort(function (a, b) { return faceDepth(b, theta) - faceDepth(a, theta); });
+
+    // bounds
+    var mnx = 1e9, mny = 1e9, mxx = -1e9, mxy = -1e9, all = faces.concat(glow), i, j, q;
+    for (i = 0; i < all.length; i++) for (j = 0; j < all[i].p.length; j++) {
+      q = project(all[i].p[j], theta);
+      if (q[0] < mnx) mnx = q[0]; if (q[0] > mxx) mxx = q[0];
+      if (q[1] < mny) mny = q[1]; if (q[1] > mxy) mxy = q[1];
+    }
+    var pad = 40, X0, Y0, W, H;
+    if (opts.box) { X0 = opts.box[0]; Y0 = opts.box[1]; W = opts.box[2]; H = opts.box[3]; }
+    else { X0 = mnx - pad; Y0 = mny - pad; W = (mxx - mnx) + 2 * pad; H = (mxy - mny) + 2 * pad; }
+    var vb = X0.toFixed(1) + ' ' + Y0.toFixed(1) + ' ' + W.toFixed(1) + ' ' + H.toFixed(1);
+    var pp = function (pts) { return pts.map(function (p) { var s = project(p, theta); return s[0].toFixed(1) + ',' + s[1].toFixed(1); }).join(' '); };
+    // jh-r19-xss: room names (labels) and face styles are data: escape them
+    var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); };
+
+    var body = '';
+    body += '<defs><filter id="g3" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="3"/></filter>'
+         + '<radialGradient id="bg3" cx="50%" cy="40%" r="65%"><stop offset="0%" stop-color="rgba(0,60,90,0.20)"/><stop offset="100%" stop-color="rgba(0,0,0,0)"/></radialGradient>'
+         + '<radialGradient id="sh3" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(0,0,0,0.55)"/><stop offset="100%" stop-color="rgba(0,0,0,0)"/></radialGradient></defs>';
+    body += '<rect x="' + X0.toFixed(1) + '" y="' + Y0.toFixed(1) + '" width="' + W.toFixed(1) + '" height="' + H.toFixed(1) + '" fill="url(#bg3)"/>';
+    // ground shadow
+    var gc = project([CENTER[0], CENTER[1], 0], theta);
+    body += '<ellipse cx="' + gc[0].toFixed(1) + '" cy="' + (mxy + pad * 0.2).toFixed(1) + '" rx="' + ((mxx - mnx) * 0.42).toFixed(1) + '" ry="20" fill="url(#sh3)"/>';
+    // glow
+    for (i = 0; i < glow.length; i++) body += '<polygon points="' + pp(glow[i].p) + '" fill="' + esc(glow[i].f) + '" filter="url(#g3)"/>';
+    // faces
+    for (i = 0; i < faces.length; i++) {
+      var fc = faces[i], closed = fc.f !== 'none';
+      body += '<poly' + (closed ? 'gon' : 'line') + ' points="' + pp(fc.p) + '"' + (fc.cls ? ' class="' + esc(fc.cls) + '"' : '')
+            + ' fill="' + esc((closed ? fc.f : 'none')) + '" stroke="' + esc(fc.s) + '" stroke-width="' + esc(fc.w) + '" stroke-linejoin="round" stroke-linecap="round"/>';
+    }
+    // room labels + occupancy pulses (upright, drawn on top)
+    for (i = 0; i < labels.length; i++) {
+      var lb = labels[i], sp = project([lb.x, lb.y, lb.z], theta);
+      if (lb.dot) {
+        var dc = lb.st === 'dom' ? '#7dffcd' : lb.st === 'mmwave' ? '#5affbe' : '#7af0ff';
+        body += '<circle cx="' + sp[0].toFixed(1) + '" cy="' + sp[1].toFixed(1) + '" r="2.4" fill="' + dc + '">'
+              + '<animate attributeName="opacity" values="0.35;1;0.35" dur="2s" repeatCount="indefinite"/></circle>';
+      } else {
+        var tc = lb.st === 'dom' ? '#9effd0' : lb.st === 'mmwave' ? '#8fffd4' : lb.st === 'on' ? '#7af0ff' : 'rgba(120,200,225,0.5)';
+        var fs = lb.small ? 6 : (lb.big ? 9 : 7.5);
+        body += '<text x="' + sp[0].toFixed(1) + '" y="' + sp[1].toFixed(1) + '" text-anchor="middle" dominant-baseline="middle"'
+              + ' font-family="JetBrains Mono, ui-monospace, monospace" font-size="' + fs + '" font-weight="600" letter-spacing="0.8"'
+              + ' paint-order="stroke" stroke="#04080c" stroke-width="0.8" stroke-linejoin="round" fill="' + tc + '">' + esc(lb.t) + '</text>';
+      }
+    }
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="' + W.toFixed(0) + '" height="' + H.toFixed(0) + '" viewBox="' + vb + '">' + body + '</svg>';
+  }
+
+  // ---------- a stable viewBox covering the model across all rotations ----------
+  function fixedBox(opts) {
+    var b = build(opts || {}), all = b.faces.concat(b.glow);
+    var mnx = 1e9, mny = 1e9, mxx = -1e9, mxy = -1e9, t, i, j, q;
+    for (t = 0; t < 360; t += 15)
+      for (i = 0; i < all.length; i++) for (j = 0; j < all[i].p.length; j++) {
+        q = project(all[i].p[j], t);
+        if (q[0] < mnx) mnx = q[0]; if (q[0] > mxx) mxx = q[0];
+        if (q[1] < mny) mny = q[1]; if (q[1] > mxy) mxy = q[1];
+      }
+    var pad = 46;
+    return [mnx - pad, mny - pad, (mxx - mnx) + 2 * pad, (mxy - mny) + 2 * pad];
+  }
+
+  return { build: build, renderSVG: renderSVG, fixedBox: fixedBox, project: project, dims: { GW: GW, HW: HW, D: D, WALL: WALL, RIDGE: RIDGE } };
+})();
+
+/* jh-haptic (step 156) BEGIN - one shared haptic helper for the JARVIS panel, the optional cards, Household Chat and the login
+   screen; the same block is in each file and the first one loaded defines it (window.jhHaptic). jhHaptic(type, el):
+   - fires Home Assistant's own "haptic" event (the Home Assistant apps on Android and iOS turn it into a native haptic);
+   - in a mobile browser without the app: navigator.vibrate with a pattern per type (Android browsers; iOS Safari has none);
+   - only on touch screens (pointer: coarse), never with prefers-reduced-motion, never when this login switched it off
+     (frontend user data "jh_haptics", default on), and at most one pulse per 80 ms (a stronger type may follow a tap at once).
+   Types: selection (tabs, pickers, dropdowns), light (buttons, arrows, toggles), medium (long press), heavy, success (an action
+   confirmed), warning (sent but not confirmed; a destructive confirmation), failure (refused or failed). */
+(() => {
+  if (window.jhHaptic) return;
+  const PAT = { selection: 5, light: 10, medium: 20, heavy: 30, success: [10, 40, 10], warning: [20, 60, 20],
+                failure: [30, 60, 30, 60, 30] };
+  const RANK = { selection: 1, light: 1, medium: 2, heavy: 3, success: 3, warning: 3, failure: 3 };
+  const S = window.__jhHapticState = { on: true, last: 0, rank: 0, loaded: null, sent: [], v: 1 };
+  const mm = (q) => { try { return !!(window.matchMedia && window.matchMedia(q).matches); } catch (e) { return false; } };
+  window.jhHapticLoad = (hass) => {   // this login's switch (frontend user data), read once per login
+    const uid = hass && hass.user && hass.user.id;
+    if (!uid || typeof hass.callWS !== "function") return Promise.resolve(S.on);
+    if (S.loaded && S.loaded.uid === uid) return S.loaded.p;
+    let p;
+    try {
+      p = Promise.resolve(hass.callWS({ type: "frontend/get_user_data", key: "jh_haptics" }))
+        .then((r) => { if (r && typeof r.value === "boolean") S.on = r.value; return S.on; }).catch(() => S.on);
+    } catch (e) { p = Promise.resolve(S.on); }   // offline: the default stands
+    S.loaded = { uid, p };
+    return p;
+  };
+  window.jhHapticOn = () => S.on;
+  window.jhHapticSet = (hass, on) => {
+    S.on = !!on;
+    try { return hass.callWS({ type: "frontend/set_user_data", key: "jh_haptics", value: !!on }); } catch (e) { return Promise.resolve(); }
+  };
+  window.jhHaptic = (type, el) => {
+    if (!PAT[type]) type = "light";
+    if (!S.on || !mm("(pointer: coarse)") || mm("(prefers-reduced-motion: reduce)")) return false;
+    const now = Date.now(), rank = RANK[type];
+    if (now - S.last < 80 && rank <= S.rank) return false;   // throttled: a held or repeated button does not buzz on and on
+    S.last = now; S.rank = rank;
+    S.sent.push(type); if (S.sent.length > 50) S.sent.shift();
+    const app = !!(window.externalApp || (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.externalBus));
+    const frontend = !!document.querySelector("home-assistant");
+    try {
+      const target = el && el.isConnected ? el : window;
+      target.dispatchEvent(new CustomEvent("haptic", { detail: type, bubbles: true, composed: true }));
+    } catch (e) { /* no event support */ }
+    if (app && !frontend) {   // a page of the app without Home Assistant's frontend (the login screen): tell the app directly
+      const msg = { id: now, type: "haptic", payload: { hapticType: type } };
+      try {
+        if (window.externalApp && window.externalApp.externalBus) window.externalApp.externalBus(JSON.stringify(msg));
+        else window.webkit.messageHandlers.externalBus.postMessage(msg);
+      } catch (e) { /* the app has no bus here */ }
+    } else if (!app && navigator.vibrate) {   // a plain mobile browser: vibrate (the app does its own haptics)
+      try { navigator.vibrate(PAT[type]); } catch (e) { /* not allowed */ }
+    }
+    return true;
+  };
+  // what a tap means: a choice (tabs, chips, pickers) is "selection", any other button "light"
+  const SEL = '[role="tab"], .tab, [data-tab], [data-settings-section], [data-step], [aria-pressed], [aria-selected], .seg button, [class*="chip"]';
+  const BTN = 'button, [role="button"], .ctrl, a.btn, ha-icon-button, ha-button, mwc-button';
+  window.jhHapticWire = (root) => {   // one listener per root: taps and changes inside it give their pulse
+    if (!root || root.__jhHaptic) return;
+    root.__jhHaptic = true;
+    const pick = (e, sel) => {
+      for (const n of (e.composedPath ? e.composedPath() : [e.target])) {
+        if (n === root) break;
+        if (n && n.nodeType === 1 && n.matches && n.matches(sel)) return n;
+      }
+      return null;
+    };
+    root.addEventListener("click", (e) => {
+      const own = pick(e, "[data-haptic]");
+      if (own) { if (own.dataset.haptic !== "none") window.jhHaptic(own.dataset.haptic, own); return; }
+      const sel = pick(e, SEL);
+      if (sel) { if (!sel.disabled) window.jhHaptic("selection", sel); return; }
+      const btn = pick(e, BTN);
+      if (btn && !btn.disabled) window.jhHaptic("light", btn);
+    }, true);
+    root.addEventListener("change", (e) => {
+      const t = e.composedPath ? e.composedPath()[0] : e.target;
+      if (!t || !t.tagName) return;
+      if (t.dataset && t.dataset.haptic) { if (t.dataset.haptic !== "none") window.jhHaptic(t.dataset.haptic, t); return; }
+      if (t.tagName === "SELECT" || (t.tagName === "INPUT" && t.type === "range")) window.jhHaptic("selection", t);
+      else if (t.tagName === "INPUT" && (t.type === "checkbox" || t.type === "radio")) window.jhHaptic("light", t);
+    }, true);
+  };
+  if (window.confirm && !window.confirm.__jhHaptic) {   // a destructive confirmation (Remove, Clear, Delete) warns first
+    const ask = window.confirm.bind(window);
+    window.confirm = function (msg) { window.jhHaptic("warning"); return ask(msg); };
+    window.confirm.__jhHaptic = true;
+  }
+})();
+/* jh-haptic END */
+
+class JarvisPanel extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._jhCamZoomInit();   // Jarvis Home patch (2026-11-14): Camera Watch zoom
+    this._hass = null;
+    this._narrow = false;
+    this._roomRotationIdx = 0;
+    this._clockInterval = null;
+    this._rotationInterval = null;
+    this._fetchInterval = null;
+    this._renderedOnce = false;
+    this._liveData = null;       // populated by _fetchLiveData()
+    this._liveDataErr = null;    // last fetch error (for status display)
+    this._activityData = null;   // populated by _fetchActivityLog()
+    this._currentTab = "dashboard"; // "dashboard" or "settings"
+    this._settingsSection = "general"; // active sub-section within Settings
+    this._settingsFilterQuery = ""; // live "filter settings cards" search box
+    // Chat tab (issue #322) — type-to-JARVIS, session-local history. Messages
+    // are {role:'user'|'jarvis'|'error', text}. Not persisted across reloads.
+    this._chatMessages = [];
+    this._chatBusy = false;         // a request is in flight (disables send)
+    this._chatConvId = null;        // HA conversation_id, for multi-turn context
+    this._chatLoaded = false;       // saved history fetched once per page
+    this._chatRemoved = new Set();  // ids deleted on this device
+    this._chatDraft = "";           // the message box survives a full render
+    this._chatSpeak = false;
+    try { this._chatSpeak = localStorage.getItem("jarvis_chat_speak") === "1"; } catch (e) {}
+    this._wakeOn = false;           // Hey JARVIS: off until this browser turned it on
+    try { this._wakeOn = localStorage.getItem("jarvis_chat_wake") === "1"; } catch (e) {}
+    this._knowledge = { facts: [], stats: {} }; // curated memory tab state
+    this._knowledgeLoaded = false;
+    this._logFilter = "all";       // log category filter
+    this._logSearch = "";          // log text search (v7.94.0)
+    this._lastLogSearch = null;
+    this._activitySearch = "";     // dashboard activity feed search (v6.43.x)
+    this._currentFloor = "all";     // floor plan tab — 3D default shows all
+    this._editorFloor = "1f";      // floor plan editor tab
+    this._dragState = null;        // floor plan drag state
+    this._editingPlan = null;      // working copy for editor
+    this._editingElements = null; // working copy of placed windows/doors (v7.94.0)
+    this._rot3dY = 22;             // 3D house rotation Y (near-front hero, like the approved view)
+    this._house3dTheta = 35;       // JARVIS3D azimuth (deg) — approved hero angle
+    this._editorTheta = 22;        // editor 3D-preview azimuth (deg), rotatable + presets
+    this._house3dBox = null;       // cached fixed viewBox for the current floor+spec
+    this._house3dBoxKey = null;    // cache key (floor + spec signature)
+    this._rot3dX = -18;            // 3D house rotation X (gentle, so the gable reads as a mass)
+    this._zoom3d = 1;              // 3D house zoom level
+    this._zoomAuto = true;         // auto-fit house to column until user zooms
+    this._pendingRender = false;   // owed full render deferred during editing
+    this._lastLogSig = null;       // signature of currently-rendered log
+    this._lastLogFilter = null;    // filter the log was last rendered under
+    // Camera Watch — live feed, selectable, event auto-focus
+    this._cams = [];
+    this._activeCam = null;        // entity currently shown
+    this._manualCam = null;        // last user-picked entity (revert target)
+    this._camFocus = null;         // {entity,label,conf} when an event grabs focus
+    this._camFocusTimer = null;
+    this._camStillTimer = null;
+    this._camSubs = [];
+    this._lastCamKey = "";         // entity|token of the attached stream
+    this._camMode = "stream";      // stream → still → jarvis (v7.94.0 fallback chain)
+    this._camModeByEntity = {};    // remembered resolved mode, skips re-escalation
+    this._camWatchdog = null;      // no-frame watchdog: hangs don't fire error events
+    this._camWsTimer = null;       // WS-snapshot poll for cams both proxies fail on
+    // Real-time entity subscriptions (v7.94.0) — a native state_changed feed
+    // that triggers a fast, throttled refresh instead of waiting on the poll.
+    this._stateSubs = [];
+    this._lastRealtimeFetch = 0;
+    this._realtimeTrailing = null;
+    // Sparklines (v7.94.0) — slow-polled separately from live data since
+    // recorder history queries are heavier than the rest of the payload.
+    this._sparklines = {};
+    this._sparklineInterval = null;
+    // Area drill-down (v7.94.0) — id of the area currently expanded, or null.
+    this._expandedArea = null;
+  }
+
+  // ─── HA property setters ─────────────────────────────────────────────────
+
+  // Jarvis Home patch (2026-11-15): jh-user-prefs. Choices that follow the Home Assistant login, not the browser.
+  _jhPrefKeys() { return ["jarvis_active_cam", "jarvis_faces_snap_cam", "jarvis_chat_speak", "jarvis_chat_wake", "jarvis_ptz_step", "jarvis_faces_snap_cams"]; }   // jh-r9-ptz-step: + the pan/tilt step; jh-r13-snapcam: + the camera per resident
+
+  _jhPrefsBoot() {
+    if (this._jhPrefsUid !== undefined) return;
+    this._jhPrefsUid = this._hass?.user?.id || "";
+    this._jhPrefs = this._jhPrefs || {};
+    this._jhPrefsTouched = this._jhPrefsTouched || new Set();
+    this._jhPrefsKey = "jarvis_prefs:" + this._jhPrefsUid;
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem(this._jhPrefsKey) || "null"); } catch (e) {}
+    if (cached && typeof cached === "object" && !Array.isArray(cached)) {
+      for (const k of this._jhPrefKeys()) if (k in cached && !this._jhPrefsTouched.has(k)) this._jhPrefs[k] = cached[k];
+    } else {
+      // first visit as this user in this browser: the old per-browser keys are only a starting point
+      for (const k of this._jhPrefKeys()) {
+        if (this._jhPrefsTouched.has(k)) continue;
+        let v = null;
+        try { v = localStorage.getItem(k); } catch (e) {}
+        if (v !== null) this._jhPrefs[k] = (k === "jarvis_chat_speak" || k === "jarvis_chat_wake") ? v === "1" : v;
+      }
+    }
+    this._jhPrefsApply(this._jhPrefKeys().filter(k => k in this._jhPrefs && !this._jhPrefsTouched.has(k)));
+    this._jhPrefsLoad();
+  }
+
+  _jhPrefsApply(keys) {
+    const p = this._jhPrefs;
+    if (keys.includes("jarvis_chat_speak")) this._chatSpeak = p.jarvis_chat_speak === true;
+    if (keys.includes("jarvis_chat_wake")) this._wakeOn = p.jarvis_chat_wake === true;
+    if (keys.includes("jarvis_ptz_step")) {   // jh-r9-ptz-step (review round 9): a pad drawn before the saved step arrived follows it
+      const box = this.shadowRoot && this.shadowRoot.getElementById("jh-ptz");
+      if (box) box.querySelectorAll("[data-step]").forEach(x => x.classList.toggle("on", x.dataset.step === p.jarvis_ptz_step));
+    }
+  }
+
+  _jhPrefGet(k) { return this._jhPrefs ? this._jhPrefs[k] : undefined; }
+
+  _jhPrefSet(k, v) {
+    this._jhPrefs = this._jhPrefs || {};
+    this._jhPrefsTouched = this._jhPrefsTouched || new Set();
+    this._jhPrefsTouched.add(k);
+    this._jhPrefs[k] = v;
+    this._jhPrefsCache();
+    clearTimeout(this._jhPrefsTimer);
+    this._jhPrefsTimer = setTimeout(() => this._jhPrefsSave(), 400);
+  }
+
+  _jhPrefsCache() {
+    try { if (this._jhPrefsKey) localStorage.setItem(this._jhPrefsKey, JSON.stringify(this._jhPrefs || {})); } catch (e) {}
+  }
+
+  async _jhPrefsLoad() {
+    let server;
+    try { server = (await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_prefs" }))?.value; }
+    catch (e) { return; }   // offline or refused: the cache stands
+    if (!server || typeof server !== "object" || Array.isArray(server)) {
+      // nothing saved for this login yet: what this browser had becomes the start
+      if (Object.keys(this._jhPrefs || {}).length) this._jhPrefsSave();
+      return;
+    }
+    const changed = [];
+    for (const k of this._jhPrefKeys()) {
+      if (this._jhPrefsTouched.has(k) || !(k in server)) continue;   // a choice made during this visit wins
+      if (server[k] !== this._jhPrefs[k]) { this._jhPrefs[k] = server[k]; changed.push(k); }
+    }
+    this._jhPrefsCache();
+    if (!changed.length) return;
+    const wake = this._wakeOn;
+    this._jhPrefsApply(changed);
+    if (changed.includes("jarvis_chat_speak")) {
+      const b = this.shadowRoot?.getElementById("chat-speak");
+      if (b) { b.classList.toggle("on", this._chatSpeak); b.innerHTML = this._ttsIcon(); }
+    }
+    if (changed.includes("jarvis_chat_wake") && wake !== this._wakeOn) {
+      try { this._wakeSync(); this._wakeShow(); } catch (e) {}
+    }
+    if (changed.includes("jarvis_active_cam") && this._cams && this._cams.length) {
+      this._activeCam = null;
+      try { this._setupCameras(); } catch (e) {}
+    }
+  }
+
+  async _jhPrefsSave() {
+    if (!this._hass) return;
+    let server = null;
+    try { server = (await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_prefs" }))?.value; } catch (e) {}
+    const value = (server && typeof server === "object" && !Array.isArray(server)) ? Object.assign({}, server) : {};
+    for (const k of Object.keys(this._jhPrefs || {})) {
+      if (this._jhPrefsTouched.has(k) || !(k in value)) value[k] = this._jhPrefs[k];   // another device keeps its other choices
+      if (k === "jarvis_faces_snap_cams" && server && server[k] && typeof server[k] === "object" && this._jhPrefsTouched.has(k)) {
+        const mine = {};   // jh-r13-snapcam: only the residents chosen on this device; another device keeps its own
+        for (const r of (this._jhSnapTouched || [])) if (r in (this._jhPrefs[k] || {})) mine[r] = this._jhPrefs[k][r];
+        value[k] = Object.assign({}, server[k], mine);
+      }
+    }
+    try { await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_prefs", value }); } catch (e) {}
+  }
+
+  set hass(hass) {
+    const first = this._hass === null;
+    this._hass = hass;
+    try { this._jhHapticBoot(); } catch (e) {}   // jh-haptic (step 156)
+    if (first) {
+      this._loadUiStrings();
+      this._jhPrefsBoot();   // jh-user-prefs: this login's choices before the first render
+      this._render();
+      this._startIntervals();
+    } else {
+      this._updateLiveValues();
+      try { this._jhDoorStateSync(); } catch (e) {}   // jh-doors (step 155)
+    }
+    if (this._wakeOn && !this._wakeRun && !this._wakeTimer) this._wakeSync();
+  }
+  get hass() { return this._hass; }
+
+  set panel(panel) { this._config = panel?.config || {}; }
+  set narrow(narrow) {
+    if (narrow !== this._narrow) {
+      this._narrow = narrow;
+      if (this._renderedOnce) this._render();
+    }
+  }
+  set route(route) { this._route = route; }
+
+  connectedCallback() {
+    if (!this._jhPinEv) this._jhPinEv = (e) => this._jhPinRoom(e && e.detail ? e.detail.area_id : null);   // jh-room-pin
+    window.addEventListener("jh-pin-room", this._jhPinEv);
+    // v6 aesthetic: load the panel's typefaces at document level (shadow DOM
+    // can't reliably pull remote @font-face). Graceful: if offline, the
+    // font-family fallbacks render and nothing breaks.
+    if (!document.getElementById("jarvis-fonts-v6")) {
+      const l = document.createElement("link");
+      l.id = "jarvis-fonts-v6";
+      l.rel = "stylesheet";
+      l.href = "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;700&family=JetBrains+Mono:wght@300;400;500&display=swap";
+      document.head.appendChild(l);
+    }
+    if (this._hass) {
+      this._render();
+      this._startIntervals();
+      this._wakeSync();
+    }
+  }
+
+  disconnectedCallback() {
+    this._stopIntervals();
+    try { this._jhRtcStop(); } catch (e) {}   // jh-rtc (step 155)
+    if (this._jhPinEv) window.removeEventListener("jh-pin-room", this._jhPinEv);   // jh-room-pin
+    clearTimeout(this._jhPinTimer); clearInterval(this._jhPinTick);
+    if (this._chatResize) { window.removeEventListener("resize", this._chatResize); this._chatResize = null; }
+    if (this._micRelease) {
+      ["pointerup", "pointercancel"].forEach((n) => window.removeEventListener(n, this._micRelease));
+      this._micRelease = null;
+    }
+    this._micHeld = false;
+    if (this._micStop) this._micStop();
+    this._stopChatAudio();
+    this._wakeHalt();
+    this._wakeUnhook();
+  }
+
+  // ─── Lifecycle ───────────────────────────────────────────────────────────
+
+  _startIntervals() {
+    if (!this._clockInterval) {
+      this._clockInterval = setInterval(() => this._updateClock(), 1000);
+    }
+    // Demo rotation kept as fallback — stops once live data arrives
+    if (!this._rotationInterval) {
+      this._rotationInterval = setInterval(() => this._rotateDominantRoom(), 6000);
+    }
+    // Live data polling — a slower safety net now that state_changed
+    // subscriptions (below) cover the common case within ~2s. Kept as a
+    // backstop in case an event is dropped or the subscription fails.
+    if (!this._fetchInterval) {
+      this._fetchLiveData();  // immediate first call
+      this._fetchInterval = setInterval(() => this._fetchLiveData(), 20000);
+    }
+    this._subscribeCameraEvents();
+    this._subscribeStateEvents();
+    if (!this._sparklineInterval) {
+      this._fetchAreaSparklines();  // immediate first call
+      this._sparklineInterval = setInterval(() => this._fetchAreaSparklines(), 300000);
+    }
+  }
+
+  _stopIntervals() {
+    if (this._clockInterval)    { clearInterval(this._clockInterval);    this._clockInterval = null; }
+    if (this._rotationInterval) { clearInterval(this._rotationInterval); this._rotationInterval = null; }
+    if (this._fetchInterval)    { clearInterval(this._fetchInterval);    this._fetchInterval = null; }
+    if (this._camFocusTimer)    { clearTimeout(this._camFocusTimer);     this._camFocusTimer = null; }
+    if (this._camStillTimer)    { clearInterval(this._camStillTimer);    this._camStillTimer = null; }
+    if (this._camWsTimer)       { clearInterval(this._camWsTimer);       this._camWsTimer = null; }
+    if (this._camWatchdog)      { clearTimeout(this._camWatchdog);       this._camWatchdog = null; }
+    if (this._realtimeTrailing) { clearTimeout(this._realtimeTrailing);  this._realtimeTrailing = null; }
+    if (this._sparklineInterval) { clearInterval(this._sparklineInterval); this._sparklineInterval = null; }
+    this._camSubs.forEach(u => { try { u && u(); } catch (_) {} });
+    this._camSubs = [];
+    this._stateSubs.forEach(u => { try { u && u(); } catch (_) {} });
+    this._stateSubs = [];
+  }
+
+  async _fetchAreaSparklines() {
+    if (!this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/get_area_sparklines" });
+      this._sparklines = res?.sparklines || {};
+    } catch (err) {
+      // Non-critical — tiles just render without a trend line this cycle.
+      console.warn("JARVIS: sparkline fetch failed", err);
+      return;
+    }
+    // Only the dashboard tab shows sparklines; avoid disrupting other tabs.
+    if (this._currentTab === "dashboard" && this._renderedOnce) this._render();
+  }
+
+  async _fetchLiveData() {
+    if (!this._hass) return;
+    try {
+      const _jhPin = this._jhRoomPinGet();   // jh-room-pin (step 155): a room shown for a moment, else automatic
+      const result = await this._hass.callWS(_jhPin ? { type: "jarvis/get_panel_data", area_id: _jhPin } : { type: "jarvis/get_panel_data" });
+      const prev = this._liveData;
+      this._liveData = result;
+      this._liveDataErr = null;
+      if (this._rotationInterval) {
+        clearInterval(this._rotationInterval);
+        this._rotationInterval = null;
+      }
+      // Also fetch activity log from DB
+      try {
+        const logResult = await this._hass.callWS({
+          type: "jarvis/get_activity_log", hours: 2, limit: 30
+        });
+        this._activityData = logResult?.entries || [];
+      } catch (_) { /* no entries yet — fine */ }
+
+      // Auto-refresh logs tab if active
+      if (this._currentTab === 'logs') {
+        this._fetchDebugLog();
+      }
+
+      // Fetch cognitive core stats for dashboard
+      try {
+        const cogEl = this.shadowRoot?.querySelector("#cognitive-stats .loading-cog");
+        if (cogEl) {
+          // We embed the status as a WebSocket call — the agent's
+          // cognitive_status tool is for conversation, this is direct
+          const cogData = await this._hass.callWS({ type: "jarvis/get_cognitive_status" });
+          if (cogData) {
+            const days = cogData.learning?.days_of_data || 0;
+            const changes = cogData.learning?.state_changes || 0;
+            const cmds = cogData.learning?.commands || 0;
+            const pending = cogData.learning?.suggestions || 0;
+            const ignores = cogData.ignore_rules || 0;
+            const la = cogData.last_analysis || {};
+            let laLine;
+            if (la.ts) {
+              const agoMin = Math.max(0, Math.round((Date.now() / 1000 - la.ts) / 60));
+              const agoStr = agoMin < 60 ? `${agoMin}m ago`
+                : agoMin < 1440 ? `${Math.round(agoMin / 60)}h ago`
+                : `${Math.round(agoMin / 1440)}d ago`;
+              laLine = `Last analysis: <span>${agoStr}</span> · ` +
+                this._esc(`${la.patterns_found ?? 0} found, ${la.new_suggestions ?? 0} stored`);
+            } else {
+              laLine = `Last analysis: <span>not yet this session</span>`;
+            }
+            cogEl.innerHTML =
+              `Data: <span>${this._esc(days)}d</span> · ` +
+              `States: <span>${this._esc(changes)}</span> · ` +
+              `Cmds: <span>${this._esc(cmds)}</span><br>` +
+              `Suggestions: <span>${this._esc(pending)}</span> · ` +
+              `Ignores: <span>${this._esc(ignores)}</span><br>` +
+              laLine;
+          }
+        }
+      } catch (_) {}
+
+      // A full DOM rebuild is only warranted when the STRUCTURE changes —
+      // i.e. the number of area tiles differs (an HA area was added/removed).
+      // The dominant area changing is handled entirely in place by
+      // _patchLiveDom (it updates #dom-name, the stats, the 3D house, etc.),
+      // so it must NOT trigger a teardown. Previously a dominant-area change
+      // rebuilt the whole shadow DOM — and since the dominant area flips with
+      // every motion event, that rebuilt the panel every few seconds, wiping
+      // in-progress settings edits and yanking the log scroll. Never rebuild
+      // while the user is on the settings or logs tab; defer until they return.
+      const structuralChange = !prev ||
+        prev.areas?.length !== result.areas?.length;
+      const interacting = this._currentTab === "settings" || this._currentTab === "logs"
+        || this._currentTab === "memory" || this._currentTab === "suggestions" || this._currentTab === "chat";
+      if (structuralChange && !interacting) {
+        this._render();
+      } else {
+        if (structuralChange) this._pendingRender = true; // owed once they leave
+        this._patchLiveDom(result);
+      }
+    } catch (err) {
+      this._liveDataErr = err?.message || String(err);
+      console.warn("JARVIS: live data fetch failed", err);
+    }
+  }
+
+  async _fetchAndRender() {
+    // Used by toggle/dropdown handlers: fetch fresh data then force
+    // a full re-render so button states update immediately. Unlike
+    // _fetchLiveData which skips re-render on the settings tab (to
+    // keep dropdowns stable during auto-refresh), this always renders.
+    await this._fetchLiveData();
+    this._render();
+  }
+
+  async _fetchDebugLog() {
+    if (!this._hass) return;
+    try {
+      const result = await this._hass.callWS({ type: "jarvis/get_debug_log" });
+      const entries = result?.entries || [];
+      const container = this.shadowRoot?.getElementById("debug-log-entries");
+      if (!container) return;
+      if (!entries.length) {
+        container.innerHTML = '<div class="log-loading">No entries yet. Talk to JARVIS to generate log entries.</div>';
+        return;
+      }
+      const cc = {
+        CONV:     { color: '#0ff',    icon: '💬', label: 'Conversation' },
+        LOCAL:    { color: '#00f5a0', icon: '⚡', label: 'Local Engine' },
+        AGENT:    { color: '#ff9d2e', icon: '🤖', label: 'Agent LLM' },
+        ROUTE:    { color: '#f80',    icon: '🔀', label: 'Audio Route' },
+        CLASSIFY: { color: '#88f',    icon: '🏷️', label: 'Classifier' },
+        REASON:   { color: '#b47aff', icon: '🧠', label: 'Reasoning' },
+        TTS:      { color: '#0ff',    icon: '🔊', label: 'TTS' },
+        ERROR:    { color: '#ff3b3b', icon: '❌', label: 'Error' },
+        GATE:     { color: '#567685', icon: '🚧', label: 'Presence Gate' },
+        DEDUP:    { color: '#567685', icon: '🔇', label: 'Dedup' },
+        CAMERA:   { color: '#00f5a0', icon: '📷', label: 'Camera' },
+      };
+      // Get active filter
+      const activeFilter = this._logFilter || 'all';
+      const categoryFiltered = activeFilter === 'all'
+        ? entries
+        : entries.filter(e => e.cat === activeFilter);
+      const search = (this._logSearch || '').trim().toLowerCase();
+      const filtered = search
+        ? categoryFiltered.filter(e =>
+            (e.msg || '').toLowerCase().includes(search) ||
+            (e.cat || '').toLowerCase().includes(search))
+        : categoryFiltered;
+
+      const countEl = this.shadowRoot?.getElementById("log-count");
+      if (countEl) {
+        countEl.textContent = search || activeFilter !== 'all'
+          ? `${filtered.length} of ${entries.length}`
+          : `${entries.length} entries`;
+      }
+
+      // Newest-first for display (deque is oldest→newest; reverse it).
+      const ordered = filtered.slice().reverse();
+
+      // Skip the DOM rebuild entirely when nothing changed — the common case
+      // on the 5s poll. Rebuilding unconditionally is what made the log flicker
+      // and jump every few seconds. Signature = count + first/last identity.
+      const first = ordered[0];
+      const last = ordered[ordered.length - 1];
+      const sig = ordered.length + "|" +
+        (first ? first.ts + first.msg : "") + "|" +
+        (last ? last.ts + last.msg : "");
+      if (sig === this._lastLogSig && activeFilter === this._lastLogFilter && search === this._lastLogSearch) {
+        return; // unchanged — leave the DOM and the user's scroll position alone
+      }
+      const filterChanged = activeFilter !== this._lastLogFilter || search !== this._lastLogSearch;
+
+      // Preserve scroll: capture where the user is BEFORE touching the DOM.
+      // Newest entries are at the TOP, so "near top" means they're reading the
+      // latest; keep them pinned there. Otherwise leave them where they were.
+      const nearTop = container.scrollTop < 40;
+      const prevTop = container.scrollTop;
+
+      container.innerHTML = ordered.length ? ordered.map(e => {
+        const cat = cc[e.cat] || { color: 'var(--text)', icon: '•', label: e.cat };
+        const isError = e.cat === 'ERROR' || e.msg.toLowerCase().includes('error') || e.msg.toLowerCase().includes('failed');
+        const bgClass = isError ? 'log-entry-error' : '';
+        // jh-r19-xss (step 161, review round 19 #8): log entries are data (msg is raw chat text from any user): escape every field
+        return `<div class="log-entry ${bgClass}" data-cat="${this._esc(e.cat)}">
+          <span class="log-ts">${this._esc(e.ts)}</span>
+          <span class="log-cat" style="color:${this._esc(cat.color)}">${this._esc(cat.icon)} ${this._esc(e.cat)}</span>
+          <span class="log-msg">${this._esc(e.msg)}</span>
+        </div>`;
+      }).join('') : `<div class="log-loading">No entries match${search ? ` "${this._esc(search)}"` : ''}${activeFilter !== 'all' ? ` in ${this._esc(activeFilter)}` : ''}.</div>`;
+
+      this._lastLogSig = sig;
+      this._lastLogFilter = activeFilter;
+      this._lastLogSearch = search;
+
+      // Restore scroll. On a deliberate filter change, or when the user was
+      // already viewing the latest, show the newest (top). Otherwise keep
+      // their position so reading older history isn't interrupted.
+      if (filterChanged || nearTop) {
+        container.scrollTop = 0;
+      } else {
+        container.scrollTop = prevTop;
+      }
+    } catch (err) {
+      const c = this.shadowRoot?.getElementById("debug-log-entries");
+      if (c) c.innerHTML = '<div class="log-entry-error" style="padding:12px;">Error loading logs: ' + this._esc(err) + '</div>';   // jh-r19-xss
+    }
+  }
+
+  // ─── Data (mock for session 1; live HA hookup session 2) ────────────────
+
+  async _fetchKnowledge() {
+    if (!this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/get_knowledge" });
+      this._knowledge = { facts: res?.facts || [], stats: res?.stats || {} };
+    } catch (err) {
+      this._knowledge = { facts: [], stats: {}, error: String(err) };
+    }
+    this._knowledgeLoaded = true;
+    this._renderKnowledgeList();
+  }
+
+  async _fetchPersonRoutines() {
+    if (!this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/get_person_routines" });
+      this._personRoutines = { groups: res?.routines || {} };
+    } catch (err) {
+      this._personRoutines = { groups: {}, error: String(err) };
+    }
+    this._personRoutinesLoaded = true;
+    this._renderPersonRoutines();
+  }
+
+  _renderPersonRoutines() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const list = root.getElementById("proutine-list");
+    if (!list) return;
+    const esc = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    const groups = this._personRoutines?.groups || {};
+    const people = Object.keys(groups).sort();
+    if (this._personRoutines?.error) {
+      list.innerHTML = `<div class="mem-empty">Couldn't load routines — ${esc(this._personRoutines.error)}</div>`;
+      return;
+    }
+    if (!people.length) {
+      list.innerHTML = this._personRoutinesLoaded
+        ? `<div class="mem-empty">Nothing person-specific learned yet — JARVIS needs a few weeks of sole-occupant data before routines are confidently individual.</div>`
+        : `<div class="mem-empty">Loading…</div>`;
+      return;
+    }
+    list.innerHTML = people.map(person => {
+      const items = groups[person]
+        .slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+        .map(r => {
+          const pct = Math.round((r.confidence || 0) * 100);
+          return `<div class="proutine-item">
+            <div class="proutine-desc">${esc(r.description)}</div>
+            <div class="proutine-meta">
+              <span class="sug-conf"><i style="width:${pct}%"></i></span>
+              <span class="sug-pct">${pct}% · ×${esc(r.occurrences || '?')}</span>
+            </div>
+          </div>`;
+        }).join("");
+      const label = esc(person.replace(/_/g, " ")).replace(/\b\w/g, c => c.toUpperCase());
+      return `<div class="mem-group"><div class="mem-group-head">${label}</div>${items}</div>`;
+    }).join("");
+  }
+
+  async _fetchBriefings() {
+    if (!this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/briefings", limit: 10 });
+      this._briefings = { items: res?.briefings || [] };
+    } catch (err) {
+      this._briefings = { items: [], error: String(err) };
+    }
+    this._briefingsLoaded = true;
+    this._renderBriefings();
+  }
+
+  _renderBriefings() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const list = root.getElementById("briefings-list");
+    if (!list) return;
+    const esc = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    if (this._briefings?.error) {
+      list.innerHTML = `<div class="mem-empty">Couldn't load briefings — ${esc(this._briefings.error)}</div>`;
+      return;
+    }
+    const items = this._briefings?.items || [];
+    if (!items.length) {
+      list.innerHTML = this._briefingsLoaded
+        ? `<div class="mem-empty">No briefings yet — they appear here once JARVIS has delivered one.</div>`
+        : `<div class="mem-empty">Loading…</div>`;
+      return;
+    }
+    const when = (ts) => {
+      if (!ts) return "";
+      const d = new Date(/Z|[+-]\d\d:?\d\d$/.test(ts) ? ts : ts + "Z");
+      return isNaN(d) ? "" : d.toLocaleString();
+    };
+    list.innerHTML = items.map((b, i) => `
+      <div class="brief-item ${i === 0 ? 'brief-latest' : ''}">
+        <div class="brief-when">${esc(when(b.timestamp))}${i === 0 ? ' · latest' : ''}</div>
+        <div class="brief-text">${esc(b.text)}</div>
+      </div>`).join("");
+  }
+
+  _renderKnowledgeList() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const list = root.getElementById("memory-list");
+    if (!list) return;
+    const esc = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    const facts = this._knowledge?.facts || [];
+    const count = root.getElementById("mem-count");
+    if (count) count.textContent = facts.length + (facts.length === 1 ? " FACT" : " FACTS");
+    if (this._knowledge?.error) {
+      list.innerHTML = `<div class="mem-empty">Couldn't load memory — ${esc(this._knowledge.error)}</div>`;
+      return;
+    }
+    if (!facts.length) {
+      list.innerHTML = this._knowledgeLoaded
+        ? `<div class="mem-empty">Nothing yet. Say "remember that…" to JARVIS, or teach it above.</div>`
+        : `<div class="mem-empty">Loading…</div>`;
+      return;
+    }
+    const groups = {};
+    facts.forEach(f => { (groups[f.subject] = groups[f.subject] || []).push(f); });
+    const labels = { household: "HOUSEHOLD", primary: "ABOUT ME" };
+    const order = Object.keys(groups).sort(
+      (a, b) => (a === "household" ? -1 : b === "household" ? 1 : a.localeCompare(b)));
+    list.innerHTML = order.map(subj => {
+      const items = groups[subj].map(f => {
+        const soft = (f.source !== "stated" || (f.confidence ?? 1) < 0.9);
+        const hedge = soft
+          ? `<span class="mem-hedge" title="${esc(f.source)} · ${Math.round((f.confidence ?? 1) * 100)}% sure">~</span>`
+          : "";
+        const exp = f.expires_at ? `<span class="mem-exp" title="expires">⌛</span>` : "";
+        return `<div class="mem-fact" data-id="${esc(f.id)}">
+          <div class="mem-kv"><span class="mem-key">${esc(f.key)}</span><span class="mem-val">${esc(f.value)}${hedge}${exp}</span></div>
+          <button class="mem-forget" data-id="${esc(f.id)}" title="Forget this" aria-label="Forget">✕</button>
+        </div>`;
+      }).join("");
+      const label = labels[subj] || esc(subj.replace(/_/g, " ").toUpperCase());
+      return `<div class="mem-group"><div class="mem-group-head">${label}</div>${items}</div>`;
+    }).join("");
+    list.querySelectorAll(".mem-forget").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const id = parseInt(e.currentTarget.getAttribute("data-id"), 10);
+        if (!isNaN(id)) this._forgetKnowledge(id);
+      });
+    });
+  }
+
+  async _teachKnowledge() {
+    const root = this.shadowRoot;
+    if (!root || !this._hass) return;
+    const keyEl = root.getElementById("mem-key");
+    const valEl = root.getElementById("mem-val");
+    const subjEl = root.getElementById("mem-subject");
+    const key = (keyEl?.value || "").trim();
+    const value = (valEl?.value || "").trim();
+    const subject = subjEl?.value || "household";
+    if (!key || !value) return;
+    try {
+      const res = await this._hass.callWS({
+        type: "jarvis/add_knowledge", key, value, subject,
+        kind: subject === "primary" ? "preference" : "fact",
+      });
+      this._knowledge = { facts: res?.facts || [], stats: this._knowledge.stats };
+      if (keyEl) keyEl.value = "";
+      if (valEl) valEl.value = "";
+      if (keyEl) keyEl.focus();
+    } catch (err) { /* keep inputs; nothing intrusive */ }
+    this._knowledgeLoaded = true;
+    this._renderKnowledgeList();
+  }
+
+  async _forgetKnowledge(id) {
+    if (!this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/forget_knowledge", fact_id: id });
+      this._knowledge = { facts: res?.facts || [], stats: this._knowledge.stats };
+    } catch (err) { /* leave list as-is on error */ }
+    this._renderKnowledgeList();
+  }
+
+  // ─── greeting/data helpers ──────────────────────────────────────────────
+
+  _greeting() {
+    const h = new Date().getHours();
+    if (h < 5)  return "Good evening";
+    if (h < 12) return "Good morning";
+    if (h < 18) return "Good afternoon";
+    return "Good evening";
+  }
+
+  // The configured form of address (Settings → honorific), e.g. a name instead
+  // of "sir". Surfaced via panel_data config; falls back to "sir" (the default)
+  // when unset or before live data arrives. (issue #210)
+  _honorific() {
+    let h;
+    try { h = this._data()?.config?.honorific; } catch (_e) { h = null; }
+    return (h && String(h).trim()) || "sir";
+  }
+
+  // ─── global search (issue #209) ─────────────────────────────────────────
+  // A header search over BOTH Home Assistant entities and panel sections, so
+  // the user can jump straight to a place (e.g. Excluded Entities) or find an
+  // entity by name instead of hunting through tabs.
+  _searchIndex() {
+    return [
+      { label: "Command Center", tab: "dashboard", kw: "dashboard home status overview" },
+      { label: "Chat", tab: "chat", kw: "chat message talk type text assistant ask conversation" },
+      { label: "Residence", tab: "residence", kw: "rooms areas floor plan" },
+      { label: "Intrusion", tab: "intrusion", kw: "security alarm breach lockdown" },
+      { label: "Faces", tab: "faces", kw: "face recognition household residents guests visitors" },
+      { label: "Suggestions", tab: "suggestions", kw: "ideas recommendations" },
+      { label: "Settings", tab: "settings", kw: "configuration options preferences" },
+      { label: "Logs", tab: "logs", kw: "debug history events" },
+      { label: "Memory", tab: "memory", kw: "knowledge facts routines" },
+      { label: "Settings · General", tab: "settings", section: "general", kw: "residence sub-agents mode diagnostics" },
+      { label: "Settings · Voice & Audio", tab: "settings", section: "voice", kw: "ai models briefings voice confirmation speakers tts" },
+      { label: "Settings · Learning", tab: "settings", section: "learning", kw: "anticipation memory observer routine" },
+      { label: "Settings · Safety & Energy", tab: "settings", section: "safety", kw: "notifications muted sentinel hazard energy appliances" },
+      { label: "Settings · Cameras", tab: "settings", section: "cameras", kw: "camera doorbell diagnostics" },
+      { label: "Settings · Home & Extras", tab: "settings", section: "home", kw: "wellbeing character documents extras" },
+      { label: "Settings · Floor Plan", tab: "settings", section: "floorplan", kw: "floorplan map rooms floor plan editor" },
+      { label: "Settings · Governance", tab: "settings", section: "governance", kw: "governance enforce enforcement kernel kill-switch autonomy safety continuity authority intrusion hazard" },
+      { label: "Excluded Entities", tab: "settings", section: "learning", kw: "exclude ignore entity hide noise" },
+      { label: "Floor Plan Editor", tab: "settings", section: "floorplan", kw: "floorplan map rooms floor plan" },
+      { label: "Cameras", tab: "settings", section: "cameras", kw: "camera" },
+      { label: "Notifications", tab: "settings", section: "safety", kw: "notify phone push" },
+      { label: "Muted Announcements", tab: "settings", section: "safety", kw: "mute shush silence" },
+      { label: "AI Models", tab: "settings", section: "voice", kw: "model provider llm" },
+      { label: "Sentinel Rules", tab: "settings", section: "safety", kw: "sentinel rule" },
+    ];
+  }
+
+  // Switch tab (and, for Settings, the active sub-section) programmatically —
+  // the same transitions the tab bar / sub-nav click handlers perform.
+  _navigateTo(tab, section) {
+    if (tab && tab !== this._currentTab) {
+      this._currentTab = tab;
+      if (tab !== "dashboard") { try { this._jhRtcStop(); } catch (err) {} }   // jh-r16-rtc: no stream on another tab
+      this._render();
+      if (tab === "logs") this._fetchDebugLog();
+      if (tab === "memory") { this._fetchKnowledge(); this._fetchPersonRoutines(); this._fetchBriefings(); }
+    }
+    if (tab === "settings" && section) {
+      this._settingsSection = section;
+      this._applySettingsSections();
+    }
+  }
+
+  _runGlobalSearch(q) {
+    const box = this.shadowRoot && this.shadowRoot.getElementById("gsearch-results");
+    if (!box) return;
+    const query = String(q || "").trim().toLowerCase();
+    if (!query) { box.hidden = true; box.innerHTML = ""; return; }
+    const secs = this._searchIndex().filter(s =>
+      s.label.toLowerCase().includes(query) || (s.kw || "").includes(query)).slice(0, 6);
+    const states = this._hass?.states || {};
+    const ents = [];
+    for (const eid of Object.keys(states).sort()) {
+      const name = String(this._entName(eid) || "");
+      if (eid.toLowerCase().includes(query) || name.toLowerCase().includes(query)) {
+        ents.push(eid);
+        if (ents.length >= 8) break;
+      }
+    }
+    let html = "";
+    if (secs.length) {
+      html += `<div class="gs-group">Sections</div>` + secs.map(s =>
+        `<button class="gs-item" data-kind="section" data-tab="${this._esc(s.tab)}" data-section="${this._esc(s.section || '')}">${this._esc(s.label)}</button>`).join('');
+    }
+    if (ents.length) {
+      html += `<div class="gs-group">Entities</div>` + ents.map(eid =>
+        `<button class="gs-item" data-kind="entity" data-eid="${this._esc(eid)}"><span class="gs-ent-name">${this._esc(this._entName(eid))}</span><span class="gs-ent-id">${this._esc(eid)}</span></button>`).join('');
+    }
+    box.innerHTML = html || `<div class="gs-empty">No matches.</div>`;
+    box.hidden = false;
+  }
+
+  _onGlobalSearchPick(el) {
+    const kind = el.getAttribute("data-kind");
+    if (kind === "section") {
+      this._navigateTo(el.getAttribute("data-tab"), el.getAttribute("data-section") || null);
+    } else if (kind === "entity") {
+      const eid = el.getAttribute("data-eid");
+      // Land on the Excluded-Entities card (Settings → Learning) and pre-fill the
+      // entity picker — the task the reporter was doing when they hit the gap.
+      this._navigateTo("settings", "learning");
+      setTimeout(() => {
+        const f = this.shadowRoot && this.shadowRoot.getElementById("excl-ent-input");
+        if (f) { f.value = eid; f.focus(); }
+      }, 0);
+    }
+    const box = this.shadowRoot && this.shadowRoot.getElementById("gsearch-results");
+    if (box) { box.hidden = true; box.innerHTML = ""; }
+    const input = this.shadowRoot && this.shadowRoot.getElementById("gsearch-input");
+    if (input) input.value = "";
+  }
+
+  _mockData() {
+    return {
+      observer:   { state: "RUNNING", level: "live" },
+      sleep:      { state: "AWAKE",   level: "live" },
+      llm_providers: { state: "UNSET", level: "warn" },
+      broadcast:  { state: "ONLINE",  level: "live" },
+      notify:     { state: "UNSET",   level: "warn" },
+      satellites: { state: "8 / 8",   level: "live" },
+      bedrooms: 3,
+      areas: 11,
+      announcements_today: 14,
+      est_cost: "$0.03",
+      uptime: "2d 14h",
+      dominantRoom: {
+        name: "Kitchen",
+        subtitle: "Occupied · 14m",
+        coord: "#02 · Second Floor",
+        temp: "72°",
+        humidity: "44%",
+        lights: "ON",
+        satellite: "ES-E3E534",
+        lastMotion: "00:08",
+      },
+      areasGrid: [
+        { name: "Kitchen",         meta: "sat · spkr · mmwave", active: true,  bedroom: false },
+        { name: "Office",          meta: "sat · spkr · mmwave", active: true,  bedroom: false },
+        { name: "Great Room",      meta: "sat · spkr · mmwave", active: false, bedroom: false },
+        { name: "Dining Room",     meta: "sat · spkr",           active: false, bedroom: false },
+        { name: "Entry",           meta: "sat · spkr · mmwave", active: false, bedroom: false },
+        { name: "Master Bedroom",  meta: "sat · spkr · mmwave", active: false, bedroom: true },
+        { name: "Guest Room",      meta: "sat · spkr · mmwave", active: false, bedroom: true },
+        { name: "Eliana's Room",   meta: "sat · spkr · mmwave", active: false, bedroom: true },
+        { name: "Garage",          meta: "sat · mmwave · cam",  active: true,  bedroom: false },
+        { name: "Basement",        meta: "moisture · smoke",    active: false, bedroom: false },
+        { name: "Outdoor",         meta: "3 cameras",           active: false, bedroom: false },
+      ],
+      activity: [
+        { ts:"14:31", urgency:"medium",   tag:"KITCHEN",        msg:"motion detected, routing reply here" },
+        { ts:"14:18", urgency:"low",      tag:"WASHER",         msg:"cycle complete — announcement suppressed, existing automation handles this" },
+        { ts:"14:03", urgency:"medium",   tag:"FRONT DOOR",     msg:"opened — Sam home" },
+        { ts:"13:47", urgency:"high",     tag:"DOORBELL",       msg:"rang — no one recognized, broadcast sent" },
+        { ts:"13:41", urgency:"muted",    tag:"shush",          msg:"laundry room muted until reset" },
+        { ts:"13:22", urgency:"medium",   tag:"BRIEFING",       msg:"requested, delivered to home group" },
+        { ts:"12:58", urgency:"low",      tag:"GARAGE",         msg:"door closed" },
+        { ts:"12:14", urgency:"medium",   tag:"OFFICE",         msg:"Sam entered, switching observer context" },
+        { ts:"11:30", urgency:"low",      tag:"OBSERVER",       msg:"quiet interval — 23 events classified, 0 spoken" },
+        { ts:"09:12", urgency:"critical", tag:"LEAK",           msg:"moisture detected in basement — broadcast override fired" },
+        { ts:"08:45", urgency:"medium",   tag:"GOOD MORNING",   msg:"briefing delivered on schedule" },
+        { ts:"08:03", urgency:"low",      tag:"MASTER BEDROOM", msg:"motion, sleep mode cleared" },
+      ],
+      roomRotation: [
+        { name: "Kitchen", subtitle: "Occupied · 14m", coord: "#02 · Second Floor", temp: "72°", humidity: "44%", lights: "ON"  },
+        { name: "Office",  subtitle: "Occupied · 3m",  coord: "#05 · Second Floor", temp: "70°", humidity: "41%", lights: "ON"  },
+        { name: "Garage",  subtitle: "Occupied · 1m",  coord: "#09 · Ground Floor", temp: "66°", humidity: "52%", lights: "OFF" },
+      ],
+    };
+  }
+
+  /**
+   * Return the data used for rendering. Prefers live WS data; falls back to
+   * mock if WS hasn't responded yet. Shapes returned to match _mockData().
+   */
+  _data() {
+    if (!this._liveData) return this._mockData();
+    const live = this._liveData;
+    return {
+      observer:   live.status.observer,
+      sleep:      live.status.sleep,
+      llm_providers: live.status.llm_providers,
+      broadcast:  live.status.broadcast,
+      notify:     live.status.notify,
+      satellites: live.status.satellites,
+      bedrooms:            live.meta.bedrooms,
+      areas:               live.meta.areas_monitored,
+      announcements_today: live.meta.announcements_today,
+      est_cost:            live.meta.est_cost,
+      uptime:              live.meta.uptime,
+      dominantRoom: {
+        name:       live.dominant.name,
+        subtitle:   live.dominant.subtitle,
+        coord:      live.dominant.coord,
+        temp:       live.dominant.temp,
+        humidity:   live.dominant.humidity,
+        lights:     live.dominant.lights,
+        satellite:  live.dominant.satellite,
+        lastMotion: live.dominant.last_motion,
+      },
+      areasGrid: live.areas.map(a => ({
+        id: a.id,
+        name: a.name,
+        caps: a.caps || [],
+        active: a.active,
+        bedroom: a.bedroom,
+        lights_on: a.lights_on || 0,
+        lights_total: a.lights_total || 0,
+        temp: a.temp || null,
+        humidity: a.humidity || null,
+        temp_entity: a.temp_entity || null,
+        humidity_entity: a.humidity_entity || null,
+        last_motion: a.last_motion || null,
+      })),
+      activity: this._activityData && this._activityData.length > 0
+        ? this._activityData
+        : [{ ts: "--:--", urgency: "low", tag: "SYSTEM", msg: "No activity yet. Enable announcements or observer to see events here." }],
+      config: live.config || {},
+      onboarding: live.onboarding || null,
+      doors: live.doors || {},
+      // v7.94.0: goals card. Also fixes suggestions, which _data() never
+      // carried through from the raw payload — _renderSuggestions(d) has
+      // been reading undefined since it was added.
+      suggestions: live.suggestions || [],
+      goals: live.goals || [],
+    };
+  }
+
+  /**
+   * Patch only the fields that change frequently, without tearing down the
+   * whole DOM. Called on every 5s WS refresh when shape is unchanged.
+   */
+  // Keep the masthead lockdown switch + status badge in sync with the real
+  // backend state on every poll — whether engaged from the toggle or
+  // auto-engaged by the alarm arming. Runs before the settings/logs early
+  // returns below, since the masthead is shared across all tabs.
+  _patchLockdown(live) {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const active = !!(live && live.lockdown && live.lockdown.active);
+    const btn = root.getElementById("lockdown-btn");
+    if (btn) {
+      btn.classList.toggle("on", active);
+      btn.setAttribute("aria-checked", active ? "true" : "false");
+      btn.setAttribute("title", active ? "Lockdown engaged — tap to lift" : "Tap to engage lockdown");
+      const state = btn.querySelector(".ld-state");
+      if (state) state.textContent = active ? "ARMED" : "OFF";
+    }
+    const badge = root.querySelector(".status-badge");
+    if (badge) {
+      badge.classList.toggle("alert", active);
+      badge.textContent = `[ STATUS: ${active ? "LOCKDOWN" : "NOMINAL"} ]`;
+    }
+  }
+
+  _patchLiveDom(live) {
+    const root = this.shadowRoot;
+    if (!root) return;
+    this._patchLockdown(live);
+    // On settings tab, DON'T re-render automatically — it destroys
+    // open dropdown menus and resets user interaction state. Settings
+    // data only updates when user clicks a toggle/dropdown (which
+    // calls _fetchLiveData → _render explicitly after the WS call).
+    if (this._currentTab === "settings") {
+      return;
+    }
+    if (this._currentTab === "logs") {
+      this._fetchDebugLog();
+      return;
+    }
+    // Status rows — scoped to dashboard's .c-status panel only
+    const statusPanel = root.querySelector(".c-status");
+    if (statusPanel) {
+      const rows = statusPanel.querySelectorAll(".status-row");
+      const statusKeys = ["observer", "sleep", "llm_providers", "broadcast", "notify", "satellites"];
+      rows.forEach((row, i) => {
+        const key = statusKeys[i];
+        const st = live.status[key];
+        if (!st) return;
+        row.className = `status-row ${st.level}`;
+        const dot = row.querySelector(".dot");
+        if (dot) dot.className = `dot ${st.level}`;
+        const v = row.querySelector(".v");
+        if (v) v.textContent = st.state;
+      });
+    }
+    // Meta block — scoped to .meta inside .c-status
+    const metaEl = statusPanel ? statusPanel.querySelector(".meta") : null;
+    if (metaEl) {
+      const metaSpans = metaEl.querySelectorAll("span");
+      if (metaSpans.length >= 4) {
+        metaSpans[0].textContent = live.meta.bedrooms;
+        metaSpans[1].textContent = live.meta.areas_monitored;
+        metaSpans[2].textContent = live.meta.announcements_today;
+        metaSpans[3].textContent = live.meta.uptime;
+      }
+    }
+    // Dominant room
+    const nameEl  = root.querySelector("#dom-name");
+    const subEl   = root.querySelector("#dom-sub");
+    const coordEl = root.querySelector("#dom-coord");
+    const footSpans = root.querySelectorAll(".anchor-foot span");
+    if (nameEl)  nameEl.textContent  = live.dominant.name;
+    this._jhRoomPinSync(root, live);   // jh-room-pin (step 155)
+    if (subEl)   subEl.textContent   = live.dominant.subtitle;
+    if (coordEl) coordEl.textContent = live.dominant.coord;
+    this._updateDomGauges(live.dominant);
+    if (footSpans.length >= 2) {
+      footSpans[footSpans.length - 2].textContent = live.dominant.last_motion;
+      footSpans[footSpans.length - 1].textContent = live.dominant.satellite;
+    }
+    const areaEls = root.querySelectorAll(".area");
+    areaEls.forEach((el) => {
+      const a = live.areas.find((area) => area.id === el.getAttribute("data-area-id"));
+      if (a) el.classList.toggle("active", !!a.active);
+    });
+    const ctlOn = live.config?.light_control_enabled !== false;
+    root.querySelectorAll(".area-light").forEach((lightBtn) => {
+      const a = live.areas.find((area) => area.id === lightBtn.getAttribute("data-light-area"));
+      if (!a) return;
+      const lit = (a.lights_total || 0) > 0 && (a.lights_on || 0) > 0;
+      lightBtn.classList.toggle("on", lit);
+      lightBtn.title = `${a.lights_on}/${a.lights_total} lights on${ctlOn ? ' — tap to toggle' : ''}`;
+      const dotLabel = lightBtn.lastChild;
+      if (dotLabel && dotLabel.nodeType === Node.TEXT_NODE) {
+dotLabel.textContent = lightBtn.classList.contains("adl")
+        ? `${a.lights_on}/${a.lights_total} ${lit ? 'ON' : 'OFF'}`
+        : (lit ? 'ON' : 'OFF');
+      }
+    });
+
+    // Activity feed — rebuild rows in place (v6.43.x: previously the feed
+    // only refreshed on a full structural re-render, so it silently went
+    // stale). Respects the active search filter; the input keeps focus.
+    this._updateActivityFeed();
+
+    // Floor plan — rebuild with fresh presence. _fetchMmwave rebuilds the
+    // house after mmWave data lands, so the plan reflects live detection.
+    if (this._currentTab === 'residence') {
+      this._fetchMmwave();
+    }
+  }
+
+  // ─── Rendering ───────────────────────────────────────────────────────────
+
+  // ── UI localization (v7.94.0) ── post-render text swap. The panel renders in
+  // English, then any standalone label whose exact text matches a key in the loaded
+  // language file is swapped. Strings fused with dynamic values (counts, entity/model
+  // names) never exact-match, so technical values stay unchanged. Language files live
+  // at /jarvis_panel_static/i18n/<lang>.json, keyed by the English string.
+  _resolveUiLang() {
+    try {
+      // Prefer the live <select> value over the last-fetched config. On change,
+      // the generic cfg-field handler saves ui_language and re-fetches
+      // asynchronously; _loadUiStrings (fired by the select's own handler) used
+      // to read the not-yet-updated config and so always loaded the PREVIOUS
+      // language — the off-by-one the panel's language picker showed (#148). The
+      // select already holds the newly chosen value, so read it directly.
+      const sel = this.shadowRoot && this.shadowRoot.getElementById("ui-lang-select");
+      const val = (sel && sel.value)
+        || (this._data && this._data() && this._data().config && this._data().config.ui_language);
+      if (val && val !== "auto") return String(val);
+    } catch (_) {}
+    return (this._hass && this._hass.language) || "en";
+  }
+  _loadUiStrings(explicit) {
+    // `explicit` (the just-chosen language) wins over whatever the DOM/config
+    // currently reports, so the language switch can't lag by one selection.
+    // Returns a promise so the caller can order save/re-render after the load.
+    const picked = (explicit && explicit !== "auto") ? explicit : this._resolveUiLang();
+    const full = (picked || "en").toLowerCase();
+    const base = full.split("-")[0];
+    if (this._uiLangLoaded === full) return Promise.resolve();   // already handled this language
+    this._uiLangLoaded = full;
+    if (base === "en") { this._uiStrings = null; return Promise.resolve(); }
+    // Try the full tag first (e.g. pt-br.json, zh-hans.json), then fall back to the base
+    // language (pt.json, zh.json), so region variants can be added without code changes.
+    const grab = (lang) => fetch("/jarvis_panel_static/i18n/" + lang + ".json").then((r) => (r.ok ? r.json() : null));
+    return grab(full)
+      .then((d) => (d || (full !== base ? grab(base) : null)))
+      .then((dict) => { this._uiStrings = dict || null; if (this._hass && this.shadowRoot) this._render(); })
+      .catch(() => { this._uiStrings = null; });
+  }
+  _localizeDOM(root) {
+    const dict = this._uiStrings;
+    if (!dict || !root) return;
+    try {
+      const walker = document.createTreeWalker(root, 4, null);   // 4 = NodeFilter.SHOW_TEXT (avoid global dep)
+      const swaps = [];
+      let n;
+      while ((n = walker.nextNode())) {
+        const raw = n.nodeValue;
+        if (!raw) continue;
+        const key = raw.trim();
+        if (key && dict[key]) swaps.push([n, raw.replace(key, dict[key])]);
+      }
+      for (const s of swaps) s[0].nodeValue = s[1];
+      root.querySelectorAll("[title],[placeholder]").forEach((el) => {
+        ["title", "placeholder"].forEach((attr) => {
+          const v = el.getAttribute(attr);
+          if (v && dict[v.trim()]) el.setAttribute(attr, v.replace(v.trim(), dict[v.trim()]));
+        });
+      });
+    } catch (_) {}
+  }
+
+  // ── Chat tab (issue #322) ─────────────────────────────────────────────────
+  // A type-to-JARVIS window so users who'd rather write than talk (or who are
+  // up late with others asleep) don't have to leave the panel for HA's Assist
+  // box. It routes through JARVIS's own HA conversation entity, so it's the
+  // exact same brain as voice — questions and home control both work. Purely
+  // additive and frontend-only: no new backend command, no kernel surface.
+
+  /** The JARVIS conversation entity_id, or null to let HA pick its default
+   *  agent. State-scan only (the panel is not admin-gated, so the entity
+   *  registry WS isn't available to every user). Cached per hass object. */
+  _jarvisAgentId() {
+    const st = this._hass?.states || {};
+    if (st["conversation.jarvis"]) return "conversation.jarvis";
+    for (const id of Object.keys(st)) {
+      if (!id.startsWith("conversation.")) continue;
+      const fn = (st[id].attributes?.friendly_name || "").toLowerCase();
+      if (id.includes("jarvis") || fn.includes("jarvis")) return id;
+    }
+    return null;  // fall back to HA's default conversation agent
+  }
+
+  _chatAgentLabel() {
+    return this._jarvisAgentId() ? "JARVIS AGENT" : "HA DEFAULT AGENT";
+  }
+
+  _renderChatMessages() {
+    if (!this._chatMessages.length) {
+      return `<div class="chat-empty">Ask JARVIS anything — "is the garage open?", "turn off the lab lights", "what's on my calendar tomorrow?"</div>`;
+    }
+    const rows = this._chatMessages.map((m, i) => {
+      const cls = m.role === "user" ? "chat-msg chat-user"
+                : m.role === "error" ? "chat-msg chat-error"
+                : "chat-msg chat-jarvis";
+      const who = m.role === "user" ? "YOU" : m.role === "error" ? "ERROR" : "JARVIS";
+      return `<div class="${cls}"><button class="chat-del" data-i="${i}" title="Delete">✕</button><span class="chat-who">${who}</span><span class="chat-text">${this._esc(m.text)}</span></div>`;
+    }).join("");
+    const typing = this._chatBusy
+      ? `<div class="chat-msg chat-jarvis chat-typing"><span class="chat-who">JARVIS</span><span class="chat-think"><svg class="chat-spark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1l2.6 8.4L23 12l-8.4 2.6L12 23l-2.6-8.4L1 12l8.4-2.6z"/></svg><span class="chat-think-t">Thinking</span><span class="chat-think-s">${Math.floor((Date.now() - (this._chatStart || Date.now())) / 1000)}s</span></span></div>`
+      : "";
+    return rows + typing;
+  }
+
+  /** Repaint only the chat log + compose controls — never a full _render(), so
+   *  the input keeps focus and the message history isn't torn down mid-type. */
+  _refreshChat() {
+    this._chatTag();
+    const log = this.shadowRoot?.getElementById("chat-log");
+    if (log) {
+      log.innerHTML = this._renderChatMessages();
+      log.scrollTop = log.scrollHeight;
+    }
+    const input = this.shadowRoot?.getElementById("chat-input");
+    const send  = this.shadowRoot?.getElementById("chat-send");
+    if (input) input.disabled = this._chatBusy;
+    if (send)  { send.disabled = this._chatBusy; send.textContent = this._chatBusy ? "…" : "SEND"; }
+  }
+
+  // Jarvis Home patch (2026-11-06): history follows the login on every device. A save reads what is stored first and merges
+  // by message id, so a phone and a PC cannot erase each other. Deleted ids travel in "removed". Nothing is written unless
+  // that read worked, so a failed load cannot wipe the history.
+  _chatTag() {
+    this._chatMessages.forEach((m) => {
+      m.t = m.t || Date.now();
+      m.id = m.id || m.t.toString(36) + Math.random().toString(36).slice(2, 8);
+    });
+  }
+
+  _chatMerge(stored) {
+    this._chatTag();
+    const gone = new Set(Array.isArray(stored?.removed) ? stored.removed : []);
+    this._chatRemoved.forEach((id) => gone.add(id));
+    const byId = new Map();
+    let last = 0;
+    (Array.isArray(stored?.messages) ? stored.messages : []).forEach((m, i) => {
+      if (!m || typeof m.text !== "string") return;
+      const id = m.id || "old" + i + "-" + m.role + "-" + m.text.length;   // saved before ids existed: the same on every device
+      last = m.t || last + 1;   // no time of its own: it stays right after the message before it
+      byId.set(id, { ...m, id, t: last });
+    });
+    if (this._chatWipe) byId.forEach((m, id) => gone.add(id));
+    this._chatMessages.forEach((m) => byId.set(m.id, m));
+    return {
+      messages: [...byId.values()].filter((m) => !gone.has(m.id)).sort((a, b) => a.t - b.t).slice(-200),
+      removed: [...gone].slice(-1000),
+    };
+  }
+
+  _chatApply(list) {
+    const same = list.length === this._chatMessages.length && list.every((m, i) => m === this._chatMessages[i]);
+    this._chatMessages = list;
+    if (!same) this._refreshChat();
+  }
+
+  async _loadChat() {
+    if (this._chatLoaded || this._chatLoading || !this._hass) return;
+    this._chatLoading = true;
+    try {
+      const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+      this._chatApply(this._chatMerge(res?.value).messages);
+      this._chatLoaded = true;
+    } catch (err) { console.warn("JARVIS chat: history not loaded", err); }
+    this._chatLoading = false;
+  }
+
+  // Home Assistant has no compare-and-set, so two devices saving at the same moment can overwrite each other. A moment after a
+  // write, read it back and put back what went missing. This narrows the window; it cannot close it.
+  async _chatRecheck(value) {
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+      const have = new Set((res?.value?.messages || []).map((m) => m?.id));
+      if (value.messages.every((m) => have.has(m.id))) return;
+      const again = this._chatMerge(res?.value);
+      this._chatApply(again.messages);
+      await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_chat", value: again });
+    } catch (err) { console.warn("JARVIS chat: history not checked", err); }
+  }
+
+  _saveChat() {
+    if (!this._hass) return Promise.resolve();
+    const run = async () => {
+      let wipe = false;
+      try {
+        const res = await this._hass.callWS({ type: "frontend/get_user_data", key: "jarvis_chat" });
+        const value = this._chatMerge(res?.value);
+        wipe = this._chatWipe;
+        this._chatWipe = false;
+        this._chatApply(value.messages);
+        this._chatLoaded = true;
+        await this._hass.callWS({ type: "frontend/set_user_data", key: "jarvis_chat", value });
+        await this._chatRecheck(value);
+      } catch (err) {
+        this._chatWipe = this._chatWipe || wipe;   // the next save tries again with everything still in memory
+        console.warn("JARVIS chat: history not saved", err);
+      }
+    };
+    this._chatSaving = (this._chatSaving || Promise.resolve()).then(run);
+    return this._chatSaving;
+  }
+
+  // Jarvis Home patch (2026-11-05): the chat box fills the window on any screen; messages scroll inside it.
+  _sizeChat() {
+    const pn = this.shadowRoot?.querySelector(".chat-panel");
+    if (!pn) return;
+    const ft = this.shadowRoot.querySelector(".footer");
+    const h = window.innerHeight - pn.getBoundingClientRect().top - (ft ? ft.offsetHeight : 0) - 28;
+    pn.style.height = Math.max(320, Math.round(h)) + "px";
+    const log = this.shadowRoot.getElementById("chat-log");
+    if (log) log.scrollTop = log.scrollHeight;
+  }
+
+  // Jarvis Home patch (2026-11-05): the indicator lives only while a request is really pending.
+  _startThink() {
+    this._chatStart = Date.now();
+    clearInterval(this._thinkTimer);
+    this._thinkTimer = setInterval(() => {
+      if (!this._chatBusy) { clearInterval(this._thinkTimer); return; }
+      const el = this.shadowRoot?.querySelector(".chat-think-s");
+      if (el) el.textContent = Math.floor((Date.now() - this._chatStart) / 1000) + "s";
+    }, 1000);
+  }
+
+  _deleteChatMessage(i) {
+    if (this._chatBusy && i === this._chatMessages.length - 1 && this._chatMessages[i]?.role === "user") {
+      this._chatReq = (this._chatReq || 0) + 1;
+      this._chatBusy = false;
+      this._spokenCut();   // spoken words still waiting to be sent go too
+    }
+    this._chatTag();
+    if (this._chatMessages[i]) this._chatRemoved.add(this._chatMessages[i].id);
+    this._chatMessages.splice(i, 1);
+    this._saveChat();
+    this._refreshChat();
+  }
+
+  // Jarvis Home patch (2026-11-06): voice in the Chat tab, through Home Assistant's own Assist pipeline. One recording at a
+  // time, and the microphone is released on every path. Audio is kept from the first moment and sent when HA is ready, so the
+  // first word is not lost. While the button is held a pause does not end the recording: the release does.
+  async _toggleMic() {
+    if (this._micStop) { this._micStop(); return; }
+    if (this._micStarting) return;
+    const conn = this._hass?.connection;
+    const fail = (t) => { this._chatMessages.push({ role: "error", text: t }); this._refreshChat(); };
+    if (!conn) return;
+    if (!navigator.mediaDevices?.getUserMedia) { fail("The microphone needs the https address of this page."); return; }
+    this._micStarting = true;
+    this._wakeSync();
+    let stream, ctx, src, proc, hid = null, done = false, unsub = null, ended = false, quiet = false;
+    const early = [];
+    const box = () => this.shadowRoot?.getElementById("chat-input");
+    const btn = () => this.shadowRoot?.getElementById("chat-mic");
+    const hint0 = box()?.placeholder;
+    const endByte = () => { try { conn.socket.send(new Uint8Array([hid])); } catch (e) {} };
+    const stop = () => {
+      if (done) return;
+      done = true;
+      this._micStarting = false;
+      this._micStop = null;
+      this._micUntil = Date.now() + 2500;   // the words are still on their way from Home Assistant
+      if (box()) box().placeholder = hint0;
+      try { proc?.disconnect(); src?.disconnect(); } catch (e) {}
+      stream?.getTracks().forEach((t) => t.stop());
+      ctx?.close()?.catch?.(() => {});
+      if (hid !== null) endByte();
+      btn()?.classList.remove("on");
+    };
+    const finish = () => {
+      ended = true;
+      this._micUntil = 0;
+      if (!unsub) return;
+      const u = unsub;
+      unsub = null;
+      Promise.resolve().then(u).catch(() => {});
+    };
+    const send = (pcm) => this._micSend(conn, hid, pcm);
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (err) { this._micStarting = false; fail("Microphone not available: " + (err?.message || err)); return; }
+    if (!this._micHeld) { stop(); return; }   // released during the permission prompt: no run, no message
+    try {
+      ({ ctx, src, proc } = this._micPipe(stream, (pcm) => {
+        if (done) return;
+        if (hid !== null) send(pcm);
+        else if (early.length < 400) early.push(pcm);
+      }));
+    } catch (err) { stop(); fail("Microphone not available: " + (err?.message || err)); return; }
+    this._micStop = stop;
+    this._micStarting = false;
+    btn()?.classList.add("on");
+    const onEvent = (ev) => {
+      if (ev.type === "run-start") {
+        hid = ev.data?.runner_data?.stt_binary_handler_id ?? null;
+        if (hid === null) return;
+        early.splice(0).forEach(send);
+        if (done) { quiet = true; endByte(); }   // released before HA was ready: a tap, so no complaint if nothing was said
+        else if (box()) box().placeholder = "Listening...";   // show that the mic is listening
+      } else if (ev.type === "stt-vad-end") stop();
+      else if (ev.type === "stt-end") {
+        stop();
+        finish();
+        const text = (ev.data?.stt_output?.text || "").trim();
+        if (text) this._chatSpoken(text);
+      } else if (ev.type === "error") {
+        stop();
+        finish();
+        if (!quiet) fail("Voice: " + (ev.data?.message || ev.data?.code || "not understood"));
+      } else if (ev.type === "run-end") { stop(); finish(); }
+    };
+    try {
+      const pipeId = await this._chatPipeline();
+      if (done) return;   // released before anything was asked of Home Assistant
+      const ask = (extra) => conn.subscribeMessage(onEvent, { type: "assist_pipeline/run", pipeline: pipeId, start_stage: "stt", end_stage: "stt",
+        input: { sample_rate: Math.round(ctx.sampleRate), ...extra }, timeout: 30 });
+      try { unsub = await ask({ no_vad: true }); }
+      catch (err) {
+        if (err?.code !== "invalid_format") throw err;
+        unsub = await ask({});   // a Home Assistant without no_vad here: a pause then ends the recording
+      }
+      if (ended) finish();
+    } catch (err) { stop(); fail("Voice: " + (err?.message || err)); }
+  }
+
+  // Jarvis Home patch (2026-11-06): the audio path of hold to talk and Hey JARVIS alike: microphone to 16 bit PCM at 16 kHz.
+  _micPipe(stream, onPcm) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx, src;
+    try {
+      try {
+        ctx = new AC({ sampleRate: 16000 });
+        src = ctx.createMediaStreamSource(stream);
+      } catch (err) {   // some browsers refuse a 16 kHz context on the microphone; Home Assistant converts other rates itself
+        ctx?.close()?.catch?.(() => {});
+        ctx = new AC();
+        src = ctx.createMediaStreamSource(stream);
+      }
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      proc.onaudioprocess = (e) => {
+        const f = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(f.length);
+        for (let i = 0; i < f.length; i++) pcm[i] = Math.max(-1, Math.min(1, f[i])) * 0x7fff;
+        onPcm(pcm);
+      };
+      src.connect(proc);
+      proc.connect(ctx.destination);
+      return { ctx, src, proc };
+    } catch (err) { ctx?.close()?.catch?.(() => {}); throw err; }
+  }
+
+  _micSend(conn, hid, pcm) {
+    const msg = new Uint8Array(1 + pcm.byteLength);
+    msg[0] = hid;
+    msg.set(new Uint8Array(pcm.buffer), 1);
+    try { conn.socket.send(msg); } catch (err) {}
+  }
+
+  // Words that came from the microphone: shown in the box, then sent unless they were changed. A typed draft is never replaced
+  // and never sent by itself (audit 2026-11-07): the words are added after it and wait for Send. While JARVIS is still answering
+  // the words wait in the box and go as soon as the reply is in. Words that still wait to be sent are no typed draft (round 2):
+  // the next utterance joins them and both go as one message. CLEAN and the red-cross cancel drop them (_spokenCut).
+  _chatSpoken(text) {
+    const box = this.shadowRoot?.getElementById("chat-input");
+    const draft = (box ? box.value : this._chatDraft || "").trim();
+    if (draft && draft === this._spokenText) text = draft + " " + text;
+    else if (draft) {
+      this._chatDraft = draft + " " + text;
+      if (box) box.value = this._chatDraft;
+      this._wakeSync();   // the run that heard these words has ended: Hey JARVIS listens again unless a message is typed
+      return;
+    }
+    this._chatDraft = this._spokenText = text;
+    if (box) box.value = text;
+    this._spokenWait = (this._spokenWait || 0) + 1;
+    this._wakeSync();
+    const cut = this._chatCut || 0;
+    const send = () => {
+      const live = this._chatDraft === text && cut === (this._chatCut || 0);
+      if (live && this._chatBusy && this.isConnected) { setTimeout(send, 300); return; }
+      this._spokenWait--;
+      if (this._spokenText === text) this._spokenText = null;
+      if (live) this._sendChat(text);
+    };
+    setTimeout(send, 1200);
+  }
+
+  // CLEAN and the red-cross cancel: spoken words that still wait to be sent are dropped, from the box too. A typed draft stays.
+  _spokenCut() {
+    this._chatCut = (this._chatCut || 0) + 1;
+    const text = this._spokenText;
+    this._spokenText = null;
+    if (!text || this._chatDraft !== text) return;
+    this._chatDraft = "";
+    const box = this.shadowRoot?.getElementById("chat-input");
+    if (box) box.value = "";
+  }
+
+  // Jarvis Home patch (2026-11-06): Hey JARVIS. While the switch is on and the panel is open the microphone feeds Home Assistant's
+  // own pipeline, from wake word to speech-to-text; audio goes nowhere else. _wakeSync decides everything from the live state: it
+  // is safe to call at any time and from anywhere. While the person talks by hand or JARVIS answers it lets go of the microphone
+  // and looks again every half second, so JARVIS cannot wake itself. While a message is typed (the box has the focus and holds
+  // text) it rests too, and its button says so; leaving or emptying the box ends that at once (audit 2026-11-07, round 2). A
+  // focused empty box does not count, nor does text in a box that is not in use: the box keeps the focus after every reply.
+  _wakeBusy() {
+    const a = this._chatAudio;
+    return !!(this._micHeld || this._micStop || this._micStarting || Date.now() < (this._micUntil || 0) || this._spokenWait
+      || this._chatBusy || this._speakBusy || (a && !a.paused && !a.ended && !a.error));
+  }
+
+  // Round 3: Hey JARVIS's own words that wait to be sent are no typing. A click on Send or another control of the bar takes the
+  // focus from the box a moment before the click itself, so a rest gets a second of grace (_wakeGrace) instead of starting a
+  // new run that the send would stop again at once.
+  _wakeTyping() {
+    const box = this.shadowRoot?.getElementById("chat-input");
+    const text = box ? box.value.trim() : "";
+    if (!text || text === this._spokenText) return false;
+    return this.shadowRoot.activeElement === box || Date.now() < (this._wakeGrace || 0);
+  }
+
+  _wakeSync() {
+    const conn = this._hass?.connection;
+    const rest = !!this._wakeOn && this._wakeTyping();
+    if (rest !== !!this._wakeRest) {   // resting while a message is typed shows on the button; when it ends, listen at once
+      this._wakeRest = rest;
+      if (!rest) { clearTimeout(this._wakeTimer); this._wakeTimer = null; }
+      this._wakeShow();
+    }
+    if (!this._wakeOn || !this.isConnected || !conn || conn.connected === false) { this._wakeHalt(); return; }
+    this._wakeHook(conn);
+    if (rest || this._wakeBusy()) {
+      this._wakeHalt();
+      this._wakeLater(500);
+    } else if (!this._wakeRun && !this._wakeTimer) this._wakeStart(conn);
+  }
+
+  _wakeLater(ms) {
+    clearTimeout(this._wakeTimer);
+    this._wakeTimer = setTimeout(() => { this._wakeTimer = null; this._wakeSync(); }, ms);
+  }
+
+  _wakeHook(conn) {   // the socket can drop and return without the panel noticing
+    if (this._wakeConn === conn || !conn.addEventListener) return;
+    this._wakeUnhook();
+    this._wakeConn = conn;
+    this._wakeSeen = () => this._wakeSync();
+    conn.addEventListener("disconnected", this._wakeSeen);
+    conn.addEventListener("ready", this._wakeSeen);
+  }
+
+  _wakeUnhook() {
+    if (!this._wakeConn) return;
+    this._wakeConn.removeEventListener?.("disconnected", this._wakeSeen);
+    this._wakeConn.removeEventListener?.("ready", this._wakeSeen);
+    this._wakeConn = null;
+  }
+
+  _wakeHalt() {
+    clearTimeout(this._wakeTimer);
+    this._wakeTimer = null;
+    this._wakeRun?.end();
+    this._wakeRun = null;
+    const mic = this._wakeMic;
+    this._wakeMic = null;
+    if (mic) {
+      if (mic.resume) window.removeEventListener("pointerdown", mic.resume, true);
+      mic.stream.getAudioTracks().forEach((t) => t.removeEventListener("ended", mic.lost));
+      try { mic.proc.disconnect(); mic.src.disconnect(); } catch (e) {}
+      mic.stream.getTracks().forEach((t) => t.stop());
+      mic.ctx.close()?.catch?.(() => {});
+    }
+    if (this._wakeHot) this._wakeMark(false);
+  }
+
+  _wakeMark(hot) {
+    this._wakeHot = hot;
+    this._wakeShow();
+  }
+
+  _wakeShow() {
+    const btn = this.shadowRoot?.getElementById("chat-wake");
+    if (btn) {
+      btn.classList.toggle("on", !!this._wakeOn);
+      btn.classList.toggle("hot", !!this._wakeHot);
+      btn.classList.toggle("rest", !!(this._wakeOn && this._wakeRest));
+      btn.setAttribute("aria-pressed", this._wakeOn ? "true" : "false");
+      btn.title = this._wakeHot ? "Hey JARVIS heard you and is listening"
+        : this._wakeOn && this._wakeRest ? "Hey JARVIS is resting while you type. It listens again when you leave or empty the box. Click to turn it off"
+        : this._wakeOn ? "Hey JARVIS is on: listening for the wake word. Click to turn it off"
+        : "Hey JARVIS is off. Click to listen for the wake word";
+    }
+    const box = this.shadowRoot?.getElementById("chat-input");
+    if (!box) return;
+    if (this._wakeHot && box.dataset.hint === undefined) {
+      box.dataset.hint = box.placeholder;
+      box.placeholder = "Listening...";
+    } else if (!this._wakeHot && box.dataset.hint !== undefined) {
+      box.placeholder = box.dataset.hint;
+      delete box.dataset.hint;
+    }
+  }
+
+  _wakeSet(on, why, persist) {
+    this._wakeOn = on;
+    if (persist) this._jhPrefSet("jarvis_chat_wake", !!on);   // jh-user-prefs: follows the login; only a click saves (review round 2)
+    this._wakeFails = 0;
+    this._wakeWarned = false;
+    this._wakeSync();
+    this._wakeShow();
+    if (why) { this._chatMessages.push({ role: "error", text: why }); this._refreshChat(); }
+  }
+
+  _wakeNone() {
+    return `No wake word is set for this assistant, ${this._honorific()}. Choose one in Home Assistant under Settings, Voice assistants. Hey JARVIS is off.`;
+  }
+
+  async _wakeOpen(conn, gone) {   // true when the microphone is ready for this run
+    if (this._wakeMic) return true;
+    const off = (t) => { if (!gone()) this._wakeSet(false, t + " Hey JARVIS is off."); return false; };
+    if (!navigator.mediaDevices?.getUserMedia) return off("The microphone needs the https address of this page.");
+    let stream, mic;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (err) { return off("Microphone not available: " + (err?.message || err) + "."); }
+    if (gone()) { stream.getTracks().forEach((t) => t.stop()); return false; }
+    try {
+      mic = { stream, ...this._micPipe(stream, (pcm) => {
+        const run = this._wakeRun;
+        if (run && run.hid !== null && !run.over) {
+          this._micSend(conn, run.hid, pcm);
+          this._wakeLevel(conn, run, pcm);
+        }
+      }) };
+    } catch (err) {
+      stream.getTracks().forEach((t) => t.stop());
+      return off("Microphone not available: " + (err?.message || err) + ".");
+    }
+    mic.lost = () => { if (this._wakeMic === mic) this._wakeSet(false, `The microphone was lost, ${this._honorific()}. Hey JARVIS is off.`); };
+    stream.getAudioTracks().forEach((t) => t.addEventListener("ended", mic.lost));
+    if (mic.ctx.state === "suspended") {   // a page opened with the switch on: the browser waits for a first touch
+      mic.resume = () => { mic.ctx.resume?.()?.catch?.(() => {}); };
+      mic.resume();
+      window.addEventListener("pointerdown", mic.resume, true);
+    }
+    this._wakeMic = mic;
+    return true;
+  }
+
+  async _wakeStart(conn) {
+    const run = { t0: Date.now(), hid: null, unsub: null, over: false, hot: false };
+    this._wakeRun = run;
+    const gone = () => this._wakeRun !== run;
+    run.end = () => {
+      if (run.over) return;
+      run.over = true;
+      clearTimeout(run.dog);
+      clearTimeout(run.turn);
+      if (run.hid !== null) { try { conn.socket.send(new Uint8Array([run.hid])); } catch (e) {} }
+      run.hid = null;
+      if (run.unsub) { const u = run.unsub; run.unsub = null; Promise.resolve().then(u).catch(() => {}); }
+    };
+    const row = await this._chatPipelineRow();
+    if (gone()) return;
+    if (row && !row.wake_word_entity) { this._wakeSet(false, this._wakeNone()); return; }
+    if (!(await this._wakeOpen(conn, gone)) || gone()) return;
+    const onEvent = (ev) => {
+      if (run.over) return;
+      if (ev.type === "run-start") run.hid = ev.data?.runner_data?.stt_binary_handler_id ?? null;
+      else if (ev.type === "wake_word-end") {
+        if (!Object.keys(ev.data?.wake_word_output || {}).length) return;   // the audio ended and nothing was heard
+        run.hot = true;
+        run.hotAt = Date.now();
+        this._wakeMark(true);
+        this._wakeBeep();
+        run.dog = setTimeout(() => this._wakeAgain(run), this._wakeDog ?? 30000);   // no answer from speech-to-text
+      } else if (ev.type === "stt-vad-end") {
+        if (run.hid !== null) { try { conn.socket.send(new Uint8Array([run.hid])); } catch (e) {} }
+        run.hid = null;
+      } else if (ev.type === "stt-end") {
+        const text = (ev.data?.stt_output?.text || "").trim();
+        // Speech-to-text invents a short word such as "Okay." from silence: a lone filler word is not a command.
+        if (!text || /^(ok(ay)?|thank you|thanks|you|bye|yeah|hmm+|uh+|um+)[.!?]*$/i.test(text)) { this._wakeAgain(run); return; }
+        run.end();
+        this._wakeRun = null;
+        this._wakeFails = 0;
+        this._wakeWarned = false;
+        this._wakeMark(false);
+        this._chatSpoken(text);
+      } else if (ev.type === "error") this._wakeError(run, ev.data?.code, ev.data?.message);
+      else if (ev.type === "run-end") { run.hid = null; this._wakeAgain(run); }
+    };
+    try {
+      const unsub = await conn.subscribeMessage(onEvent, { type: "assist_pipeline/run", pipeline: row?.id, start_stage: "wake_word", end_stage: "stt",
+        input: { sample_rate: Math.round(this._wakeMic.ctx.sampleRate), timeout: 0, no_vad: true }, timeout: 300 }, { resubscribe: false });
+      if (run.over) { Promise.resolve().then(unsub).catch(() => {}); return; }
+      run.unsub = unsub;
+      // HA ends a run at its timeout, wherever the person is in a sentence. A fresh run before that keeps a command whole.
+      run.turn = setTimeout(() => {
+        if (run.over || run.hot) return;
+        run.end();
+        this._wakeRun = null;
+        this._wakeSync();
+      }, this._wakeTurn ?? 270000);
+    } catch (err) { if (!run.over) this._wakeError(run, err?.code, err?.message || String(err)); }
+  }
+
+  // A short soft tone when the wake word is heard (2026-11-07), made in the browser: no file, and it is over before the
+  // first 0.5 s of speech that the end-of-speech check skips, so speech-to-text does not hear it.
+  _wakeBeep() {
+    const ctx = this._wakeMic?.ctx;
+    if (!ctx || ctx.state !== "running") return;
+    try {
+      const osc = ctx.createOscillator(), gain = ctx.createGain(), t = ctx.currentTime;
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(880, t);
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.exponentialRampToValueAtTime(0.18, t + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.15);
+    } catch (e) {}
+  }
+
+  // Home Assistant's own end-of-speech check stops after 0.7 s of quiet, so a pause after the wake word ended the command. The
+  // page decides instead: it skips the end of the wake word, waits for the person to start, and ends after a real pause. When
+  // nobody speaks, nothing is sent. Levels are 16 bit; the gate follows the room's own noise.
+  _wakeLevel(conn, run, pcm) {
+    let sum = 0;
+    for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+    const rms = Math.sqrt(sum / (pcm.length || 1)), now = Date.now();
+    if (!run.hot) {
+      const n = this._wakeNoise ?? rms;
+      if (rms < n * 4 + 200) this._wakeNoise = n * 0.9 + rms * 0.1;
+      return;
+    }
+    const since = now - run.hotAt;
+    if (since < (this._wakeSkip ?? 500)) return;
+    if (rms > Math.max(this._wakeGate ?? 700, (this._wakeNoise || 0) * 3)) { run.spoke = run.spoke || now; run.loud = now; }
+    const finished = run.spoke && now - run.loud > (this._wakeQuiet ?? 1300);
+    if (!finished && since < (run.spoke ? (this._wakeMax ?? 15000) : (this._wakeWait ?? 7000))) return;
+    if (!run.spoke) { this._wakeAgain(run); return; }
+    try { conn.socket.send(new Uint8Array([run.hid])); } catch (e) {}
+    run.hid = null;
+  }
+
+  _wakeError(run, code, message) {
+    run.hid = null;
+    if (code === "wake-engine-missing" || code === "wake-provider-missing") {
+      run.end();
+      this._wakeSet(false, this._wakeNone());
+      return;
+    }
+    const soft = ["wake-word-timeout", "timeout", "duplicate_wake_up_detected", "wake_word_detection_aborted", "stt-no-text-recognized"].includes(code);
+    if (!soft && !this._wakeWarned) {
+      this._wakeWarned = true;
+      this._chatMessages.push({ role: "error", text: `Hey JARVIS could not listen: ${message || code}. I will keep trying, ${this._honorific()}.` });
+      this._refreshChat();
+    }
+    this._wakeAgain(run, !soft);
+  }
+
+  // Listen again after a wait that grows while runs keep ending early. Ordinary endings stay within a few seconds.
+  _wakeAgain(run, hard) {
+    run.end();
+    if (this._wakeRun === run) this._wakeRun = null;
+    this._wakeMark(false);
+    if (Date.now() - run.t0 > 10000) this._wakeFails = 0;
+    const fails = this._wakeFails || 0;
+    this._wakeFails = fails + 1;
+    this._wakeLater(Math.min(hard ? 30000 : 4000, (this._wakeBase ?? 500) * 2 ** fails));
+  }
+
+  async _speakChat(text) {
+    if (!this._chatSpeak || !text || !this.isConnected) return;   // a reply that lands after leaving the panel stays silent
+    const gen = this._speakGen;
+    let preparing = true;
+    const ready = () => { if (preparing) { preparing = false; this._speakBusy--; } };
+    this._speakBusy = (this._speakBusy || 0) + 1;   // Hey JARVIS rests from here until the voice has finished
+    this._wakeSync();
+    try {
+      const pipeId = await this._chatPipeline();
+      let unsub = null, finished = false;
+      const drop = () => { const u = unsub; unsub = null; if (u) Promise.resolve().then(u).catch(() => {}); };
+      unsub = await this._hass.connection.subscribeMessage((ev) => {
+        if (ev.type === "tts-end") {
+          const url = ev.data?.tts_output?.url;
+          this._chatLastAudio = url;
+          if (url && this._chatSpeak && gen === this._speakGen) {
+            this._chatAudio?.pause();
+            this._chatAudio = new Audio(url);
+            this._chatAudio.play().catch((e) => console.warn("JARVIS chat: audio blocked", e));
+          }
+        }
+        if (ev.type === "run-end" || ev.type === "error") { finished = true; ready(); drop(); }
+      }, { type: "assist_pipeline/run", pipeline: pipeId, start_stage: "tts", end_stage: "tts", input: { text } });
+      if (finished) drop();
+    } catch (err) { ready(); console.warn("JARVIS chat: speech failed", err); }
+  }
+
+  _chatIcon(path) { return `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="${this._esc(path)}"/></svg>`; }
+
+  _ttsIcon() {
+    return this._chatIcon(this._chatSpeak
+      ? "M14,3.23V5.29C16.89,6.15 19,8.83 19,12C19,15.17 16.89,17.84 14,18.7V20.77C18,19.86 21,16.28 21,12C21,7.72 18,4.14 14,3.23M16.5,12C16.5,10.23 15.5,8.71 14,7.97V16C15.5,15.29 16.5,13.76 16.5,12M3,9V15H7L12,20V4L7,9H3Z"
+      : "M12,4L9.91,6.09L12,8.18M4.27,3L3,4.27L7.73,9H3V15H7L12,20V13.27L16.25,17.53C15.58,18.04 14.83,18.46 14,18.7V20.77C15.38,20.45 16.63,19.82 17.68,18.96L19.73,21L21,19.73L12,10.73M19,12C19,12.94 18.8,13.82 18.46,14.64L19.97,16.15C20.62,14.91 21,13.5 21,12C21,7.72 18,4.14 14,3.23V5.29C16.89,6.15 19,8.83 19,12M16.5,12C16.5,10.23 15.5,8.71 14,7.97V10.18L16.45,12.63C16.5,12.43 16.5,12.21 16.5,12Z");
+  }
+
+  _wakeIcon() {
+    return this._chatIcon("M17,20C16.71,20 16.44,19.94 16.24,19.85C15.53,19.5 15.03,18.97 14.53,17.47C14,15.91 13.06,15.18 12.14,14.47C11.35,13.86 10.53,13.23 9.82,11.94C9.29,11 9,9.93 9,9C9,6.2 11.2,4 14,4C16.8,4 19,6.2 19,9H21C21,5.07 17.93,2 14,2C10.07,2 7,5.07 7,9C7,10.26 7.38,11.65 8.07,12.9C9,14.55 10.05,15.38 10.92,16.05C11.73,16.67 12.31,17.12 12.63,18.1C13.23,19.92 14,20.94 15.36,21.65C15.86,21.88 16.43,22 17,22C19.21,22 21,20.21 21,18H19C19,19.1 18.1,20 17,20M7.64,2.64L6.22,1.22C4.23,3.21 3,5.96 3,9C3,12.04 4.23,14.79 6.22,16.78L7.63,15.37C6,13.74 5,11.5 5,9C5,6.5 6,4.26 7.64,2.64M11.5,9C11.5,10.38 12.62,11.5 14,11.5C15.38,11.5 16.5,10.38 16.5,9C16.5,7.62 15.38,6.5 14,6.5C12.62,6.5 11.5,7.62 11.5,9Z");
+  }
+
+  _micIcon() {
+    return this._chatIcon("M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z");
+  }
+
+  // Jarvis Home patch (2026-11-05): use the speech settings of the assistant that runs JARVIS.
+  async _chatPipelineRow() {
+    try {
+      const res = await this._hass.callWS({ type: "assist_pipeline/pipeline/list" });
+      const agent = this._jarvisAgentId();
+      const rows = res?.pipelines || [];
+      const all = rows.filter((x) => x.conversation_engine === agent);
+      return all.find((x) => x.id === res?.preferred_pipeline) || all[0] || rows.find((x) => x.id === res?.preferred_pipeline) || null;
+    } catch (err) { return null; }
+  }
+
+  async _chatPipeline() {
+    return (await this._chatPipelineRow())?.id;
+  }
+
+  _toggleSpeak() {
+    this._chatSpeak = !this._chatSpeak;
+    this._jhPrefSet("jarvis_chat_speak", !!this._chatSpeak);   // jh-user-prefs: follows the login
+    const b = this.shadowRoot?.getElementById("chat-speak");
+    if (b) { b.classList.toggle("on", this._chatSpeak); b.innerHTML = this._ttsIcon(); }
+    if (!this._chatSpeak && this._chatAudio) { this._chatAudio.pause(); this._chatAudio = null; }
+  }
+
+  _stopChatAudio() {
+    this._speakGen = (this._speakGen || 0) + 1;   // speech still being prepared must not start either
+    if (this._chatAudio) { this._chatAudio.pause(); this._chatAudio = null; }
+  }
+
+  _clearChat() {
+    this._chatTag();
+    this._chatMessages.forEach((m) => this._chatRemoved.add(m.id));
+    this._chatMessages = [];
+    this._chatConvId = null;
+    this._chatReq = (this._chatReq || 0) + 1;   // a reply still on its way stays out of the cleared chat
+    this._chatBusy = false;
+    this._spokenCut();   // spoken words still waiting to be sent go too
+    this._stopChatAudio();
+    this._chatWipe = true;
+    this._saveChat();
+    this._refreshChat();
+  }
+
+  // Jarvis Home patch (2026-11-07): CLEAN deletes the history on every device of this login, so it asks first, on the page
+  // itself. The question text starts where CLEAN was, with CANCEL and YES after it, so a second tap on that spot hits no button
+  // and cannot confirm. The question closes by itself; a render keeps it.
+  _chatAskSet(on) {
+    this._chatAsk = on;
+    clearTimeout(this._chatAskT);
+    this._chatAskT = on ? setTimeout(() => this._chatAskSet(false), this._chatAskWait ?? 10000) : null;
+    const root = this.shadowRoot;
+    root?.getElementById("chat-clear")?.toggleAttribute("hidden", on);
+    root?.getElementById("chat-ask")?.toggleAttribute("hidden", !on);
+    if (on) root?.getElementById("chat-ask-no")?.focus();
+  }
+
+  async _sendChat(spoken) {
+    if (this._chatBusy) return;
+    const input = this.shadowRoot?.getElementById("chat-input");
+    const text = (input?.value || spoken || "").trim();
+    if (!text) return;
+    if (input) input.value = "";
+    this._chatDraft = "";
+    this._chatMessages.push({ role: "user", text });
+    const reqId = (this._chatReq = (this._chatReq || 0) + 1);
+    this._chatBusy = true;
+    this._wakeSync();
+    this._startThink();
+    this._refreshChat();
+    try {
+      const payload = {
+        type: "conversation/process",
+        text,
+        language: this._hass?.language || undefined,
+      };
+      const agent = this._jarvisAgentId();
+      if (agent) payload.agent_id = agent;
+      if (this._chatConvId) payload.conversation_id = this._chatConvId;
+      const res = await this._hass.callWS(payload);
+      if (reqId !== this._chatReq) return;  // cancelled with the red cross
+      this._chatConvId = res?.conversation_id || this._chatConvId;
+      const reply = res?.response?.speech?.plain?.speech
+        || "(JARVIS returned no text.)";
+      this._chatMessages.push({ role: "jarvis", text: reply });
+      this._speakChat(reply);
+    } catch (err) {
+      if (reqId !== this._chatReq) return;
+      this._chatMessages.push({
+        role: "error",
+        text: "Couldn't reach JARVIS — " + (err?.message || String(err)),
+      });
+    } finally {
+      if (reqId !== this._chatReq) return;
+      this._chatBusy = false;
+      this._saveChat();
+      this._refreshChat();
+      this.shadowRoot?.getElementById("chat-input")?.focus();
+    }
+  }
+
+  _render() {
+    let body;
+    try {
+      body = this._html();
+    } catch (err) {
+      console.error("JARVIS panel: render failed", err);
+      body = '<div class="panel"><div class="head"><span>Panel error</span></div>'
+        + '<div class="appliance-intro">JARVIS hit an error while drawing this page \u2014 usually a stale entity still referenced in configuration. The details are in your browser console (F12). Reloading often clears it; if not, please report the console error.</div></div>';
+    }
+    this.shadowRoot.innerHTML = this._styles() + body;
+    // Stamp each Settings card with its section BEFORE localization rewrites the
+    // heading text — otherwise a translated UI can't be matched back to a section.
+    try {
+      this._stampSettingsSections();
+      this._localizeDOM(this.shadowRoot);
+      this._wire();
+    } catch (err) {
+      console.error("JARVIS panel: post-render wiring failed", err);
+    }
+    this._renderedOnce = true;
+    this._pendingRender = false;
+  }
+
+  _updateLiveValues() {
+    this._updateClock();
+  }
+
+  _updateClock() {
+    const timeEl = this.shadowRoot.querySelector("#clock-time");
+    const dateEl = this.shadowRoot.querySelector("#clock-date");
+    const greetEl = this.shadowRoot.querySelector("#greeting-text");
+    if (!timeEl) return;
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    const ss = String(now.getSeconds()).padStart(2, "0");
+    timeEl.textContent = `${hh}:${mm}:${ss}`;
+
+    const days = ["SUN","MON","TUE","WED","THU","FRI","SAT"];
+    const mons = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    dateEl.textContent = `${days[now.getDay()]} · ${String(now.getDate()).padStart(2,"0")} · ${mons[now.getMonth()]} · ${now.getFullYear()}`;
+
+    if (greetEl) greetEl.textContent = this._greeting();
+  }
+
+  _rotateDominantRoom() {
+    // Only runs as pre-live-data demo; stops once WS returns data
+    if (this._liveData) return;
+    const data = this._mockData();
+    this._roomRotationIdx = (this._roomRotationIdx + 1) % data.roomRotation.length;
+    const r = data.roomRotation[this._roomRotationIdx];
+    const nameEl  = this.shadowRoot.querySelector("#dom-name");
+    const subEl   = this.shadowRoot.querySelector("#dom-sub");
+    const coordEl = this.shadowRoot.querySelector("#dom-coord");
+    if (!nameEl) return;
+    nameEl.style.opacity = 0;
+    setTimeout(() => {
+      nameEl.textContent = r.name;
+      subEl.textContent  = r.subtitle;
+      if (coordEl) coordEl.textContent = r.coord;
+      this._updateDomGauges(r);
+      nameEl.style.opacity = 1;
+    }, 250);
+  }
+
+  // ─── HTML helpers (avoid nested template literals) ─────────────────────────
+
+  // Radial (donut) gauge — used for the dominant-room environment readout.
+  _radialGauge(id, frac, display, label, hue, dim) {
+    const R = 26, C = 2 * Math.PI * R;
+    const f = Math.max(0, Math.min(1, frac || 0));
+    const off = C * (1 - f);
+    return `<div class="rgauge${dim ? ' dim' : ''}">
+      <svg viewBox="0 0 64 64" class="rgauge-svg" aria-hidden="true">
+        <circle class="rgauge-track" cx="32" cy="32" r="${R}"></circle>
+        <circle class="rgauge-fill" id="${this._esc(id)}-arc" cx="32" cy="32" r="${R}"
+          style="stroke:hsl(${this._esc(hue)},90%,62%);stroke-dasharray:${C.toFixed(1)};stroke-dashoffset:${off.toFixed(1)};"></circle>
+      </svg>
+      <div class="rgauge-val" id="${this._esc(id)}-val">${this._esc(display)}</div>
+      <div class="rgauge-lbl">${this._esc(label)}</div>
+    </div>`;
+  }
+
+  // jh-temp-unit (step 158): the ring's range follows the unit (upstream assumed 50-90 °F, so a metric home's 18 °C showed no
+  // arc and always cold blue): the reading's own unit ("18°C"), else Home Assistant's unit system, else upstream's °F.
+  _jhTempUnit(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    const m = s.match(/\u00b0\s*([CF])\b/i) || s.match(/\d\s*([CF])$/i);
+    if (m) return m[1].toUpperCase();
+    const u = String((((this._hass || {}).config || {}).unit_system || {}).temperature || '');
+    return /F/i.test(u) ? 'F' : /C/i.test(u) ? 'C' : 'F';
+  }
+  _tempFrac(t, raw) {   // jh-temp-unit: °C 10-32, °F 50-90, clamped to 0-1
+    if (!isFinite(t)) return 0;
+    const [lo, hi] = this._jhTempUnit(raw) === 'C' ? [10, 32] : [50, 90];
+    return Math.max(0, Math.min(1, (t - lo) / (hi - lo)));
+  }
+  _tempHue(t, raw) {
+    const f = this._tempFrac(t, raw);
+    return Math.round(210 - f * 190);                          // cool blue → warm orange
+  }
+
+  _domGauges(dr) {
+    const t = parseFloat(String(dr.temp));
+    const h = parseFloat(String(dr.humidity));
+    const lon = /on|^[1-9]/i.test(String(dr.lights || ""));
+    return (
+      this._radialGauge("g-temp", this._tempFrac(t, dr.temp), dr.temp ?? "—", "Temp", this._tempHue(t, dr.temp), false) +
+      this._radialGauge("g-hum", (isFinite(h) ? h / 100 : 0), dr.humidity ?? "—", "Humidity", 190, false) +
+      this._radialGauge("g-lite", lon ? 1 : 0.04, lon ? "ON" : "OFF", "Lights", lon ? 48 : 205, !lon)
+    );
+  }
+
+  _setGauge(id, frac, display, hue, dim) {
+    const arc = this.shadowRoot.querySelector(`#${id}-arc`);
+    const val = this.shadowRoot.querySelector(`#${id}-val`);
+    if (arc) {
+      const R = 26, C = 2 * Math.PI * R;
+      const f = Math.max(0, Math.min(1, frac || 0));
+      arc.style.strokeDashoffset = (C * (1 - f)).toFixed(1);
+      if (hue != null) arc.style.stroke = `hsl(${hue},90%,62%)`;
+    }
+    if (val) {
+      val.textContent = display;
+      const g = val.closest(".rgauge");
+      if (g) g.classList.toggle("dim", !!dim);
+    }
+  }
+
+  // jh-room-pin (step 155, the owner: "stay auto, only show when clicked, then back to auto"): the dominant-room strip always
+  // follows presence and has no control of its own. A room sent with the window event "jh-pin-room" {detail: {area_id}} (the
+  // 3D house fires it when a room floor is tapped) or this._jhPinRoom(area_id) is shown for 30 s with its live readings and a
+  // subtle "AUTO IN Ns" hint (a tap on it goes back at once); then the strip follows presence again by itself. Nothing is saved.
+  _jhRoomPinGet() {
+    if (this._jhPin && Date.now() >= (this._jhPinUntil || 0)) this._jhPin = null;
+    return this._jhPin || null;
+  }
+
+  _jhPinRoom(areaId) {   // a room (area_id) for 30 s, or "auto" (or nothing) at once
+    clearTimeout(this._jhPinTimer);
+    this._jhPin = typeof areaId === "string" && areaId && areaId !== "auto" ? areaId.slice(0, 128) : null;
+    this._jhPinUntil = this._jhPin ? Date.now() + 30000 : 0;
+    if (this._jhPin) this._jhPinTimer = setTimeout(() => this._jhPinRoom("auto"), 30000);
+    this._jhRoomPinTick();
+    if (this._hass) { try { this._fetchLiveData(); } catch (e) {} }   // the strip follows at once
+  }
+
+  _jhRoomPinTick() {   // the countdown hint
+    clearInterval(this._jhPinTick);
+    const draw = () => {
+      const m = this.shadowRoot && this.shadowRoot.querySelector("#dom-pinned");
+      const left = Math.max(0, Math.ceil(((this._jhPinUntil || 0) - Date.now()) / 1000));
+      if (!this._jhRoomPinGet() || !left) { if (m) m.hidden = true; clearInterval(this._jhPinTick); return; }
+      if (m) { m.hidden = false; m.textContent = "AUTO IN " + left + "s \u2715"; }
+    };
+    draw();
+    if (this._jhPin) this._jhPinTick = setInterval(draw, 1000);
+  }
+
+  _jhRoomPinSync(root, live) {
+    const mark = root.querySelector("#dom-pinned");
+    if (mark && !mark.dataset.bound) {   // the hint's x: back to automatic now
+      mark.dataset.bound = "1";
+      mark.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this._jhPinRoom("auto"); });
+    }
+    this._jhRoomPinTick();
+  }
+
+  _updateDomGauges(dr) {
+    const t = parseFloat(String(dr.temp));
+    const h = parseFloat(String(dr.humidity));
+    const lon = /on|^[1-9]/i.test(String(dr.lights || ""));
+    this._setGauge("g-temp", this._tempFrac(t, dr.temp), dr.temp ?? "—", this._tempHue(t, dr.temp), false);
+    this._setGauge("g-hum", (isFinite(h) ? h / 100 : 0), dr.humidity ?? "—", 190, false);
+    this._setGauge("g-lite", lon ? 1 : 0.04, lon ? "ON" : "OFF", lon ? 48 : 205, !lon);
+  }
+
+  // ─── AI Models (Settings) ───────────────────────────────────────────────
+  _modelRoles() {
+    return [
+      { role: 'llm',        label: 'Main Agent', provKey: 'llm_provider',        modelKey: 'model' },
+      { role: 'fast',       label: 'Fast Chat',  provKey: 'fast_provider',        modelKey: 'fast_model' },
+      { role: 'classifier', label: 'Classifier', provKey: 'classifier_provider', modelKey: 'classifier_model' },
+      { role: 'reasoning',  label: 'Reasoning',  provKey: 'reasoning_provider',  modelKey: 'reasoning_model' },
+      { role: 'review',     label: 'Review',     provKey: 'review_provider',     modelKey: 'review_model' },
+      { role: 'vision',     label: 'Vision',     provKey: 'vision_provider',     modelKey: 'vision_model' },
+      { role: 'camrsn',     label: 'Camera Rsn', provKey: 'camera_reasoning_provider', modelKey: 'camera_reasoning_model' },
+    ];
+  }
+
+  // Roles whose provider can support extended "thinking" (Gemini/Gemma,
+  // Ollama reasoning models). default/tokenDefault must match websocket.py's
+  // snapshot defaults — the key has never been saved otherwise.
+  _THINKING_ROLES = {
+    vision: { key: 'vision_thinking_enabled', default: false, tokenKey: 'vision_thinking_max_tokens', tokenDefault: 1024 },
+  };
+
+  // Review enable/disable toggle (#400 #10): the Review role can now be turned
+  // on/off straight from the panel instead of only through the options flow.
+  _reviewToggleRow(cfg) {
+    const on = !!(cfg && cfg.review_enabled);
+    return `
+      <div class="model-hint model-thinking-row">
+        <span>Second-opinion review</span>
+        <button class="toggle-btn ${on ? 'on' : 'off'}" data-cfg-key="review_enabled" data-cfg-val="${on ? 'false' : 'true'}">${on ? 'ON' : 'OFF'}</button>
+      </div>`;
+  }
+
+  _thinkingToggleRow(cfg, role) {
+    const spec = this._THINKING_ROLES[role];
+    if (!spec) return '';
+    const stored = cfg[spec.key];
+    const on = (stored === undefined || stored === null || stored === '') ? spec.default : !!stored;
+    const tokens = cfg[spec.tokenKey] ?? spec.tokenDefault;
+    return `
+      <div class="model-hint model-thinking-row">
+        <span>Thinking</span>
+        <button class="toggle-btn ${on ? 'on' : 'off'}" data-cfg-key="${this._esc(spec.key)}" data-cfg-val="${on ? 'false' : 'true'}">${on ? 'ON' : 'OFF'}</button>
+        ${on ? `<span class="model-thinking-tokens">
+          <label for="think-tok-${this._esc(role)}">token budget</label>
+          <input id="think-tok-${this._esc(role)}" class="cfg-field cfg-num" type="number" min="256" max="65536" step="128"
+                 data-cfg-key="${this._esc(spec.tokenKey)}" value="${this._esc(tokens)}" title="Higher budget so a thinking model has room to think AND answer.">
+        </span>` : ''}
+      </div>`;
+  }
+
+  // Throttle for AUTOMATIC camera analyses (#421): a minimum gap (seconds)
+  // between motion/auto-event vision calls, so a frequent trigger doesn't burn
+  // through a provider's daily token budget (e.g. Groq's TPD cap). 0 = off.
+  // Explicit "analyze camera" requests and doorbell presses are never throttled.
+  _visionThrottleRow(cfg) {
+    const v = cfg.vision_min_interval ?? 0;
+    return `
+      <div class="model-hint model-thinking-row">
+        <span>Auto-analysis min interval</span>
+        <span class="model-thinking-tokens">
+          <input id="vision-min-interval" class="cfg-field cfg-num" type="number" min="0" max="86400" step="30"
+                 data-cfg-key="vision_min_interval" value="${this._esc(v)}"
+                 title="Minimum seconds between automatic (motion / auto-event) camera analyses, to cap vision token use. 0 = off. Explicit requests and doorbell presses are never throttled.">
+          <label for="vision-min-interval">sec (0 = off)</label>
+        </span>
+      </div>`;
+  }
+
+  // Fast-chat tier (latency): enable + the complexity threshold below which a
+  // simple conversational turn uses this small model instead of the Main Agent.
+  // The provider/model selectors come from the standard model-role row; these
+  // are the fast-chat-specific extras. Off until a fast model is chosen above.
+  _fastChatRows(cfg) {
+    const on = !!(cfg && cfg.fast_chat_enabled);
+    const thr = (cfg && cfg.fast_chat_max_complexity != null) ? cfg.fast_chat_max_complexity : 70;
+    return `
+      <div class="model-hint model-thinking-row">
+        <span>Fast chat (simple turns)</span>
+        <button class="toggle-btn ${on ? 'on' : 'off'}" data-cfg-key="fast_chat_enabled" data-cfg-val="${on ? 'false' : 'true'}">${on ? 'ON' : 'OFF'}</button>
+      </div>
+      <div class="model-hint model-thinking-row">
+        <span>Use when complexity &lt;</span>
+        <span class="model-thinking-tokens">
+          <input class="cfg-field cfg-num" type="number" min="0" max="100" step="5"
+                 data-cfg-key="fast_chat_max_complexity" value="${this._esc(thr)}"
+                 title="Turns scoring below this (0–100) use the fast model; at or above it the Main Agent handles them. Direct-reasoning turns always use the Main Agent. Default 70.">
+        </span>
+      </div>`;
+  }
+
+  _renderModelRoles(d) {
+    const ALL_PROVIDERS = ['groq', 'openai', 'gemini', 'ollama', 'anthropic', 'custom'];
+    const cfg = d.config || {};
+    // Every provider JARVIS speaks is selectable. Ones without a stored key or
+    // endpoint are marked "needs setup" — add a key in Settings → Devices &
+    // Services → JARVIS → Configure and it starts fetching models. (Previously
+    // the list was filtered to configured providers, which hid the fact that
+    // OpenAI, Anthropic, and any OpenAI-compatible endpoint are supported too.)
+    const configured = (Array.isArray(cfg.configured_providers) && cfg.configured_providers.length)
+      ? cfg.configured_providers
+      : ALL_PROVIDERS;
+    const defaultProvider = configured[0] || 'groq';
+    const cfgSet = new Set(configured);
+    return this._modelRoles().map(r => {
+      const storedProv = cfg[r.provKey];
+      const curProv = storedProv || defaultProvider;
+      const curModel = cfg[r.modelKey] || '';
+      // Show all known providers (all entries are safe literals); the current
+      // one stays selected. Unconfigured providers carry a "needs setup" hint.
+      const provOpts = ALL_PROVIDERS.map(p => {
+        const label = cfgSet.has(p) ? p : `${p} — needs setup`;
+        return `<option value="${p}"${p === curProv ? ' selected' : ''}>${label}</option>`;
+      }).join('');
+      // Model select starts with the current value + a loading hint; it's
+      // repopulated live from the provider via _loadModelsFor().
+      const modelOpts =
+        (curModel ? `<option value="${this._esc(curModel)}" selected>${this._esc(curModel)}</option>` : '') +
+        `<option value="" disabled>loading…</option>` +
+        `<option value="__custom__">✎ Custom…</option>`;
+      return `
+        <div class="model-row" data-role="${this._esc(r.role)}">
+          <span class="model-label">${this._esc(r.label)}</span>
+          <select class="notify-select prov-select" data-role="${this._esc(r.role)}" data-cfg-key="${this._esc(r.provKey)}">${provOpts}</select>
+          <select class="notify-select model-select" data-role="${this._esc(r.role)}" data-cfg-key="${this._esc(r.modelKey)}" data-current="${this._esc(curModel)}">${modelOpts}</select>
+          <input class="model-custom" data-role="${this._esc(r.role)}" data-cfg-key="${this._esc(r.modelKey)}"
+                 type="text" placeholder="enter model id" value="${this._esc(curModel)}" />
+          ${r.role === 'vision' ? `<div class="model-hint">Needs an image-capable model — e.g. moondream on Ollama, or a Groq vision model. Text-only models (like gpt-oss) will fail on camera analysis.</div>` : ''}
+          ${r.role === 'review' ? this._reviewToggleRow(cfg) : ''}
+          ${this._thinkingToggleRow(cfg, r.role)}
+          ${r.role === 'vision' ? this._visionThrottleRow(cfg) : ''}
+          ${r.role === 'fast' ? this._fastChatRows(cfg) : ''}
+        </div>`;
+    }).join('');
+  }
+
+  _customLlmUrl(config) {
+    const cfg = config || {};
+    return cfg.custom_base_url || cfg.llm_base_url || '';
+  }
+
+  _ollamaLlmUrl(config) {
+    const cfg = config || {};
+    return cfg.ollama_base_url || cfg.llm_base_url || '';
+  }
+
+  // Jarvis Home patch (2026-11-14): jh-quick-actions - the Quick Actions buttons come from the quick_actions setting
+  _jhQaDefault() {
+    return [
+      { label: "Briefing", service: "jarvis.briefing" },
+      { label: "Nap 30m", service: "jarvis.nap", data: { duration_minutes: 30 } },
+      { label: "Nap 60m", service: "jarvis.nap", data: { duration_minutes: 60 } },
+      { label: "Unshush All", service: "jarvis.unshush" },
+      { label: "Status Dump", service: "jarvis.observer_status" },
+      { label: "Analyze Now", service: "jarvis:analyze_now" },
+    ];
+  }
+
+  _jhQaTip(a) {
+    const nap = (m) => `Mute JARVIS's non-critical announcements for ${m} minutes. Does NOT change lights, blinds/covers, or locks — only quiets proactive speech. Safety alerts still come through.`;
+    const data = a.data && Object.keys(a.data).length ? JSON.stringify(a.data) : "";
+    const tips = {
+      "jarvis.briefing": "Speak a status briefing now — weather, calendar, overnight events, energy and any hazards.",
+      'jarvis.nap{"duration_minutes":30}': nap(30), 'jarvis.nap{"duration_minutes":60}': nap(60),
+      "jarvis.unshush": "Cancel any active Nap/Shush and resume normal announcements immediately.",
+      "jarvis.observer_status": "Log a diagnostic dump of the observer's current state to the JARVIS log.",
+      "jarvis:analyze_now": "Run a cognition/observer analysis pass now instead of waiting for the next scheduled one.",
+    };
+    return tips[a.service + data] || `Runs ${a.service}${data ? " " + data : ""}`;
+  }
+
+  // The same rules the backend applies on save. Returns "" when the button is fine, else what is wrong.
+  _jhQaProblem(a, n) {
+    const DOMAINS = ["script", "scene", "automation", "light", "switch", "fan", "climate", "media_player", "cover", "input_boolean", "jarvis"];
+    const BLOCKED = ["jarvis.database_purge", "jarvis.restore", "jarvis.forget"];
+    const label = typeof a?.label === "string" ? a.label.trim() : "";
+    const svc = typeof a?.service === "string" ? a.service.trim() : "";
+    if (label.length < 1 || label.length > 24 || /[\x00-\x1f]/.test(label)) return `Button ${n}: the label must be 1-24 characters`;
+    if (a.data != null && (typeof a.data !== "object" || Array.isArray(a.data))) return `Button ${n} (${label}): the data must be a JSON object`;
+    if (svc === "jarvis:analyze_now") return "";
+    const m = /^([a-z0-9_]+)\.([a-z0-9_]+)$/.exec(svc);
+    if (!m) return `Button ${n} (${label}): the action must look like domain.service, e.g. script.turn_on`;
+    if (!DOMAINS.includes(m[1]) || BLOCKED.includes(svc)) return `Button ${n} (${label}): ${svc} is not allowed on a button. Allowed: ${DOMAINS.join(", ")} (automation: trigger, turn_on, turn_off)`;
+    if (m[1] === "automation" && !["trigger", "turn_on", "turn_off"].includes(m[2])) return `Button ${n} (${label}): automation buttons may only trigger, turn_on or turn_off`;
+    return "";
+  }
+
+  _jhQaList(d) {
+    const saved = d && d.config ? d.config.quick_actions : undefined;
+    if (!Array.isArray(saved)) return this._jhQaDefault();
+    return saved.filter((a, i) => !this._jhQaProblem(a, i + 1));
+  }
+
+  _jhQaButtons(d) {
+    const list = this._jhQaList(d);
+    if (!list.length) return `<div class="jh-qa-none">No quick actions. Add them in Settings → General → Quick Actions.</div>`;
+    let analyze = false;
+    return list.map((a, i) => {
+      const cls = i === 0 ? "ctrl primary" : "ctrl";
+      const tip = this._esc(this._jhQaTip(a)), label = this._esc(a.label);
+      if (a.service === "jarvis:analyze_now") {
+        if (analyze) return "";
+        analyze = true;
+        return `<button class="${cls}" id="qa-run-analysis" title="${tip}">${label}</button>`;
+      }
+      const data = a.data && Object.keys(a.data).length ? ` data-svc-data="${this._esc(JSON.stringify(a.data))}"` : "";
+      return `<button class="${cls}" data-svc="${this._esc(a.service)}"${data} title="${tip}">${label}</button>`;
+    }).join("\n      ");
+  }
+
+  _jhQaRows(d) {
+    if (this._jhQaDraft) return this._jhQaDraft;
+    return this._jhQaList(d).map(a => ({ label: a.label, service: a.service,
+      data: a.data && Object.keys(a.data).length ? JSON.stringify(a.data) : "" }));
+  }
+
+  _jhQaServiceOptions() {
+    const ok = ["script", "scene", "automation", "light", "switch", "fan", "climate", "media_player", "cover", "input_boolean", "jarvis"];
+    const svcs = (this._hass && this._hass.services) || {};
+    const out = ["jarvis:analyze_now"];
+    for (const dom of ok) {
+      for (const s of Object.keys(svcs[dom] || {}).sort()) {
+        const full = dom + "." + s;
+        if (!this._jhQaProblem({ label: "x", service: full }, 0)) out.push(full);
+      }
+    }
+    return out.slice(0, 500).map(s => `<option value="${this._esc(s)}"></option>`).join("");
+  }
+
+  _jhQaSettings(d) {
+    const rows = this._jhQaRows(d);
+    const custom = Array.isArray(d && d.config ? d.config.quick_actions : undefined);
+    return `
+      <div class="panel" id="jh-qa-card">
+        <div class="head"><span>Quick Actions</span><span class="side">CMD</span></div>
+        <div class="appliance-intro">The buttons on the Command Center, in this order (the first is highlighted). Each button runs one Home Assistant action, with optional data as a JSON object, e.g. <b>script.turn_on</b> with <b>{"entity_id": "script.evening"}</b>. Allowed: script, scene, automation (trigger, turn_on, turn_off), light, switch, fan, climate, media_player, cover, input_boolean and jarvis. <b>jarvis:analyze_now</b> is the Analyze Now button. At most 12 buttons, labels up to 24 characters.</div>
+        <div class="jh-qa-rows">
+          ${rows.length ? rows.map((r, i) => `
+          <div class="cfg-row jh-qa-row" data-qa-i="${i}">
+            <input class="cfg-field jh-qa-label" type="text" maxlength="24" placeholder="Label" aria-label="Label" value="${this._esc(r.label)}">
+            <input class="cfg-field jh-qa-svc" type="text" list="jh-qa-svcs" placeholder="domain.service" aria-label="Action" autocomplete="off" value="${this._esc(r.service)}">
+            <input class="cfg-field jh-qa-data" type="text" placeholder="data (JSON, optional)" aria-label="Data (JSON)" autocomplete="off" value="${this._esc(r.data)}">
+            <div class="jh-qa-btns">
+              <button class="ctrl jh-qa-up" data-qa-i="${i}" title="Move up" ${i === 0 ? "disabled" : ""}>&uarr;</button>
+              <button class="ctrl jh-qa-down" data-qa-i="${i}" title="Move down" ${i === rows.length - 1 ? "disabled" : ""}>&darr;</button>
+              <button class="ctrl warn jh-qa-del" data-qa-i="${i}" title="Remove">&times;</button>
+            </div>
+          </div>`).join("") : `<div class="jh-qa-none">No buttons. Add one, or press Reset to default.</div>`}
+        </div>
+        <datalist id="jh-qa-svcs">${this._jhQaServiceOptions()}</datalist>
+        <div class="jh-qa-msg" id="jh-qa-msg">${this._jhQaDraft ? "Unsaved changes — press Save." : (custom ? "" : "Showing the default buttons.")}</div>
+        <div class="jh-qa-actions">
+          <button class="ctrl" id="jh-qa-add" ${rows.length >= 12 ? "disabled" : ""}>+ Add</button>
+          <button class="ctrl primary" id="jh-qa-save">Save</button>
+          <button class="ctrl" id="jh-qa-reset">Reset to default</button>
+        </div>
+      </div>`;
+  }
+
+  _jhQaReadDom() {
+    const card = this.shadowRoot && this.shadowRoot.getElementById("jh-qa-card");
+    if (!card) return this._jhQaRows(this._data());
+    return [...card.querySelectorAll(".jh-qa-row")].map(row => ({
+      label: row.querySelector(".jh-qa-label").value,
+      service: row.querySelector(".jh-qa-svc").value,
+      data: row.querySelector(".jh-qa-data").value,
+    }));
+  }
+
+  _jhQaRedraw() {
+    const old = this.shadowRoot && this.shadowRoot.getElementById("jh-qa-card");
+    if (!old) return;
+    const box = document.createElement("div");
+    box.innerHTML = this._jhQaSettings(this._data());
+    const card = box.firstElementChild;
+    if (old.dataset.section) card.dataset.section = old.dataset.section;
+    card.style.display = old.style.display;
+    old.replaceWith(card);
+    this._jhQaWire();
+  }
+
+  _jhQaMsg(text, err) {
+    const el = this.shadowRoot && this.shadowRoot.getElementById("jh-qa-msg");
+    if (el) { el.textContent = text; el.classList.toggle("err", !!err); }
+  }
+
+  _jhQaWire() {
+    const card = this.shadowRoot && this.shadowRoot.getElementById("jh-qa-card");
+    if (!card || card._jhWired) return;
+    card._jhWired = true;
+    card.addEventListener("input", (e) => {
+      if (!e.target.closest(".jh-qa-row")) return;
+      this._jhQaDraft = this._jhQaReadDom();
+      this._jhQaMsg("Unsaved changes — press Save.", false);
+    });
+    card.addEventListener("click", async (e) => {
+      const btn = e.target.closest("button");
+      if (!btn || btn.disabled || !card.contains(btn)) return;
+      const rows = this._jhQaReadDom(), i = parseInt(btn.getAttribute("data-qa-i"), 10);
+      if (btn.classList.contains("jh-qa-up") && i > 0) { [rows[i - 1], rows[i]] = [rows[i], rows[i - 1]]; }
+      else if (btn.classList.contains("jh-qa-down") && i < rows.length - 1) { [rows[i + 1], rows[i]] = [rows[i], rows[i + 1]]; }
+      else if (btn.classList.contains("jh-qa-del")) { rows.splice(i, 1); }
+      else if (btn.id === "jh-qa-add") { if (rows.length < 12) rows.push({ label: "", service: "", data: "" }); }
+      else if (btn.id === "jh-qa-save") { await this._jhQaSave(rows); return; }
+      else if (btn.id === "jh-qa-reset") { await this._jhQaReset(); return; }
+      else return;
+      this._jhQaDraft = rows;
+      this._jhQaRedraw();
+    });
+  }
+
+  async _jhQaSave(rows) {
+    const list = [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i], n = i + 1, label = String(r.label || "").trim();
+      let data;
+      const raw = String(r.data || "").trim();
+      if (raw) {
+        try { data = JSON.parse(raw); } catch (_) { this._jhQaMsg(`Button ${n} (${label || "no label"}): the data is not valid JSON`, true); return false; }
+      }
+      const a = { label, service: String(r.service || "").trim() };
+      if (data !== undefined) a.data = data;
+      const bad = this._jhQaProblem(a, n);
+      if (bad) { this._jhQaMsg(bad, true); return false; }
+      if (a.data && !Object.keys(a.data).length) delete a.data;
+      list.push(a);
+    }
+    if (list.length > 12) { this._jhQaMsg(`At most 12 quick actions (${list.length} given)`, true); return false; }
+    if (list.filter(a => a.service === "jarvis:analyze_now").length > 1) { this._jhQaMsg("Only one Analyze Now button (jarvis:analyze_now)", true); return false; }
+    if (!this._hass) return false;
+    try {
+      await this._hass.callWS({ type: "jarvis/update_config", key: "quick_actions", value: list });
+    } catch (err) {
+      this._jhQaMsg(`Not saved: ${err?.message || err}`, true);
+      this._toast(`✗ quick actions — ${err?.message || err}`, "err");
+      return false;
+    }
+    this._jhQaDraft = null;
+    this._toast(`✓ quick actions saved (${list.length})`, "ok");
+    await this._fetchAndRender();
+    return true;
+  }
+
+  async _jhQaReset() {
+    if (!this._hass) return false;
+    if (!window.confirm("Put back the six standard Quick Actions buttons?")) return false;
+    try {
+      await this._hass.callWS({ type: "jarvis/update_config", key: "quick_actions", value: null });
+    } catch (err) {
+      this._jhQaMsg(`Not reset: ${err?.message || err}`, true);
+      return false;
+    }
+    this._jhQaDraft = null;
+    this._toast("✓ quick actions back to default", "ok");
+    await this._fetchAndRender();
+    return true;
+  }
+
+  // Jarvis Home patch (2026-11-14): jh-person-pronouns - how JARVIS refers to each Home Assistant person
+  _jhPronounRows(d) {
+    const states = (this._hass && this._hass.states) || {};
+    const raw = d && d.config ? d.config.person_pronouns : null;
+    const saved = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    return Object.keys(states).filter(e => e.startsWith("person."))
+      .map(e => ({ eid: e, name: String((states[e].attributes || {}).friendly_name || e.slice(7)),
+                   value: ["she", "he", "they"].includes(saved[e]) ? saved[e] : "they",
+                   // Jarvis Home patch (2026-11-14): jh-person-address
+                   address: (() => { const a = d && d.config && d.config.person_address && typeof d.config.person_address === "object" ? d.config.person_address[e] : null;
+                                     return ["sir", "madam", "name", "none"].includes(a) ? a : "name"; })() }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  _jhPronounSettings(d) {
+    const rows = this._jhPronounRows(d);
+    const opts = (v) => ["they", "she", "he"].map(p => `<option value="${p}"${p === v ? " selected" : ""}>${p}</option>`).join("");
+    return `
+      <div class="panel" id="jh-pron-card">
+        <div class="head"><span>People</span><span class="side">PRONOUNS</span></div>
+        <div class="mem-sub">How JARVIS refers to each person in Home Assistant (pronoun) and how it addresses them when they ask something (sir, madam, their name or no address). Not set: they, and their name — JARVIS never guesses. The Form of address under Persona &amp; Core stays for voice with no login.</div>
+        <div class="home-cfg">
+          ${rows.length ? rows.map(r => `<div class="cfg-row jh-pron-row"><label>${this._esc(r.name)}</label><div class="jh-pron-sels"><select class="cfg-field jh-pron-sel" data-person="${this._esc(r.eid)}" aria-label="Pronoun for ${this._esc(r.name)}" title="Pronoun">${opts(r.value)}</select><select class="cfg-field jh-addr-sel" data-person="${this._esc(r.eid)}" aria-label="Form of address for ${this._esc(r.name)}" title="Form of address">${[["name", "their name"], ["sir", "sir"], ["madam", "madam"], ["none", "no address"]].map(([v, t]) => `<option value="${v}"${v === r.address ? " selected" : ""}>${t}</option>`).join("")}</select></div></div>`).join("")
+            : `<div class="jh-qa-none">No people in Home Assistant.</div>`}
+        </div>
+        <div class="home-cfg"><div class="cfg-row jh-share-row"><label title="Who may ask JARVIS where someone is. Voice with no login never may.">Location sharing</label><select class="cfg-field jh-share-sel" aria-label="Location sharing" title="Who may ask JARVIS where someone is">${(() => { const v = d && d.config && d.config.location_sharing === "household" ? "household" : "private";   // jh-location-sharing, jh-private-by-default
+              return [["household", "Household"], ["private", "Only admin and the person"]].map(([k, t]) => `<option value="${k}"${k === v ? " selected" : ""}>${t}</option>`).join(""); })()}</select></div></div>
+        <div class="jh-qa-msg" id="jh-pron-msg"></div>
+      </div>`;
+  }
+
+  _jhPronounWire() {
+    const card = this.shadowRoot && this.shadowRoot.getElementById("jh-pron-card");
+    if (!card || card._jhWired) return;
+    card._jhWired = true;
+    card.addEventListener("change", async (e) => {
+      // Jarvis Home patch (2026-11-15): jh-location-sharing - who may ask where someone is
+      const ssel = e.target.closest(".jh-share-sel");
+      if (ssel && this._hass) {
+        const smsg = this.shadowRoot.getElementById("jh-pron-msg");
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "location_sharing", value: ssel.value });
+        } catch (err) {
+          if (smsg) { smsg.textContent = `Not saved: ${err?.message || err}`; smsg.classList.add("err"); }
+          this._toast(`✗ location sharing — ${err?.message || err}`, "err");
+          return;
+        }
+        if (smsg) { smsg.textContent = ""; smsg.classList.remove("err"); }
+        this._toast(`✓ location sharing: ${ssel.value === "private" ? "only admin and the person" : "household"}`, "ok");
+        await this._fetchAndRender();
+        return;
+      }
+      // Jarvis Home patch (2026-11-14): jh-person-address - the form of address beside the pronoun
+      const asel = e.target.closest(".jh-addr-sel");
+      if (asel && this._hass) {
+        const addr = {};
+        card.querySelectorAll(".jh-addr-sel").forEach(s => {
+          if (["sir", "madam", "none"].includes(s.value)) addr[s.getAttribute("data-person")] = s.value;
+        });
+        const amsg = this.shadowRoot.getElementById("jh-pron-msg");
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "person_address", value: addr });
+        } catch (err) {
+          if (amsg) { amsg.textContent = `Not saved: ${err?.message || err}`; amsg.classList.add("err"); }
+          this._toast(`✗ form of address — ${err?.message || err}`, "err");
+          return;
+        }
+        if (amsg) { amsg.textContent = ""; amsg.classList.remove("err"); }
+        this._toast(`✓ form of address saved: ${asel.value === "name" ? "name" : asel.value}`, "ok");
+        await this._fetchAndRender();
+        return;
+      }
+      const sel = e.target.closest(".jh-pron-sel");
+      if (!sel || !this._hass) return;
+      const value = {};
+      card.querySelectorAll(".jh-pron-sel").forEach(s => {
+        if (s.value === "she" || s.value === "he") value[s.getAttribute("data-person")] = s.value;
+      });
+      const msg = this.shadowRoot.getElementById("jh-pron-msg");
+      try {
+        await this._hass.callWS({ type: "jarvis/update_config", key: "person_pronouns", value });
+      } catch (err) {
+        if (msg) { msg.textContent = `Not saved: ${err?.message || err}`; msg.classList.add("err"); }
+        this._toast(`✗ pronouns — ${err?.message || err}`, "err");
+        return;
+      }
+      if (msg) { msg.textContent = ""; msg.classList.remove("err"); }
+      this._toast(`✓ pronoun saved: ${sel.value}`, "ok");
+      await this._fetchAndRender();
+    });
+  }
+
+  // Clean Jarvis: jh-optional - Settings > Optional pages. Each page is a switch (off by default); while it is on an administrator
+  // can Set up the page the way Home Assistant's dashboard editor does it (same commands: dashboards, resources, the view) and
+  // Remove exactly what Setup made (kept in jh_opt_created). A dashboard that already shows the card is adopted, not copied.
+  _jhOptSpecs() {
+    const DETAILS = ["last_used_app", "geocoded_location", "phone_state", "mic_muted", "audio_mode", "app_inactive"];
+    // jh-r8-app-keys (review round 8): the companion app's own keys (dnd_sensor, wifi_signal_strength), the same in every language
+    const PHONE = ["next_alarm", "dnd_sensor", "interactive", "steps_sensor", "sleep_confidence", "bluetooth_connection",
+                   "network_type", "wifi_signal_strength", "battery_health", "battery_temperature"];
+    const wrap = (card, kw) => Object.assign({ type: "custom:person-card", card }, kw || {});
+    const people = { icon: "mdi:shield-account", max_columns: 4, path: "private", type: "sections", title: "People", dense_section_placement: true, sections: [
+      { type: "grid", cards: [
+        { type: "custom:person-picker-card" },
+        { type: "heading", heading: "Phone & tablet details (admin only - with consent)" },
+        wrap({ type: "entities", entities: DETAILS }, { grid_options: { columns: "full" } }),
+        wrap({ type: "history-graph", title: "Phone & tablet details (24 h)", entities: DETAILS }),
+        wrap({ type: "map", entities: ["person"], hours_to_show: 24, aspect_ratio: "16:9" }, { grid_options: { columns: "full" } }),
+      ] },
+      { type: "grid", cards: [
+        { type: "custom:person-card", each_device: true, exclude: DETAILS, listed_only: [], cards: [
+          { type: "heading", heading: "{person} - {device}" },
+          { type: "entities", entities: PHONE.concat(["*"]) },
+          { type: "history-graph", title: "Steps & sleep (7 days)", entities: ["sleep_confidence"], hours_to_show: 168 },
+        ] },
+      ] },
+    ] };
+    return {
+      map: { key: "jh_opt_map", title: "Map", sub: "Day routes on a map, a person's phone or tablet under their name, Normal / Google / Satellite. Admins see everyone, others only themselves.",
+             url: "jarvis-map", icon: "mdi:map", admin: false, card: "path-calendar-card", files: ["path-calendar-card.js", "map-device-picker.js"],
+             view: { title: "Map", path: "map", type: "panel", cards: [{ type: "custom:path-calendar-card" }] } },
+      people: { key: "jh_opt_people", title: "People (private)", sub: "Each person's phones and tablets with their sensors. Admins only.",
+                url: "jarvis-people", icon: "mdi:shield-account", admin: true, card: "person-card", files: ["person-page-card.js"], view: people },
+      phone: { key: "jh_opt_phone", title: "My phone", sub: "Everyone sees the sensors of their own phones and tablets, nobody else's.",
+               url: "jarvis-my-phone", icon: "mdi:cellphone", admin: false, card: "phone-page-card", files: ["phone-page-card.js"],
+               view: { title: "My phone", path: "phone", type: "panel", cards: [{ type: "custom:phone-page-card" }] } },
+      chat: { key: "jh_opt_chat", title: "Household Chat", sub: "WhatsApp-style chat for everyone who logs in, with JARVIS as a contact. Only the people in a chat can read it. The switch alone adds or removes the Chat page.", chat: true },
+      overview: { key: "jh_opt_overview", title: "Home overview", sub: "Home Assistant's own Home page for everyone, with cameras only for admins and each phone or tablet only for admins and its own login. JARVIS keeps it up to date; views you edit yourself are left alone.",
+                  url: "jarvis-overview", icon: "mdi:home-variant", admin: false, adopt: '"home-overview"', adoptView: 'home-overview', files: [], view: null },   // jh-r23-adopt (step 165)
+      history: { key: "jh_opt_history", title: "Saved history views", sub: "Everyone saves their own History selections and opens them again from a list; nobody else sees them.",
+                 url: "jarvis-history", icon: "mdi:chart-timeline-variant", admin: false, card: "saved-history-card", files: ["saved-history-card.js"],
+                 view: { title: "My history", path: "history", type: "sections", sections: [{ type: "grid", cards: [{ type: "custom:saved-history-card" }] }] } },
+      login: { key: "jh_opt_login", title: "Login screen", sub: "The animated JARVIS look around Home Assistant's own login form (it still does the login). The first time it is switched on, JARVIS downloads its video, photos and planet maps (about 11 MB) from the Clean Jarvis release; without them a drawn starfield is shown. Switch it off for Home Assistant's own login page. Admins only; the switch alone.", login: true },   // jh-login-screen
+      brand: { key: "jh_opt_brand", title: "JARVIS logo", sub: "The JARVIS logo instead of the Home Assistant logo: browser tab, loading screen, the logo pictures inside the app and the top of the sidebar (jh-r8-logo: Home Assistant's own logo files are never replaced, so nothing stays behind in a browser). Switch it off for Home Assistant's own logos. Admins only; the switch alone.", alone: true },   // jh-optional-looks
+      mediabar: { key: "jh_opt_mediabar", title: "Hide the idle media bar", sub: "On the Media page the player bar shrinks to its target button while nothing can be controlled there (Web browser with nothing playing, a film in the pop-up, an item loading, a speaker that is off or gone). Admins only; the switch alone.", alone: true },
+      tuya: { key: "jh_opt_tuya", title: "Tuya lamp clean-up", sub: "Only with Tuya Local: hides the Music effect from the lamps and disables the scene preset selects, so the scenes from the Tuya app stay. Switching it off puts everything back. Admins only; the switch alone.", alone: true, tuya: true },
+      assist: { key: "jh_opt_assist", title: "Assist history", sub: "Home Assistant's own Assist pop-up shows your last 50 messages again, per assistant, and keeps the conversation for a few minutes. Each login only sees its own; nothing is kept in the browser. A Clear history button is in the pop-up. Admins switch it on; the switch alone.", alone: true },   // jh-assist-history
+      watch: { key: "jh_opt_watch", title: "Answer watcher", sub: "Flags answers that look wrong (slow, unsure, another language, an action claimed but nothing switched, a gendered guess, no reply). Admins only; the switch alone.", watch: true },
+      chatlog: { key: "jh_opt_chatlog", title: "Chat history", sub: "Past JARVIS conversations of every login, and the Assist chats of the other assistants, with a filter and Delete. Admins only.",
+                 url: "jarvis-chats", icon: "mdi:chat-processing", admin: true, card: "chat-history-card", files: ["chat-history-card.js"],
+                 view: { title: "Chats", path: "chats", type: "panel", cards: [{ type: "custom:chat-history-card" }] } },
+    };
+  }
+
+  // The Home overview as the start page: Home Assistant's own setting for everyone when this version has it (system data
+  // "core"), else for this login (user data "core"). Returns for whom it was set.
+  async _jhOptDefault(url) {
+    const h = this._hass, merge = (r) => Object.assign({}, (r && r.value && typeof r.value === "object") ? r.value : {}, { default_panel: url });
+    try {
+      const cur = await h.callWS({ type: "frontend/get_system_data", key: "core" });
+      await h.callWS({ type: "frontend/set_system_data", key: "core", value: merge(cur) });
+      return "for everyone";
+    } catch (err) {
+      const cur = await h.callWS({ type: "frontend/get_user_data", key: "core" }).catch(() => null);
+      await h.callWS({ type: "frontend/set_user_data", key: "core", value: merge(cur) });
+      return "for your login";
+    }
+  }
+
+  // Answer watcher log (administrators only; the command refuses anybody else)
+  _jhWatchSettings(d) {
+    const c = (d && d.config) || {}, admin = !!(this._hass && this._hass.user && this._hass.user.is_admin);
+    if (!admin || c.jh_opt_watch !== true) return "";
+    return `
+      <div class="panel" id="jh-watch-card">
+        <div class="head"><span>Answer watcher</span><span class="side">ADMINS ONLY</span></div>
+        <div class="appliance-intro">Answers that looked wrong, newest first, with the question and the answer. Only administrators can see this list.</div>
+        <div class="jh-watch-body" id="jh-watch-body"><div class="jh-qa-none">Loading…</div></div>
+        <div class="jh-opt-btns"><button class="ctrl warn jh-watch-clear">CLEAR LIST</button></div>
+      </div>`;
+  }
+
+  async _jhWatchFill() {
+    const box = this.shadowRoot && this.shadowRoot.getElementById("jh-watch-body");
+    if (!box || !this._hass) return;
+    if (!(this._hass.user && this._hass.user.is_admin)) return;   // jh-nonadmin: jarvis/answer_watch is for administrators only
+    let r;
+    try { r = await this._hass.callWS({ type: "jarvis/answer_watch", limit: 200 }); }
+    catch (err) { box.innerHTML = `<div class="jh-qa-none">${this._esc((err && err.message) || err)}</div>`; return; }
+    const rows = (r && r.rows) || [];
+    box.innerHTML = rows.length ? rows.map(x => `<div class="jh-watch-row">
+        <div class="jh-watch-top"><b>${this._esc(new Date((x.ts || 0) * 1000).toLocaleString())}</b> <span>${this._esc(x.who || "")}</span> <span class="jh-opt-warn">${this._esc((x.why || []).join("; "))}</span></div>
+        <div class="jh-watch-q">Q: ${this._esc(x.q || "")}</div><div class="jh-watch-a">A: ${this._esc(x.a == null ? "(no reply)" : x.a)}</div></div>`).join("")
+      : `<div class="jh-qa-none">Nothing flagged in the last ${this._esc(r && r.days)} days.</div>`;
+  }
+
+  _jhWatchWire() {
+    const card = this.shadowRoot && this.shadowRoot.getElementById("jh-watch-card");
+    if (!card || card._jhWired) return;
+    card._jhWired = true;
+    this._jhWatchFill();
+    card.addEventListener("click", async (e) => {
+      if (!e.target.closest(".jh-watch-clear") || !window.confirm("Clear the list of flagged answers?")) return;
+      try { await this._hass.callWS({ type: "jarvis/answer_watch_clear" }); } catch (err) { this._toast("✗ " + ((err && err.message) || err), "err"); }
+      this._jhWatchFill();
+    });
+  }
+
+  _jhOptUrl(file, c) {
+    const v = ((c && c.jh_opt_assets) || {})[file] || "1";
+    return "/jarvis_panel_static/optional/" + file + "?v=" + encodeURIComponent(v);
+  }
+
+  // Household Chat needs no Set up: the switch starts it. What the server reports about it (jh_chat_status).
+  _jhOptChatText(c) {
+    const st = (c && c.jh_chat_status) || {};
+    if (st.running) return "Running: Chat is in the sidebar for everyone who logs in" + (st.copied === "copied" ? " \u00b7 the chats of the former Household Chat were copied (the old folder is kept)" : "");
+    if (st.old === "installed") return "Old Household Chat integration is still installed \u2014 remove it, then switch Chat on";
+    if (st.old === "restart") return "Old Household Chat integration was removed \u2014 restart Home Assistant, then Chat starts";
+    if (st.copied === "busy") return "Not started: the folder jarvis/household_chat holds files but no chats \u2014 move them away, then switch Chat on";
+    return c && c.jh_opt_chat === true ? "Not running" : "Off";
+  }
+
+  // jh-login-screen: what the server reports about the login screen and its downloaded media
+  _jhLoginText(c, on) {
+    if (!on) return "Off: Home Assistant's own login page";
+    const a = (c && c.jh_login_assets) || {};
+    const media = a.state === "ready" ? "video and planets ready" : a.state === "downloading" ? "downloading the video and planets…"
+      : a.state === "failed" ? "media not downloaded (" + (a.error || "error") + "), a drawn starfield is shown; switch off and on to try again"
+      : "media not downloaded yet, a drawn starfield is shown";
+    return (c && c.jh_login_active === false ? "On, but Home Assistant's own login page is still served (see the log)" : "On") + " · " + media;
+  }
+
+  _jhOptSettings(d) {
+    const c = (d && d.config) || {}, specs = this._jhOptSpecs(), made = (c.jh_opt_created && typeof c.jh_opt_created === "object") ? c.jh_opt_created : {};
+    const admin = !!(this._hass && this._hass.user && this._hass.user.is_admin);
+    const row = (f, s) => {
+      const on = c[s.key] === true, rec = made[f], busy = this._jhOptBusy === f;
+      const stale = rec && !s.chat && (rec.resources || []).some(r => s.files.some(file => (r.url || "").split("?")[0].endsWith("/" + file) && r.url !== this._jhOptUrl(file, c)));
+      const chatWarn = s.chat && ((c.jh_chat_status || {}).old || (c.jh_chat_status || {}).copied === "busy");
+      const where = s.alone ? (s.tuya && c.jh_tuya_local === false ? (on ? "On, but Tuya Local is not installed: nothing to do" : "Off · Tuya Local is not installed") : (on ? "On" : "Off"))   // jh-optional-looks
+        : s.login ? this._esc(this._jhLoginText(c, on))   // jh-login-screen
+        : s.watch ? (on ? "On: flagged answers are kept " + this._esc(c.jh_watch_days || 14) + " days, below" : "Off")
+        : s.chat ? `<span class="${chatWarn ? "jh-opt-warn" : ""}">${this._esc(this._jhOptChatText(c))}</span>`
+        : rec ? "Set up: /" + this._esc(rec.dashboard || "") + (rec.adopted ? " (kept as it was)" : "") + (stale ? " \u00b7 update available, press Set up" : "") : "Not set up";
+      const btns = admin && !s.chat && !s.watch && !s.login && !s.alone ? `<div class="jh-opt-btns">${f === "overview" && rec && on ? `<button class="ctrl jh-opt-default" data-url="${this._esc(rec.dashboard || "")}">MAKE DEFAULT PAGE</button>` : ""}${on ? `<button class="ctrl jh-opt-setup" data-opt="${this._esc(f)}" ${busy ? "disabled" : ""}>${rec ? "SET UP AGAIN" : "SET UP"}</button>` : ""}${rec ? `<button class="ctrl warn jh-opt-remove" data-opt="${this._esc(f)}" ${busy ? "disabled" : ""}>REMOVE</button>` : ""}</div>` : "";
+      return `<div class="jh-opt-row" data-opt-row="${this._esc(f)}">
+          <div class="cfg-row"><label>${this._esc(s.title)} <span class="mode-bind-sub">${this._esc(s.sub)}</span></label>${admin ? `<button class="toggle-btn ${on ? "on" : "off"}" data-cfg-key="${this._esc(s.key)}" data-cfg-val="${on ? "false" : "true"}">${on ? "ON" : "OFF"}</button>` : `<span class="mode-bind-sub">${on ? "ON" : "OFF"}</span>`}</div>
+          <div class="jh-opt-state"><span class="jh-opt-where">${where}</span>${btns}</div>
+          ${f === "login" && admin && on ? `<div class="cfg-row"><label>System status on the login screen <span class="mode-bind-sub">counts only (devices offline, integrations failing), never names; visible to anyone who opens the login page</span></label><button class="toggle-btn ${c.jh_login_status === true ? "on" : "off"}" data-cfg-key="jh_login_status" data-cfg-val="${c.jh_login_status === true ? "false" : "true"}">${c.jh_login_status === true ? "ON" : "OFF"}</button></div>
+          <div class="cfg-row"><label>Voice "Identify yourself." <span class="mode-bind-sub">once when the login page opens; if the browser blocks sound, on the first tap or key press</span></label><button class="toggle-btn ${c.jh_login_voice !== false ? "on" : "off"}" data-cfg-key="jh_login_voice" data-cfg-val="${c.jh_login_voice !== false ? "false" : "true"}">${c.jh_login_voice !== false ? "ON" : "OFF"}</button></div>` : ""}
+          ${f === "overview" && admin && on ? `<div class="cfg-row"><!-- jh-overview-cams (step 158) --><label>Cameras for everyone <span class="mode-bind-sub">off: only administrators see the cameras; applied at the next update, within 5 minutes</span></label><button class="toggle-btn ${c.jh_overview_cams_all === true ? "on" : "off"}" data-cfg-key="jh_overview_cams_all" data-cfg-val="${c.jh_overview_cams_all === true ? "false" : "true"}">${c.jh_overview_cams_all === true ? "ON" : "OFF"}</button></div>` : ""}
+          ${f === "watch" && admin && on ? `<div class="cfg-row jh-opt-days"><label>Keep flagged answers (days) <span class="mode-bind-sub">1 to 90</span></label><input class="cfg-field jh-watch-days-in" type="number" min="1" max="90" step="1" aria-label="Keep flagged answers in days" value="${this._esc(c.jh_watch_days || 14)}"></div>
+          <div class="cfg-row"><label>Notify admins <span class="mode-bind-sub">no chat text in the notification</span></label><button class="toggle-btn ${c.jh_watch_notify === true ? "on" : "off"}" data-cfg-key="jh_watch_notify" data-cfg-val="${c.jh_watch_notify === true ? "false" : "true"}">${c.jh_watch_notify === true ? "ON" : "OFF"}</button></div>` : ""}
+          ${f === "map" && admin && on ? `<div class="cfg-row jh-opt-days"><label>History kept (days) <span class="mode-bind-sub">empty: JARVIS removes nothing; Home Assistant's own recorder setting still applies</span></label><input class="cfg-field jh-opt-days-in" type="number" min="1" max="365" step="1" aria-label="History kept in days" value="${c.jh_history_days == null ? "" : this._esc(c.jh_history_days)}"></div>` : ""}
+        </div>`;
+    };
+    return `
+      <div class="panel" id="jh-opt-card">
+        <div class="head"><span>Optional pages</span><span class="side">OFF BY DEFAULT</span></div>
+        <div class="appliance-intro">Extra pages for this home. Each one is off until you switch it on; then Set up adds its dashboard to the sidebar the way Home Assistant's dashboard editor would, and Remove takes away exactly what Set up added. ${admin ? "" : "Only an administrator can change these."}</div>
+        ${Object.entries(specs).map(([f, s]) => row(f, s)).join("")}
+        <div class="jh-qa-msg${this._jhOptMsg && this._jhOptMsg.err ? " err" : ""}" id="jh-opt-msg">${this._esc((this._jhOptMsg && this._jhOptMsg.text) || "")}</div>
+      </div>`;
+  }
+
+  _jhOptSay(text, err) {
+    this._jhOptMsg = text ? { text, err: !!err } : null;   // kept for the re-render that follows
+    const m = this.shadowRoot && this.shadowRoot.getElementById("jh-opt-msg");
+    if (m) { m.textContent = text || ""; m.classList.toggle("err", !!err); }
+    if (text) this._toast((err ? "✗ " : "✓ ") + text, err ? "err" : "ok");
+  }
+
+  async _jhOptSaveMade(feature, rec) {
+    // jh-r11-created (review round 11): only this page's record, merged on the server, so another device's pages stay
+    const r = await this._hass.callWS({ type: "jarvis/opt_created_set", feature, rec: rec || null });
+    const all = (r && r.jh_opt_created && typeof r.jh_opt_created === "object") ? r.jh_opt_created : {};
+    if (this._liveData && this._liveData.config) this._liveData.config.jh_opt_created = all;
+  }
+
+  async _jhOptSetup(feature) {
+    const h = this._hass, s = this._jhOptSpecs()[feature], c = (this._liveData && this._liveData.config) || {};
+    const prev = ((c.jh_opt_created || {})[feature]) || null;
+    if (!s || s.chat) return null;
+    const rec = { dashboard: prev && prev.dashboard, made: !!(prev && prev.made), adopted: !!(prev && prev.adopted), resources: [] };
+    if (prev && prev.ha_map) rec.ha_map = prev.ha_map;   // jh-r7-setup-merge, review round 7: kept in every save, also a partial one
+    const boards = await h.callWS({ type: "lovelace/dashboards/list" });
+    let board = rec.dashboard ? boards.find(b => b.url_path === rec.dashboard) : null;
+    if (!board) {   // a dashboard that already shows this card is adopted as it is
+      rec.made = false; rec.adopted = false; rec.dashboard = null;
+      for (const b of boards) {
+        if (b.mode && b.mode !== "storage") continue;
+        if (b.url_path === s.url && !(prev && prev.adopted)) continue;   // jh-r6-setup-progress: its own address is never adopted
+        const cfg = await h.callWS({ type: "lovelace/config", url_path: b.url_path }).catch(() => null);
+        // jh-r23-adopt (step 165, review round 23 #11): the Home overview only when a view really uses its strategy (a view path,
+        // a button or a title with that text is no overview), never a dashboard that is a strategy itself
+        const jhAdopt = s.adoptView
+          ? !!(cfg && !cfg.strategy && Array.isArray(cfg.views) && cfg.views.some(v => v && v.strategy && v.strategy.type === s.adoptView))
+          : !!(cfg && JSON.stringify(cfg).includes(s.adopt || ('"custom:' + s.card + '"')));
+        if (jhAdopt) { board = b; rec.dashboard = b.url_path; rec.adopted = true; break; }
+      }
+    }
+    if (board && s.admin && !board.require_admin) throw new Error("Dashboard /" + board.url_path + " is not admin-only, so nothing was written. Turn on Admin only for it in Settings > Dashboards, then press Set up again.");
+    if (!board) {
+      if (boards.some(b => b.url_path === s.url)) throw new Error("A dashboard at /" + s.url + " already exists and does not show this page. Rename or delete it in Settings > Dashboards first.");
+      await h.callWS({ type: "lovelace/dashboards/create", url_path: s.url, title: s.title, icon: s.icon, show_in_sidebar: true, require_admin: s.admin, mode: "storage" });
+      rec.dashboard = s.url; rec.made = true;
+      await this._jhOptSaveMade(feature, Object.assign({}, rec, { resources: (prev && prev.resources) || [] }));   // review round 6: recorded at once; jh-r8-early-save (review round 8): the earlier resources stay in it
+    }
+    try {   // review round 6: whatever fails later, what was made so far stays recorded (so Remove can take it away)
+    if (rec.made && s.view) {   // only a dashboard Setup made gets its view (re)written; an adopted one keeps its own layout (the Home overview is written by JARVIS)
+      let cfg = await h.callWS({ type: "lovelace/config", url_path: rec.dashboard }).catch(() => null);
+      cfg = cfg && typeof cfg === "object" ? cfg : {};
+      const views = Array.isArray(cfg.views) ? cfg.views.slice() : [];
+      const i = views.findIndex(v => v && v.path === s.view.path);
+      if (i >= 0) views[i] = s.view; else views.push(s.view);
+      await h.callWS({ type: "lovelace/config/save", url_path: rec.dashboard, config: Object.assign({}, cfg, { views }) });
+    }
+    const have = await h.callWS({ type: "lovelace/resources" });
+    const mine = new Map(((prev && prev.resources) || []).map(r => [r.id, r]));
+    for (const file of s.files) {
+      const url = this._jhOptUrl(file, c);
+      const hit = have.find(r => String(r.url || "").split("?")[0].endsWith("/" + file));
+      if (!hit) {
+        const made = await h.callWS({ type: "lovelace/resources/create", res_type: "module", url });
+        rec.resources.push({ id: String(made.id), url });
+        continue;
+      }
+      const old = mine.get(String(hit.id));
+      // jh-r8-was (review round 8): the old address must be storable before the resource is taken over, or it would be lost
+      if (!old && hit.url !== url && !/^[^\x00-\x1f\x7f]{1,2000}$/.test(String(hit.url || ""))) throw new Error("The existing resource " + hit.id + " has an address JARVIS cannot keep, so nothing was changed. Remove that resource in Settings > Dashboards > Resources first, then press Set up again.");
+      if (hit.url !== url) await h.callWS({ type: "lovelace/resources/update", resource_id: hit.id, res_type: "module", url });
+      // a resource of an older install of the same card is taken over; Remove puts its old address back
+      // jh-r11-own-was (review round 11): a resource already at JARVIS's own address has no earlier address to put back (Remove deletes it)
+      const ownAddr = String(hit.url || "").split("?")[0].startsWith("/jarvis_panel_static/optional/");
+      rec.resources.push(old ? { id: String(hit.id), url, ...(old.was ? { was: old.was } : {}) } : (ownAddr ? { id: String(hit.id), url } : { id: String(hit.id), url, was: hit.url }));
+    }
+    if (feature === "map") {   // jh-private-by-default: Home Assistant's own Map dashboard shows everyone to everybody: admins only
+      const ha = boards.find(b => b.url_path === "map" && b.url_path !== rec.dashboard);
+      if (prev && prev.ha_map) rec.ha_map = prev.ha_map;
+      if (ha && !ha.require_admin) {
+        await h.callWS({ type: "lovelace/dashboards/update", dashboard_id: ha.id, require_admin: true });
+        rec.ha_map = String(ha.id);
+      }
+    }
+    } catch (err) {   // review round 7: the earlier record's resources stay in it (with their old address), so Remove can undo them
+      rec.resources = rec.resources.concat(((prev && prev.resources) || []).filter(p => !rec.resources.some(r => r.id === p.id)));
+      try { await this._jhOptSaveMade(feature, rec); } catch (e2) { /* the error below is what the admin sees */ }
+      throw err;
+    }
+    return rec;
+  }
+
+  async _jhOptRemove(feature) {
+    const h = this._hass, s = this._jhOptSpecs()[feature], c = (this._liveData && this._liveData.config) || {};
+    const rec = ((c.jh_opt_created || {})[feature]) || null;
+    if (!rec || !s || s.chat) return;
+    const have = await h.callWS({ type: "lovelace/resources" });
+    for (const r of rec.resources || []) {
+      if (!have.some(x => String(x.id) === r.id)) continue;
+      if (r.was && !String(r.was).split("?")[0].startsWith("/jarvis_panel_static/optional/")) await h.callWS({ type: "lovelace/resources/update", resource_id: r.id, res_type: "module", url: r.was });   // jh-r11-own-was
+      else await h.callWS({ type: "lovelace/resources/delete", resource_id: r.id });
+    }
+    if (rec.ha_map) await this._jhOptMapBack(rec);   // jh-private-by-default: Home Assistant's Map as it was
+    if (feature === "overview" && !rec.made && rec.dashboard) {   // jh-r5-panel (review round 5): JARVIS's views out of an adopted dashboard
+      await h.callWS({ type: "jarvis/overview_unsync", dashboard: rec.dashboard });
+    }
+    if (rec.made && rec.dashboard) {
+      const boards = await h.callWS({ type: "lovelace/dashboards/list" });
+      const b = boards.find(x => x.url_path === rec.dashboard);
+      if (b) await h.callWS({ type: "lovelace/dashboards/delete", dashboard_id: b.id });
+    }
+  }
+
+  // jh-private-by-default: Home Assistant's own Map dashboard back as it was (not admin-only), when Setup made it admin-only
+  async _jhOptMapBack(rec) {
+    const boards = await this._hass.callWS({ type: "lovelace/dashboards/list" });
+    const ha = boards.find(b => String(b.id) === String(rec.ha_map));
+    if (ha && ha.require_admin) await this._hass.callWS({ type: "lovelace/dashboards/update", dashboard_id: ha.id, require_admin: false });
+  }
+
+  _jhOptWire() {
+    const card = this.shadowRoot && this.shadowRoot.getElementById("jh-opt-card");
+    if (!card || card._jhWired) return;
+    card._jhWired = true;
+    card.addEventListener("click", async (e) => {
+      const def = e.target.closest(".jh-opt-default");
+      if (def && this._hass) {
+        try { this._jhOptSay("Home overview is now the default page " + await this._jhOptDefault(def.getAttribute("data-url")), false); }
+        catch (err) { this._jhOptSay("Not set as default: " + ((err && err.message) || err) + ". Use Settings > Dashboards instead.", true); }
+        return;
+      }
+      const btn = e.target.closest(".jh-opt-setup, .jh-opt-remove");
+      if (!btn || !this._hass || this._jhOptBusy) return;
+      const f = btn.getAttribute("data-opt"), remove = btn.classList.contains("jh-opt-remove"), s = this._jhOptSpecs()[f];
+      if (!s || s.chat || s.watch) return;
+      if (remove && !window.confirm("Remove the " + s.title + " page that Set up added?")) return;
+      this._jhOptBusy = f; btn.disabled = true;
+      try {
+        const rec = remove ? (await this._jhOptRemove(f), null) : await this._jhOptSetup(f);
+        await this._jhOptSaveMade(f, rec);
+        this._jhOptSay(remove ? s.title + " removed" : s.title + " set up: open it from the sidebar", false);
+      } catch (err) {
+        this._jhOptSay(s.title + ": " + ((err && err.message) || err), true);
+      } finally {
+        this._jhOptBusy = null;
+      }
+      await this._fetchAndRender();
+    });
+    card.addEventListener("change", async (e) => {
+      const wd = e.target.closest(".jh-watch-days-in");
+      if (wd && this._hass) {
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "jh_watch_days", value: Number(wd.value) });
+          this._jhOptSay("flagged answers kept " + wd.value + " days", false);
+        } catch (err) { this._jhOptSay("days not saved: " + ((err && err.message) || err), true); }
+        await this._fetchAndRender();
+        return;
+      }
+      const inp = e.target.closest(".jh-opt-days-in");
+      if (!inp || !this._hass) return;
+      const raw = String(inp.value).trim();
+      try {
+        await this._hass.callWS({ type: "jarvis/update_config", key: "jh_history_days", value: raw === "" ? null : Number(raw) });
+        this._jhOptSay(raw === "" ? "history days cleared: JARVIS removes nothing" : "history kept: " + raw + " days", false);
+      } catch (err) {
+        this._jhOptSay("history days not saved: " + ((err && err.message) || err), true);
+      }
+      await this._fetchAndRender();
+    });
+  }
+
+  _esc(s) {   // jh-r19-xss: the single quote too (some attributes are single-quoted)
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  async _saveConfig(key, value) {
+    if (!this._hass || !key) return;
+    try {
+      await this._hass.callWS({ type: 'jarvis/update_config', key, value });
+      this._toast(`✓ ${key} → ${value}`, 'ok');
+    } catch (err) {
+      this._toast(`✗ ${key} — ${err?.message || err}`, 'err');
+    }
+  }
+
+  // Wire every config on/off toggle (a button carrying both data-cfg-key and
+  // data-cfg-val) under `root`. Extracted from the main wiring pass so cards
+  // rendered lazily — the Intrusion tab is populated after that pass runs —
+  // can wire their own toggles; otherwise those buttons render but clicking
+  // does nothing (issue #111). Idempotent: a button is wired at most once.
+  _wireConfigToggles(root) {
+    if (!root) return;
+    root.querySelectorAll("[data-cfg-key][data-cfg-val]").forEach(btn => {
+      if (btn._cfgWired) return;
+      btn._cfgWired = true;
+      btn.addEventListener("click", async (e) => {
+        const key = e.currentTarget.getAttribute("data-cfg-key");
+        const rawVal = e.currentTarget.getAttribute("data-cfg-val");
+        const value = rawVal === "true" ? true : rawVal === "false" ? false : rawVal;
+        if (!key || !this._hass) return;
+        // Gate: a toggle carrying data-confirm must be explicitly acknowledged
+        // before it can be switched ON (e.g. FRIDAY, which can actuate the home).
+        // Only enabling (value === true) prompts; turning it back off never does.
+        const confirmMsg = e.currentTarget.getAttribute("data-confirm");
+        if (confirmMsg && value === true && !window.confirm(confirmMsg)) return;
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key, value });
+          if (key === "jh_opt_map" && value === true) {   // jh-r4-map-on (review round 4): back on, Home Assistant's Map admin-only again
+            const made = ((this._liveData && this._liveData.config && this._liveData.config.jh_opt_created) || {}).map;
+            if (made) {
+              try {
+                const boards = await this._hass.callWS({ type: "lovelace/dashboards/list" });
+                const ha = boards.find(b => b.url_path === "map" && b.url_path !== made.dashboard);
+                if (ha && !ha.require_admin) {
+                  await this._hass.callWS({ type: "lovelace/dashboards/update", dashboard_id: ha.id, require_admin: true });
+                  await this._jhOptSaveMade("map", Object.assign({}, made, { ha_map: String(ha.id) }));
+                }
+              } catch (err3) { this._toast("\u2717 Home Assistant's Map was not made admin-only: " + ((err3 && err3.message) || err3), "err"); }
+            }
+          }
+          if (key === "jh_opt_map" && value === false) {   // jh-private-by-default: the Map page off puts Home Assistant's Map back
+            const made = ((this._liveData && this._liveData.config && this._liveData.config.jh_opt_created) || {}).map;
+            if (made && made.ha_map) {
+              try { await this._jhOptMapBack(made); const keep = Object.assign({}, made); delete keep.ha_map; await this._jhOptSaveMade("map", keep); }
+              catch (err2) { this._toast("✗ Home Assistant's Map was not put back: " + ((err2 && err2.message) || err2), "err"); }
+            }
+          }
+          this._toast(`✓ ${key} → ${value}`, "ok");
+          await this._fetchAndRender();
+        } catch (err) {
+          this._toast(`✗ ${key} — ${err?.message || err}`, "err");
+        }
+      });
+    });
+  }
+
+  // ── Governance tab: the kernel enforce kill-switches ──────────────────────
+  // Fetches jarvis/get_enforcement and renders a toggle + explanation per
+  // switch into #gov-body. Called when the Settings tab renders and when the
+  // Governance sub-section is opened. Safe to call repeatedly.
+  async _fetchEnforcement() {
+    const body = this.shadowRoot && this.shadowRoot.getElementById("gov-body");
+    if (!body || !this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/get_enforcement" });
+      const switches = (res && res.switches) || [];
+      body.innerHTML = this._renderEnforcement(switches);
+      this._wireEnforcementToggles(body);
+    } catch (err) {
+      body.innerHTML = `<div class="mem-sub">Couldn't load governance switches — ${this._esc(err?.message || String(err))}</div>`;
+    }
+  }
+
+  _renderEnforcement(switches) {
+    const row = (s) => {
+      const on = !!s.enabled;
+      const phase = s.phase ? `<span style="opacity:.6;font-size:11px;margin-left:6px;">${this._esc(s.phase)}</span>` : "";
+      const ovr = s.overridden ? `<span style="opacity:.7;font-size:11px;margin-left:6px;color:var(--warning,#e0a030);">overridden</span>` : "";
+      return `
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.07);">
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;">${this._esc(s.name)}${phase}${ovr}</div>
+          <div class="mem-sub" style="margin-top:3px;">${this._esc(s.explanation)}</div>
+        </div>
+        <button class="toggle-btn ${on ? 'on' : 'off'} gov-toggle"
+                data-gov-key="${this._esc(s.key)}" data-gov-enabled="${on ? '1' : '0'}"
+                data-gov-cat="${this._esc(s.category)}" data-gov-name="${this._esc(s.name)}"
+                style="flex:0 0 auto;">${on ? 'ON' : 'OFF'}</button>
+      </div>`;
+    };
+    const caps = switches.filter(s => s.category === "capability");
+    const safety = switches.filter(s => s.category === "safety");
+    let html = "";
+    if (caps.length) {
+      html += `<div class="mem-sub" style="margin:4px 0 2px;font-weight:600;">Owner opt-in capabilities</div>`;
+      html += `<div class="mem-sub" style="margin-bottom:6px;">These ship OFF. Turning one ON makes the kernel authoritative for that capability — your choice, behaviour-changing.</div>`;
+      html += caps.map(row).join("");
+    }
+    if (safety.length) {
+      html += `<div class="mem-sub" style="margin:14px 0 2px;font-weight:600;">Safety &amp; governance — kill-switches (keep ON)</div>`;
+      html += `<div class="mem-sub" style="margin-bottom:6px;">These ship ON and guard autonomous behaviour. Turning one OFF reverts that guard to observe-only (log-only) — only for debugging.</div>`;
+      html += safety.map(row).join("");
+    }
+    return html || `<div class="mem-sub">No governance switches reported.</div>`;
+  }
+
+  _wireEnforcementToggles(root) {
+    if (!root) return;
+    root.querySelectorAll(".gov-toggle").forEach(btn => {
+      if (btn._govWired) return;
+      btn._govWired = true;
+      btn.addEventListener("click", async (e) => {
+        const t = e.currentTarget;
+        const key = t.getAttribute("data-gov-key");
+        const cur = t.getAttribute("data-gov-enabled") === "1";
+        const next = !cur;
+        const cat = t.getAttribute("data-gov-cat");
+        const name = t.getAttribute("data-gov-name") || key;
+        if (!key || !this._hass) return;
+        // Turning OFF a safety kill-switch, or turning ON an opt-in capability,
+        // both change autonomous behaviour — confirm before either.
+        if (cat === "safety" && next === false &&
+            !window.confirm(`Turn OFF the safety enforcement “${name}”?\n\nThis reverts that guard to observe-only (log-only) until you turn it back on. Only do this for debugging.`)) return;
+        if (cat === "capability" && next === true &&
+            !window.confirm(`Enable “${name}”?\n\nThis makes the kernel authoritative for that capability.`)) return;
+        t.disabled = true;
+        try {
+          await this._hass.callWS({ type: "jarvis/set_enforcement", key, enabled: next });
+          this._toast(`✓ ${name} → ${next ? 'ON' : 'OFF'}`, "ok");
+          await this._fetchEnforcement();
+        } catch (err) {
+          this._toast(`✗ ${name} — ${err?.message || err}`, "err");
+          t.disabled = false;
+        }
+      });
+    });
+  }
+
+  _applianceTypes() {
+    return ['washer', 'dryer', 'dishwasher', 'oven', 'microwave', 'appliance'];
+  }
+
+  _renderApplianceEntityOptions(selected) {
+    const states = this._hass?.states || {};
+    const cands = [];
+    Object.keys(states).forEach(eid => {
+      const s = states[eid];
+      const dom = eid.split('.')[0];
+      const dc = (s.attributes && s.attributes.device_class) || '';
+      const unit = ((s.attributes && s.attributes.unit_of_measurement) || '').toLowerCase();
+      const isPower = dc === 'power' || dc === 'energy' || unit === 'w' || unit === 'kw';
+      const isStatus = (dom === 'binary_sensor' || dom === 'sensor') &&
+        /(washer|dryer|dishwash|laundry|appliance|run_complete|cycle_complete|job_state|machine_state)/i.test(eid);
+      if (isPower || isStatus) cands.push(eid);
+    });
+    cands.sort();
+    if (selected && !cands.includes(selected)) cands.unshift(selected);
+    return cands.map(eid => {
+      const fn = (states[eid] && states[eid].attributes && states[eid].attributes.friendly_name) || eid;
+      return `<option value="${this._esc(eid)}"${eid === selected ? ' selected' : ''}>${this._esc(fn)}</option>`;
+    }).join('');
+  }
+
+  _applianceRow(a, learnedW) {
+    const types = this._applianceTypes();
+    const t = a.type || 'appliance';
+    const learnedTxt = (learnedW && a.watts && Math.abs(learnedW - a.watts) > 5)
+      ? `learned ~${Math.round(learnedW)}W` : '';
+    return `<div class="appliance-row">
+      <div class="ar-line1">
+        <input class="appliance-name" type="text" placeholder="Name (e.g. Washer)" value="${this._esc(a.name || '')}"/>
+        <button class="appliance-remove" title="Remove appliance" aria-label="Remove appliance">✕</button>
+      </div>
+      <div class="ar-line2">
+        <select class="appliance-type">
+          ${types.map(x => `<option value="${x}"${x === t ? ' selected' : ''}>${x}</option>`).join('')}
+        </select>
+        <select class="appliance-entity">
+          <option value="">— no entity (use watts) —</option>
+          ${this._renderApplianceEntityOptions(a.entity || '')}
+        </select>
+        <input class="appliance-watts" type="number" min="0" step="10" placeholder="watts" value="${this._esc(a.watts || '')}"/>
+      </div>
+      ${learnedTxt ? `<div class="appliance-learned">${learnedTxt}</div>` : ''}
+    </div>`;
+  }
+
+  _renderAppliances(d) {
+    const prof = (d.config && d.config.appliance_profile) || [];
+    const learned = {};
+    (((d.config && d.config.appliances) || {}).profile || []).forEach(p => { learned[p.name] = p.learned_w; });
+    if (!prof.length) {
+      return `<div class="appliance-empty">No appliances declared yet — JARVIS falls back to generic power guesses until you add some.</div>`;
+    }
+    return prof.map(a => this._applianceRow(a, learned[a.name])).join('');
+  }
+
+  // Pick a replacement when the saved model is no longer offered by the provider.
+  // Vision roles must stay multimodal, so only heal them to a vision-capable id;
+  // any model works for text roles, so take the first.
+  _pickHealModel(models, cfgKey) {
+    if (/vision/.test(cfgKey || '')) {
+      return models.find(m => /vision|vl|scout|maverick|llama-4|gpt-4o|multimodal|qwen3\.\d|gemini/i.test(m)) || null;
+    }
+    return models[0] || null;
+  }
+
+  async _loadModelsFor(provider, selectEl) {
+    if (!this._hass || !selectEl) return;
+    if (!(this._hass.user && this._hass.user.is_admin)) return;   // jh-nonadmin: jarvis/list_models is for administrators only
+    const cur = selectEl.getAttribute('data-current') || '';
+    try {
+      const res = await this._hass.callWS({ type: 'jarvis/list_models', provider });
+      const models = (res && res.models) || [];
+      let opts = '';
+      if (models.length) {
+        // Self-heal: if the saved model isn't in the provider's live list anymore
+        // (e.g. Groq rotated it out), switch to an available one and persist it —
+        // so a stale/deprecated default can't silently break the connection.
+        if (cur && !models.includes(cur)) {
+          const cfgKey = selectEl.getAttribute('data-cfg-key');
+          const heal = this._pickHealModel(models, cfgKey);
+          if (heal && cfgKey) {
+            this._saveConfig(cfgKey, heal);
+            selectEl.setAttribute('data-current', heal);
+            this._toast(`Model set to ${heal} \u2014 the previous one is no longer offered by ${provider}`, 'ok');
+            opts += models.map(m =>
+              `<option value="${this._esc(m)}"${m === heal ? ' selected' : ''}>${this._esc(m)}</option>`).join('');
+          } else {
+            // no suitable replacement (e.g. no multimodal model available) — keep
+            // the current value but flag it so the user picks one.
+            opts += `<option value="${this._esc(cur)}" selected>${this._esc(cur)} \u2014 unavailable, pick one</option>`;
+            opts += models.map(m =>
+              `<option value="${this._esc(m)}">${this._esc(m)}</option>`).join('');
+          }
+        } else {
+          opts += models.map(m =>
+            `<option value="${this._esc(m)}"${m === cur ? ' selected' : ''}>${this._esc(m)}</option>`).join('');
+        }
+      } else {
+        const err = res && res.error ? ` — ${String(res.error).slice(0, 48)}` : '';
+        opts += (cur ? `<option value="${this._esc(cur)}" selected>${this._esc(cur)}</option>` : '');
+        opts += `<option value="" disabled>no models found${this._esc(err)}</option>`;
+      }
+      opts += `<option value="__custom__">✎ Custom…</option>`;
+      selectEl.innerHTML = opts;
+    } catch (_) {
+      /* leave current options in place on error */
+    }
+  }
+
+  _renderCameraOptions(d) {
+    const cams = ((d.config && d.config.cameras) || []).filter(c => c.enabled !== false);
+    if (!cams.length) return '<option value="">— no cameras —</option>';
+    return cams.map(c =>
+      `<option value="${this._esc(c.entity_id)}">${this._esc(c.name)}</option>`).join('');
+  }
+
+  _sparklineSvg(values, colorVar) {
+    if (!values || values.length < 2) return '';
+    const w = 44, h = 14, pad = 1;
+    const min = Math.min(...values), max = Math.max(...values);
+    const range = (max - min) || 1;
+    const step = (w - pad * 2) / (values.length - 1);
+    const pts = values.map((v, i) => {
+      const x = pad + i * step;
+      const y = h - pad - ((v - min) / range) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <polyline points="${pts}" fill="none" stroke="${this._esc(colorVar)}" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/>
+    </svg>`;
+  }
+
+  _evtIcon(tag) {
+    const t = (tag || "").toUpperCase();
+    const S = (p) => `<svg class="evt-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+    if (/MOTION|OBSERV|PRESENCE|OCCUP/.test(t)) return S('<circle cx="12" cy="13" r="2.5"/><path d="M6.5 13a5.5 5.5 0 0 1 11 0"/><path d="M3 13a9 9 0 0 1 18 0"/>');
+    if (/DOOR|GARAGE|WINDOW|COVER|GATE/.test(t)) return S('<rect x="6" y="3" width="12" height="18" rx="1"/><circle cx="14.5" cy="12" r="1"/>');
+    if (/ALARM|INTRU|SECUR|LOCK|BREACH/.test(t)) return S('<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/>');
+    if (/PACKAGE|MAIL|DELIV|PARCEL/.test(t)) return S('<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/>');
+    if (/ENERGY|POWER|WATT|LOAD/.test(t)) return S('<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>');
+    if (/WEATHER|HAZARD|QUAKE|STORM|FIRE|FLOOD/.test(t)) return S('<path d="M12 2v3"/><path d="M4.2 10a5 5 0 0 1 9.6-1.5A4 4 0 1 1 15 18H7a4.5 4.5 0 0 1-2.8-8z"/>');
+    if (/CAMERA|DOORBELL|VISION|FACE/.test(t)) return S('<path d="M3 7h4l2-2h6l2 2h4v12H3z"/><circle cx="12" cy="13" r="3.5"/>');
+    if (/BRIEF|MORNING|EVENING|AGENDA|CALENDAR/.test(t)) return S('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/>');
+    if (/LEAVE|DEPART|TRAVEL|ROUTINE/.test(t)) return S('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>');
+    return S('<circle cx="12" cy="12" r="2.5"/>');
+  }
+
+  _evtRowHtml(e) {
+    // jh-feed (step 149): the headline is the entity's friendly name (the entity id stays as the tooltip)
+    const eid = e.entity_id || "";
+    const st = eid && this._hass && this._hass.states ? this._hass.states[eid] : null;
+    const head = (st && st.attributes && st.attributes.friendly_name) || e.name || e.tag || "";   // jh-ha-names: HA's name first
+    return `
+      <div class="evt ${this._esc(e.urgency || '')}">
+        <div class="ts">${this._esc(e.ts || '')}</div>
+        ${this._evtIcon(e.tag)}
+        <div class="msg"><b${eid ? ` title="${this._esc(eid)}"` : ""}>${this._esc(head)}</b> · ${this._jhNamesHtml(e.msg || '')}</div>
+      </div>`;
+  }
+
+  _activityFiltered() {
+    const entries = (this._activityData && this._activityData.length > 0)
+      ? this._activityData
+      : [{ ts: "--:--", urgency: "low", tag: "SYSTEM", msg: "No activity yet. Enable announcements or observer to see events here." }];
+    const q = (this._activitySearch || '').trim().toLowerCase();
+    if (!q) return { rows: entries, total: entries.length };
+    return {
+      rows: entries.filter(e =>
+        (e.msg || '').toLowerCase().includes(q) ||
+        (e.tag || '').toLowerCase().includes(q) ||
+        (e.name || '').toLowerCase().includes(q)),   // jh-feed (step 149): the readable name too
+      total: entries.length,
+    };
+  }
+
+  _updateActivityFeed() {
+    // Rebuilds ONLY the feed rows + count — the search input keeps focus.
+    const feed = this.shadowRoot?.getElementById('activity-feed');
+    if (!feed) return;
+    const { rows, total } = this._activityFiltered();
+    const q = (this._activitySearch || '').trim();
+    feed.innerHTML = rows.length
+      ? rows.map(e => this._evtRowHtml(e)).join('')
+      : `<div class="evt low"><div class="msg" style="grid-column:1/-1;">No events match "${this._esc(q)}".</div></div>`;
+    const count = this.shadowRoot?.getElementById('activity-count');
+    if (count) count.textContent = q ? `${rows.length} OF ${total}` : `LAST ${total}`;
+  }
+
+  _relTime(iso) {
+    if (!iso) return '';
+    const t = new Date(String(iso).replace(' ', 'T')).getTime();
+    if (isNaN(t)) return '';
+    const diffMin = Math.round((t - Date.now()) / 60000);
+    const abs = Math.abs(diffMin);
+    const unit = abs < 60 ? `${abs}m` : abs < 1440 ? `${Math.round(abs / 60)}h` : `${Math.round(abs / 1440)}d`;
+    return diffMin >= 0 ? `in ${unit}` : `${unit} ago`;
+  }
+
+  _renderAreaDetail(d) {
+    if (!this._expandedArea) return '';
+    const a = (d.areasGrid || []).find(x => x.id === this._expandedArea);
+    if (!a) return '';
+    const spark = this._sparklines?.[a.id] || {};
+    const tempSpark = spark.temp ? this._sparklineSvg(spark.temp, 'var(--cyan-dim)') : '';
+    const humSpark = spark.humidity ? this._sparklineSvg(spark.humidity, 'var(--green)') : '';
+    const hasLights = (a.lights_total || 0) > 0;
+    const lit = hasLights && (a.lights_on || 0) > 0;
+    const ctlOn = (this._liveData && this._liveData.config && this._liveData.config.light_control_enabled) !== false;
+    const caps = a.caps || [];
+    return `
+      <div class="area-detail-overlay" id="area-detail-overlay">
+        <div class="area-detail-card">
+          <div class="area-detail-head">
+            <span class="area-detail-title">${this._esc(a.name)}</span>
+            <span class="area-detail-status ${a.active ? 'active' : ''}">${a.active ? '◉ OCCUPIED' : '○ VACANT'}</span>
+            <button class="area-detail-close" aria-label="Close">✕</button>
+          </div>
+          <div class="area-detail-grid">
+            ${a.temp ? `<div class="area-detail-stat">
+              <div class="ads-label">Temperature</div>
+              <div class="ads-value">${this._esc(a.temp)}</div>
+              <div class="ads-spark">${tempSpark}</div>
+            </div>` : ''}
+            ${a.humidity ? `<div class="area-detail-stat">
+              <div class="ads-label">Humidity</div>
+              <div class="ads-value">${this._esc(a.humidity)}</div>
+              <div class="ads-spark">${humSpark}</div>
+            </div>` : ''}
+          </div>
+          <div class="area-detail-meta">
+            ${hasLights ? `<div class="adm-row"><span>Lights</span>
+              <button class="area-light adl ${lit ? 'on' : ''} ${ctlOn ? '' : 'static'}" data-light-area="${this._esc(a.id)}" data-area-name="${this._esc(a.name)}">
+                <span class="al-dot"></span>${this._esc(a.lights_on)}/${this._esc(a.lights_total)} ${lit ? 'ON' : 'OFF'}
+              </button></div>` : ''}
+            ${a.last_motion ? `<div class="adm-row"><span>Last motion</span><span>${this._esc(a.last_motion)}</span></div>` : ''}
+            <div class="adm-row"><span>Capabilities</span><span>${caps.length ? caps.map(c => this._esc(c)).join(', ') : '—'}</span></div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  _renderGoals(d) {
+    const goals = d.goals || [];
+    const STATUS_LABEL = { active: 'ACTIVE', done: 'DONE', failed: 'FAILED', cancelled: 'CANCELLED' };
+    const rows = goals.map(g => {
+      const pct = g.steps_total ? Math.round((g.steps_done / g.steps_total) * 100) : 0;
+      const isActive = g.status === 'active';
+      const when = isActive
+        ? (g.deadline_ts
+            ? `deadline ${this._relTime(g.deadline_ts)}`
+            : `next check ${this._relTime(g.next_check_ts)}`)
+        : this._esc(g.last_result || '');
+      return `<div class="goal goal-${this._esc(g.status)}" data-goal-id="${this._esc(g.id)}">
+        <div class="goal-top">
+          <span class="goal-status-badge">${this._esc(STATUS_LABEL[g.status] || g.status.toUpperCase())}</span>
+          <span class="goal-title">${this._esc(g.title)}</span>
+          ${isActive
+            ? `<button class="goal-cancel" title="Cancel this goal">✕</button>`
+            : `<button class="goal-delete" title="Delete this goal">🗑</button>`}
+        </div>
+        <div class="goal-outcome">${this._esc(g.outcome)}</div>
+        ${g.steps_total ? `
+        <div class="goal-meta">
+          <span class="goal-steps-bar"><i style="width:${pct}%"></i></span>
+          <span class="goal-steps-pct">${this._esc(g.steps_done)}/${this._esc(g.steps_total)} steps</span>
+        </div>` : ''}
+        ${when ? `<div class="goal-when">${when}</div>` : ''}
+      </div>`;
+    }).join('');
+    const activeCount = goals.filter(g => g.status === 'active').length;
+    return `
+      <div class="panel">
+        <div class="head">
+          <span>Goals</span>
+          <span class="side">${activeCount} ACTIVE</span>
+        </div>
+        <div class="goal-new">
+          <input class="goal-new-input" type="text" placeholder="Give JARVIS a goal to work toward…" maxlength="240" />
+          <button class="goal-new-btn" title="Add goal">+ ADD</button>
+        </div>
+        <div class="goal-list">${rows || '<div class="goal-empty">No goals yet. Add one above, or ask JARVIS to set one.</div>'}</div>
+      </div>`;
+  }
+
+  _renderComposer() {
+    // Natural-language automation composer: describe → draft (validated, not
+    // installed) → review → install. Reuses the same validation the chat
+    // create_automation path uses; nothing is written until you click Install.
+    return `
+      <div class="meta sug-wrap sug-composer">
+        <div class="sug-header">
+          <span class="sug-header-title">CREATE AN AUTOMATION</span>
+        </div>
+        <div class="composer-sub">Describe it in plain English — JARVIS drafts it
+          against your real devices for you to review before anything is installed.</div>
+        <textarea id="composer-input" class="composer-input" rows="2"
+          placeholder="e.g. turn on the porch light at sunset and off at 11pm"></textarea>
+        <div class="composer-actions">
+          <button id="composer-draft" class="sug-btn composer-draft">✎ Draft automation</button>
+        </div>
+        <div id="composer-result" class="composer-result" hidden>
+          <div id="composer-msg" class="composer-msg"></div>
+          <pre id="composer-yaml" class="sug-yaml" hidden></pre>
+          <div class="composer-actions">
+            <button id="composer-install" class="sug-btn sug-approve" hidden>✓ Install</button>
+            <button id="composer-discard" class="sug-btn sug-dismiss">✕ Discard</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  _renderSuggestions(d) {
+    const sugs = d.suggestions || [];
+    const composer = this._renderComposer();
+    const TYPE_LABEL = {
+      time_routine: 'DAILY ROUTINE', sequence: 'ACTION SEQUENCE',
+      repeated_command: 'REPEATED COMMAND', temp_pref: 'TEMPERATURE',
+      presence: 'PRESENCE', numeric_trigger: 'SENSOR THRESHOLD',
+    };
+    if (!sugs.length) {
+      return composer + `
+        <div class="meta sug-wrap sug-empty">
+          <div class="sug-header">
+            <span class="sug-header-title">WHAT JARVIS HAS LEARNED</span>
+          </div>
+          <div class="sug-empty-body">
+            <div class="sug-empty-icon">◇</div>
+            <div class="sug-empty-title">No suggestions right now</div>
+            <div class="sug-empty-sub">JARVIS proposes automations as it notices
+              routines repeat — a light you turn on each evening, a scene after a
+              button press, the heat when it's cold. As patterns build up, they'll
+              appear here for you to review and approve. Nothing is ever created
+              without your say-so.</div>
+          </div>
+        </div>`;
+    }
+    const rows = sugs.map(s => {
+      const pct = Math.round((s.confidence || 0) * 100);
+      const conf = pct >= 80 ? 'sug-hi' : pct >= 55 ? 'sug-mid' : 'sug-lo';
+      const label = TYPE_LABEL[s.pattern_type] || 'LEARNED PATTERN';
+      const evidence = (s.evidence || []).map(e =>
+        `<li>${this._esc(e)}</li>`).join('');
+      const entities = (s.entities || []).length
+        ? `<div class="sug-ents">${(s.entities || []).map(e =>
+            `<span class="sug-ent">${this._esc(e)}</span>`).join('')}</div>`
+        : '';
+      return `<div class="sug" data-sug-id="${this._esc(s.id)}">
+        <div class="sug-head">
+          <span class="sug-type sug-type-${this._esc(s.pattern_type || 'x')}">${label}</span>
+          <span class="sug-pct-txt ${conf}">${pct}% confident</span>
+        </div>
+        ${s.why_headline ? `<div class="sug-why">${this._esc(s.why_headline)}</div>` : ''}
+        <div class="sug-desc">${this._esc(s.description)}</div>
+        ${evidence ? `<div class="sug-ev-label">What JARVIS observed</div>
+          <ul class="sug-ev">${evidence}</ul>` : ''}
+        ${entities}
+        <div class="sug-conf-row">
+          <span class="sug-conf ${conf}"><i style="width:${pct}%"></i></span>
+          <span class="sug-seen">seen ${this._esc(s.count || '?')}× in 30 days</span>
+        </div>
+        <div class="sug-actions">
+          <button class="sug-btn sug-approve">✓ Create automation</button>
+          <button class="sug-btn sug-dismiss">✕ Dismiss</button>
+          <button class="sug-btn sug-yaml-btn">⌄ See the automation</button>
+        </div>
+        <pre class="sug-yaml" hidden>${this._esc(s.yaml || '')}</pre>
+      </div>`;
+    }).join('');
+    return composer + `
+      <div class="meta sug-wrap" style="margin-top:8px;border-top:1px solid var(--line);padding-top:10px;">
+        <div class="sug-header">
+          <span class="sug-header-title">WHAT JARVIS HAS LEARNED</span>
+          <span class="sug-header-sub">${sugs.length} suggestion${sugs.length === 1 ? '' : 's'} to review</span>
+        </div>
+        <div class="sug-list">${rows}</div>
+      </div>`;
+  }
+
+  _renderDoorbellTraining(d) {
+    const t = d.doorbell_training || {};
+    const stats = t.stats || {};
+    const events = t.recent || [];
+    const total = stats.total || 0;
+    const notable = stats.notable || 0;
+    const bySource = stats.by_source || {};
+    const srcLine = Object.keys(bySource).length
+      ? Object.entries(bySource).map(([k, v]) => `${k} ${v}`).join(' · ')
+      : 'none yet';
+    const rows = events.length
+      ? events.slice().reverse().map(e => this._dbTrainRow(e)).join('')
+      : `<div class="dbt-empty">No analysed doorbell events yet. Run a backlog scan, or wait for the next doorbell press.</div>`;
+    return `
+      <div class="dbt-controls">
+        <button class="btn dbt-scan">Scan backlog</button>
+        <input class="dbt-limit" type="number" min="1" max="500" value="40" title="Max events to analyse"/>
+        <span class="dbt-stat">${this._esc(total)} analysed · ${this._esc(notable)} notable · ${this._esc(srcLine)}</span>
+      </div>
+      <div class="dbt-list">${rows}</div>
+    `;
+  }
+
+  _dbTrainRow(e) {
+    const ts = String(e.ts || '').replace('T', ' ').replace('Z', '').slice(5, 16);
+    const src = String(e.image_source || '?');
+    const srcCls = src.replace(/[^a-z]/gi, '').toLowerCase();
+    const cat = e.category || '';
+    const desc = this._esc(e.summary || e.analysis || '');
+    return `<div class="dbt-row${e.notable ? ' dbt-notable' : ''}">
+      <span class="dbt-ts">${this._esc(ts)}</span>
+      <span class="dbt-src dbt-src-${srcCls}">${this._esc(src)}</span>
+      ${cat ? `<span class="dbt-cat">${this._esc(cat)}</span>` : ''}
+      <span class="dbt-desc">${desc}</span>
+    </div>`;
+  }
+
+  _renderNotifyOptions(d) {
+    const svcs = d.config?.notify_services_available || [];
+    const current = d.config?.notify_service || '';
+    let html = '<option value="">— none —</option>';
+    for (const svc of svcs) {
+      const sel = svc === current ? ' selected' : '';
+      const label = svc.replace('notify.', '');
+      html += '<option value="' + this._esc(svc) + '"' + sel + '>' + this._esc(label) + '</option>';
+    }
+    return html;
+  }
+
+  _renderSentinelRules(d) {
+    const rules = d.config?.sentinel_rules || [];
+    const disabled = d.config?.disabled_sentinel_rules || [];
+    let html = '';
+    for (const r of rules) {
+      const isOff = disabled.includes(r.id);
+      const cls = isOff ? 'off' : 'on';
+      const label = isOff ? 'OFF' : 'ON';
+      const name = r.id.replace(/_/g, ' ');
+      const desc = (r.desc || '').slice(0, 60);
+      html += '<div class="rule-row">'
+        + '<span class="rule-name">' + this._esc(name) + '</span>'
+        + '<span class="rule-desc">' + this._esc(desc) + '</span>'
+        + '<button class="toggle-btn ' + cls + ' rule-toggle" data-rule-id="' + this._esc(r.id) + '">' + label + '</button>'
+        + '</div>';
+    }
+    return html;
+  }
+
+  _renderSatellitePairings(d) {
+    const satellites = d.config?.satellites || [];
+    const castDevs = d.config?.cast_devices || [];
+    const pairings = d.config?.satellite_pairings || {};
+    if (!satellites.length) return '<div class="toggle-desc" style="padding:10px">No satellites found</div>';
+    let html = '';
+    for (const sat of satellites) {
+      const paired = pairings[sat.entity_id] || '';
+      const label = sat.area ? (sat.area) : sat.name;
+      html += '<div class="pairing-row">'
+        + '<span class="pairing-label">' + this._esc(label) + '</span>'
+        + '<select class="notify-select sat-pair-select" data-sat-id="' + this._esc(sat.entity_id) + '">'
+        + '<option value="">— none —</option>';
+      for (const cd of castDevs) {
+        const sel = cd.entity_id === paired ? ' selected' : '';
+        html += '<option value="' + this._esc(cd.entity_id) + '"' + sel + '>' + this._esc(cd.name) + '</option>';
+      }
+      html += '</select></div>';
+    }
+    return html;
+  }
+
+  _renderAnnouncementSpeakers(d) {
+    const castDevs = d.config?.cast_devices || [];
+    const selected = d.config?.announcement_speakers || [];
+    if (!castDevs.length) return '<div class="toggle-desc" style="padding:10px">No Cast devices found</div>';
+    let html = '';
+    for (const cd of castDevs) {
+      const isOn = selected.includes(cd.entity_id);
+      html += '<div class="rule-row">'
+        + '<span class="rule-name">' + this._esc(cd.name) + '</span>'
+        + '<span class="rule-desc">' + this._esc(cd.entity_id) + '</span>'
+        + '<button class="toggle-btn ' + (isOn ? 'on' : 'off') + ' ann-speaker-toggle" data-speaker-id="' + this._esc(cd.entity_id) + '">'
+        + (isOn ? 'ON' : 'OFF') + '</button>'
+        + '</div>';
+    }
+    return html;
+  }
+
+  // ─── Floor plan: data-driven with config editor ────────────────────────
+
+  _defaultFloorPlan() {
+    return {
+      "1f": {
+        label: "1st Floor", viewBox: "0 0 320 150",
+        rooms: [
+          {name:"Garage",x:5,y:5,w:100,h:88,type:"room"},
+          {name:"Kitchen",x:115,y:5,w:65,h:40,type:"room"},
+          {name:"Bath",x:185,y:5,w:28,h:22,type:"bath"},
+          {name:"Guest Room",x:218,y:5,w:95,h:40,type:"room"},
+          {name:"Dining Room",x:115,y:50,w:65,h:38,type:"room"},
+          {name:"Stairs",x:185,y:32,w:28,h:32,type:"stairs"},
+          {name:"Living Room",x:218,y:50,w:95,h:38,type:"room"},
+          {name:"Downstairs Hallway",x:115,y:93,w:198,h:20,type:"room"},
+          {name:"Front Door",x:185,y:117,w:50,h:12,type:"door"},
+        ],
+      },
+      "2f": {
+        label: "2nd Floor", viewBox: "0 0 320 140",
+        rooms: [
+          {name:"Eliana's Room",x:50,y:25,w:95,h:80,type:"room"},
+          {name:"Bath",x:150,y:25,w:30,h:40,type:"bath"},
+          {name:"Master Bedroom",x:185,y:25,w:85,h:80,type:"room"},
+          {name:"Upstairs Hallway",x:150,y:70,w:30,h:35,type:"room"},
+          {name:"Stairs",x:150,y:108,w:25,h:20,type:"stairs"},
+        ],
+      },
+      "bsmt": {
+        label: "Basement", viewBox: "0 0 320 130",
+        rooms: [
+          {name:"Basement",x:50,y:10,w:220,h:90,type:"room"},
+          {name:"Stairs",x:120,y:20,w:28,h:35,type:"stairs"},
+        ],
+        labels: [
+          {text:"SUMP PUMP",x:95,y:55},{text:"DEHUMIDIFIER",x:95,y:75},
+          {text:"HOME ENERGY",x:235,y:55},{text:"WASHER",x:235,y:75},
+        ],
+      },
+    };
+  }
+
+  _getFloorPlan() {
+    // Dashboard view: always reads from saved config (NOT _editingPlan)
+    const d = this._data();
+    try {
+      const raw = d.config?.floor_plan_rooms;
+      if (raw) {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (parsed && typeof parsed === 'object' && Object.keys(parsed).length) {
+          return parsed;
+        }
+      }
+    } catch (_) {}
+    return this._defaultFloorPlan();
+  }
+
+  // Placed openings (windows/doors) — v7.94.0. Parallel to the room plan.
+  _getFloorElements() {
+    const raw = this._data().config?.floor_plan_elements;
+    let el = {};
+    try { el = typeof raw === 'string' ? (raw ? JSON.parse(raw) : {}) : (raw || {}); } catch (_) { el = {}; }
+    return el || {};
+  }
+  _getEditingElements() {
+    if (this._editingElements) return this._editingElements;
+    this._editingElements = JSON.parse(JSON.stringify(this._getFloorElements()));
+    return this._editingElements;
+  }
+  _elemsFor(floor) {
+    const el = this._getEditingElements();
+    if (!Array.isArray(el[floor])) el[floor] = [];
+    return el[floor];
+  }
+  _getFloorCameras() {
+    const raw = this._data().config?.floor_plan_cameras;
+    let c = {};
+    try { c = typeof raw === 'string' ? (raw ? JSON.parse(raw) : {}) : (raw || {}); } catch (_) { c = {}; }
+    return c || {};
+  }
+  _getEditingCameras() {
+    if (this._editingCameras) return this._editingCameras;
+    this._editingCameras = JSON.parse(JSON.stringify(this._getFloorCameras()));
+    return this._editingCameras;
+  }
+  _camsFor(floor) {
+    const c = this._getEditingCameras();
+    if (!Array.isArray(c[floor])) c[floor] = [];
+    return c[floor];
+  }
+  _getFloorEntities() {
+    const raw = this._data().config?.floor_plan_entities;
+    let e = {};
+    try { e = typeof raw === 'string' ? (raw ? JSON.parse(raw) : {}) : (raw || {}); } catch (_) { e = {}; }
+    return e || {};
+  }
+  _getEditingEntities() {
+    if (this._editingEntities) return this._editingEntities;
+    this._editingEntities = JSON.parse(JSON.stringify(this._getFloorEntities()));
+    return this._editingEntities;
+  }
+  _entsFor(floor) {
+    const e = this._getEditingEntities();
+    if (!Array.isArray(e[floor])) e[floor] = [];
+    return e[floor];
+  }
+  _entMarkerStyle(eid) {
+    // Live-state pin styling: colour + short value from the entity's current state.
+    const st = this._hass && this._hass.states ? this._hass.states[eid] : null;
+    const dom = (eid.split('.')[0] || '');
+    const dim = '#567685';
+    if (!st) return { color: dim, name: (eid.split('.')[1] || eid), val: '—' };
+    const s = st.state, dc = (st.attributes && st.attributes.device_class) || '';
+    const name = (st.attributes && st.attributes.friendly_name) || eid;
+    let color = dim, val = s;
+    const offish = ['off', 'unavailable', 'unknown', 'idle', 'standby', 'none'];
+    if (dom === 'sensor') {
+      const u = (st.attributes && st.attributes.unit_of_measurement) || '';
+      val = (s === 'unknown' || s === 'unavailable') ? '—' : (s + u);
+      color = '#00cfe8';
+    } else if (dom === 'binary_sensor') {
+      const on = s === 'on';
+      if (['door', 'window', 'garage_door', 'opening'].indexOf(dc) >= 0) { color = on ? '#ff9d2e' : dim; val = on ? 'OPEN' : 'SHUT'; }
+      else if (['motion', 'occupancy', 'presence'].indexOf(dc) >= 0) { color = on ? '#00f2fe' : dim; val = on ? 'DET' : '—'; }
+      else { color = on ? '#00f2fe' : dim; val = on ? 'ON' : 'OFF'; }
+    } else if (dom === 'lock') { const locked = s === 'locked'; color = locked ? dim : '#ff5a5a'; val = locked ? 'LOCK' : 'OPEN'; }
+    else if (dom === 'cover') { const open = s === 'open' || s === 'opening'; color = open ? '#ff9d2e' : dim; val = open ? 'OPEN' : 'SHUT'; }
+    else if (dom === 'person' || dom === 'device_tracker') { const home = s === 'home'; color = home ? '#00f2fe' : dim; val = home ? 'HOME' : 'AWAY'; }
+    else if (dom === 'climate') { color = '#00cfe8'; const t = st.attributes && st.attributes.current_temperature; val = (t != null) ? (t + '\u00b0') : s; }
+    else { const on = offish.indexOf(s) < 0; color = on ? '#00f2fe' : dim; val = on ? 'ON' : 'OFF'; }
+    return { color, name, val };
+  }
+  _getProperty() {
+    const raw = this._data().config?.floor_plan_property;
+    let p = null;
+    try { p = typeof raw === 'string' ? (raw ? JSON.parse(raw) : null) : (raw || null); } catch (_) { p = null; }
+    return (p && Array.isArray(p.points)) ? p.points : [];
+  }
+  _propertyPts() {
+    if (!this._editingProperty) this._editingProperty = JSON.parse(JSON.stringify(this._getProperty()));
+    return this._editingProperty;
+  }
+  _setProperty(pts) { this._editingProperty = pts; }
+  _propPathD(pts) { return pts.map((p, k) => (k ? 'L' : 'M') + this._esc(p[0]) + ' ' + this._esc(p[1])).join(' ') + ' Z'; }   // jh-r19-xss
+  _floorBelow(floor) { return ({ '2f': '1f', '1f': 'bsmt' })[floor] || null; }
+
+  // ---------- opening anchors: a window/door sits on a wall EDGE ----------
+  // An opening anchors to an edge of a room's polygon — or, with no room
+  // picked, to the whole-house footprint rectangle (legacy behaviour). `edge`
+  // = index into the anchor's corner list, `pos` = 0..1 along it. `wall` stays
+  // stored as a derived front/back/left/right hint for consumers that only
+  // know cardinals (the 3D model). Works for L-shaped rooms and detached
+  // buildings: any enclosed room's edge is a valid anchor.
+  _footprintPts(rooms) {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, any = false;
+    (rooms || []).forEach(r => {
+      if (r.type === 'outdoor') return;
+      any = true;
+      this._zonePoints(r).forEach(p => { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); });
+    });
+    return any ? [[x0, y0], [x1, y0], [x1, y1], [x0, y1]] : null;
+  }
+  _anchorPts(rooms, e) {
+    if (e && e.room) {
+      const rr = (rooms || []).filter(r => r.type !== 'outdoor' && r.name.toLowerCase() === (e.room || '').toLowerCase())[0];
+      if (rr) return this._zonePoints(rr);
+    }
+    return this._footprintPts(rooms);
+  }
+  _polyWinding(pts) {   // >0 for the _zonePoints corner order → outward = right of edge dir
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; a += p[0] * q[1] - q[0] * p[1]; }
+    return a;
+  }
+  _edgeNormal(pts, k, winding) {
+    const a = pts[k], b = pts[(k + 1) % pts.length];
+    const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1;
+    const ux = dx / L, uy = dy / L;
+    return (winding > 0) ? { ux, uy, nx: uy, ny: -ux } : { ux, uy, nx: -uy, ny: ux };
+  }
+  _wallFromNormal(nx, ny) {
+    return Math.abs(nx) > Math.abs(ny) ? (nx < 0 ? 'left' : 'right') : (ny < 0 ? 'front' : 'back');
+  }
+  _edgeForWall(pts, wall) {   // edge whose outward normal best matches a cardinal
+    const tgt = { front: [0, -1], back: [0, 1], left: [-1, 0], right: [1, 0] }[wall] || [0, -1];
+    const w = this._polyWinding(pts);
+    let best = 0, bd = -1e9;
+    for (let k = 0; k < pts.length; k++) {
+      const n = this._edgeNormal(pts, k, w), d = n.nx * tgt[0] + n.ny * tgt[1];
+      if (d > bd) { bd = d; best = k; }
+    }
+    return best;
+  }
+  // Resolved placement of an opening, in editor units: {x, y, ux, uy, nx, ny,
+  // wall, edge, pts} — edge direction (u), outward normal (n) — or null.
+  _openingAnchorRooms(rooms, e) {
+    const pts = this._anchorPts(rooms, e);
+    if (!pts || pts.length < 2) return null;
+    const winding = this._polyWinding(pts), p = e.pos != null ? e.pos : 0.5;
+    if (Number.isInteger(e.edge) && e.edge >= 0 && e.edge < pts.length) {
+      const a = pts[e.edge], b = pts[(e.edge + 1) % pts.length];
+      const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (L < 0.001) return null;
+      const n = this._edgeNormal(pts, e.edge, winding), t = Math.min(1, Math.max(0, p));
+      return { x: a[0] + n.ux * L * t, y: a[1] + n.uy * L * t, ux: n.ux, uy: n.uy,
+               nx: n.nx, ny: n.ny, wall: this._wallFromNormal(n.nx, n.ny), edge: e.edge, pts };
+    }
+    // legacy: wall + pos on the anchor's bounding box
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    pts.forEach(pt => { x0 = Math.min(x0, pt[0]); y0 = Math.min(y0, pt[1]); x1 = Math.max(x1, pt[0]); y1 = Math.max(y1, pt[1]); });
+    const wall = e.wall || 'front';
+    let x, y, ux, uy, nx, ny;
+    if (wall === 'back') { x = x0 + p * (x1 - x0); y = y1; ux = 1; uy = 0; nx = 0; ny = 1; }
+    else if (wall === 'left') { x = x0; y = y0 + p * (y1 - y0); ux = 0; uy = 1; nx = -1; ny = 0; }
+    else if (wall === 'right') { x = x1; y = y0 + p * (y1 - y0); ux = 0; uy = 1; nx = 1; ny = 0; }
+    else { x = x0 + p * (x1 - x0); y = y0; ux = 1; uy = 0; nx = 0; ny = -1; }
+    return { x, y, ux, uy, nx, ny, wall, edge: this._edgeForWall(pts, wall), pts };
+  }
+  _openingAnchor(floor, e) {
+    return this._openingAnchorRooms(((this._getEditingPlan()[floor] || {}).rooms) || [], e);
+  }
+  // Nearest wall edge across every snap-eligible room — for dragging an opening
+  // onto a wall (incl. detached buildings, which are just rooms).
+  _snapToWall(floor, px, py) {
+    const rooms = ((this._getEditingPlan()[floor] || {}).rooms) || [];
+    let best = null, bd = 1e18;
+    for (let zi = 0; zi < rooms.length; zi++) {
+      const r = rooms[zi];
+      if (r.type === 'outdoor' || r.type === 'stairs' || r.type === 'door') continue;
+      const pts = this._zonePoints(r), w = this._polyWinding(pts);
+      for (let k = 0; k < pts.length; k++) {
+        const a = pts[k], b = pts[(k + 1) % pts.length];
+        const dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy;
+        if (L2 < 0.001) continue;
+        const t = Math.min(1, Math.max(0, ((px - a[0]) * dx + (py - a[1]) * dy) / L2));
+        const qx = a[0] + dx * t, qy = a[1] + dy * t, d = (px - qx) * (px - qx) + (py - qy) * (py - qy);
+        if (d < bd) {
+          const n = this._edgeNormal(pts, k, w);
+          bd = d;
+          best = { zi, edge: k, t, x: qx, y: qy, ux: n.ux, uy: n.uy, nx: n.nx, ny: n.ny, deg: Math.atan2(n.uy, n.ux) * 180 / Math.PI };
+        }
+      }
+    }
+    return best;
+  }
+
+  _applyEditVB(svgEl) {
+    const v = this._editVB; if (!v || !svgEl) return;
+    svgEl.setAttribute('viewBox', v.x + ' ' + v.y + ' ' + v.w + ' ' + v.h);
+    svgEl.querySelectorAll('.fp-grid-rect').forEach(r => { r.setAttribute('x', v.x); r.setAttribute('y', v.y); r.setAttribute('width', v.w); r.setAttribute('height', v.h); });
+  }
+  _zonePoints(r) {
+    if (r && Array.isArray(r.points) && r.points.length >= 3) return r.points;
+    const x = r.x || 0, y = r.y || 0, w = r.w || 40, h = r.h || 40;   // legacy rect -> 4 corners
+    return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+  }
+  _ensureZonePoints(rm) {
+    if (!Array.isArray(rm.points) || rm.points.length < 3) rm.points = this._zonePoints(rm).map(p => [p[0], p[1]]);
+    return rm.points;
+  }
+  _syncRoomBBox(rm) {
+    if (!rm || !Array.isArray(rm.points) || rm.points.length < 3) return;
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    rm.points.forEach(p => { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); });
+    rm.x = Math.round(x0); rm.y = Math.round(y0); rm.w = Math.round(x1 - x0); rm.h = Math.round(y1 - y0);
+  }
+  _pointInPoly(x, y, pts) {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  _pointCovered(px, py, cx, cy, ang, half, rng, geo) {
+    const dx = px - cx, dy = py - cy;
+    if (Math.hypot(dx, dy) > rng) return false;
+    const a = Math.atan2(dy, dx) * 180 / Math.PI;
+    if (Math.abs(((a - ang + 540) % 360) - 180) > half) return false;
+    return this._losClear(cx, cy, px, py, geo);
+  }
+  _propertyArea(pts) {
+    if (!pts || pts.length < 3) return '';
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; a += p[0] * q[1] - q[0] * p[1]; }
+    const sqFt = Math.abs(a) / 2 * 0.04;   // editor units^2 -> sq ft (1 unit = 0.2 ft)
+    if (this._fpUnits() === 'metric') {
+      const sqM = sqFt * 0.092903;
+      return sqM >= 10000 ? (sqM / 10000).toFixed(2) + ' ha' : Math.round(sqM).toLocaleString() + ' m\u00b2';
+    }
+    return sqFt >= 43560 ? (sqFt / 43560).toFixed(2) + ' acres' : Math.round(sqFt).toLocaleString() + ' sq ft';
+  }
+  // ---- camera coverage geometry (Phase 2a) ----
+  _segIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
+    const den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(den) < 1e-9) return null;
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
+    const u = ((x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) / den;
+    if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+    return { x: x1 + t * (x2 - x1), y: y1 + t * (y2 - y1) };
+  }
+  _planGeometry(floor) {
+    const plan = this._getEditingPlan()[floor];
+    const rooms = (plan && plan.rooms) || [];
+    const walls = [], gaps = [];
+    rooms.forEach(r => {
+      if (r.type === 'stairs' || r.type === 'door' || r.type === 'outdoor') return;   // open — no blocking walls
+      const _rp = this._zonePoints(r);   // polygon edges block LOS (= the 4 rect sides for a plain room)
+      for (let _wi = 0; _wi < _rp.length; _wi++) { const _a = _rp[_wi], _b = _rp[(_wi + 1) % _rp.length]; walls.push({ x0: _a[0], y0: _a[1], x1: _b[0], y1: _b[1] }); }
+    });
+    (this._elemsFor(floor) || []).forEach(e => {
+      if (e.type !== 'door' && e.type !== 'window') return;
+      const a = this._openingAnchorRooms(rooms, e);
+      if (!a) return;
+      const ow = e.w || 20;
+      gaps.push({ x0: a.x - a.ux * ow / 2, y0: a.y - a.uy * ow / 2, x1: a.x + a.ux * ow / 2, y1: a.y + a.uy * ow / 2 });
+    });
+    return { walls, gaps };
+  }
+  _inGap(x, y, gaps) {
+    const tol = 2.5;
+    for (let i = 0; i < gaps.length; i++) {
+      const g = gaps[i];
+      if (x >= Math.min(g.x0,g.x1)-tol && x <= Math.max(g.x0,g.x1)+tol &&
+          y >= Math.min(g.y0,g.y1)-tol && y <= Math.max(g.y0,g.y1)+tol) return true;
+    }
+    return false;
+  }
+  _losClear(x1, y1, x2, y2, geo) {
+    for (let i = 0; i < geo.walls.length; i++) {
+      const w = geo.walls[i];
+      const ip = this._segIntersect(x1, y1, x2, y2, w.x0, w.y0, w.x1, w.y1);
+      if (ip && !this._inGap(ip.x, ip.y, geo.gaps)) return false;
+    }
+    return true;
+  }
+  _computeCoverage(floor, cam, geo) {
+    const plan = this._getEditingPlan()[floor];
+    if (!plan || !plan.rooms || !plan.rooms.length) return {};
+    geo = geo || this._planGeometry(floor);
+    const cx = cam.x, cy = cam.y, ang = cam.angle != null ? cam.angle : 270,
+          fov = cam.fov != null ? cam.fov : 90, rng = Math.max(cam.range != null ? cam.range : 55, 5), half = fov/2;
+    const cov = {};
+    plan.rooms.forEach(r => {
+      if (r.type === 'door' || r.type === 'stairs') return;
+      let hit = 0, tot = 0;
+      if (r.type === 'outdoor' || (r.points && r.points.length >= 3)) {
+        const pts = this._zonePoints(r);
+        let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+        pts.forEach(p => { bx0 = Math.min(bx0, p[0]); by0 = Math.min(by0, p[1]); bx1 = Math.max(bx1, p[0]); by1 = Math.max(by1, p[1]); });
+        const nx = 6, ny = 6;
+        for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) {
+          const px = bx0 + (i + 0.5) / nx * (bx1 - bx0), py = by0 + (j + 0.5) / ny * (by1 - by0);
+          if (!this._pointInPoly(px, py, pts)) continue;
+          tot++;
+          if (this._pointCovered(px, py, cx, cy, ang, half, rng, geo)) hit++;
+        }
+      } else {
+        const nx = 4, ny = 4;
+        for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) {
+          const px = r.x + (i + 0.5) / nx * r.w, py = r.y + (j + 0.5) / ny * r.h;
+          tot++;
+          if (this._pointCovered(px, py, cx, cy, ang, half, rng, geo)) hit++;
+        }
+      }
+      if (hit > 0 && tot > 0) cov[r.name] = Math.round(hit / tot * 100) / 100;
+    });
+    return cov;
+  }
+  _coneD(cam) {
+    const cx = cam.x, cy = cam.y, ang = cam.angle != null ? cam.angle : 270,
+          fov = cam.fov != null ? cam.fov : 90, rng = Math.max(cam.range != null ? cam.range : 55, 5);
+    const a1 = (ang - fov / 2) * Math.PI / 180, a2 = (ang + fov / 2) * Math.PI / 180;
+    const x1 = cx + rng * Math.cos(a1), y1 = cy + rng * Math.sin(a1);
+    const x2 = cx + rng * Math.cos(a2), y2 = cy + rng * Math.sin(a2);
+    const large = fov > 180 ? 1 : 0;
+    return 'M ' + this._esc(cx) + ' ' + this._esc(cy) + ' L ' + x1.toFixed(1) + ' ' + y1.toFixed(1) +   // jh-r19-xss
+           ' A ' + rng + ' ' + rng + ' 0 ' + large + ' 1 ' + x2.toFixed(1) + ' ' + y2.toFixed(1) + ' Z';
+  }
+  _rayCast(cx, cy, ang, range, geo) {
+    // distance from (cx,cy) along ang to the first blocking wall — passing through
+    // openings (gaps) — else the full range.
+    const ex = cx + range * Math.cos(ang), ey = cy + range * Math.sin(ang);
+    let best = range;
+    for (let i = 0; i < geo.walls.length; i++) {
+      const w = geo.walls[i];
+      const ip = this._segIntersect(cx, cy, ex, ey, w.x0, w.y0, w.x1, w.y1);
+      if (!ip || this._inGap(ip.x, ip.y, geo.gaps)) continue;
+      const d = Math.hypot(ip.x - cx, ip.y - cy);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+  _clippedCone(cam, geo) {
+    if (!geo || !geo.walls || !geo.walls.length) return this._coneD(cam);   // no walls → raw cone
+    const cx = cam.x, cy = cam.y, ang = cam.angle != null ? cam.angle : 270,
+          fov = cam.fov != null ? cam.fov : 90, rng = Math.max(cam.range != null ? cam.range : 55, 5);
+    const N = Math.max(24, Math.round(fov / 3)), a0 = (ang - fov / 2) * Math.PI / 180, step = (fov * Math.PI / 180) / N;
+    let d = 'M ' + this._esc(cx) + ' ' + this._esc(cy);   // jh-r19-xss
+    for (let i = 0; i <= N; i++) {
+      const a = a0 + i * step, dist = this._rayCast(cx, cy, a, rng, geo);
+      d += ' L ' + (cx + dist * Math.cos(a)).toFixed(1) + ' ' + (cy + dist * Math.sin(a)).toFixed(1);
+    }
+    return d + ' Z';
+  }
+  _cameraEntityOptions(selected) {
+    const states = this._hass?.states || {};
+    const eids = Object.keys(states).filter(e => e.startsWith('camera.')).sort();
+    if (selected && !eids.includes(selected)) eids.unshift(selected);
+    const opts = eids.map(e => {
+      const st = states[e];
+      const fn = (st && st.attributes && st.attributes.friendly_name) || e;
+      return '<option value="' + this._esc(e) + '"' + (e === selected ? ' selected' : '') + '>' + this._esc(fn) + '</option>';
+    }).join('');
+    return '<option value="">\u2014 camera \u2014</option>' + opts;
+  }
+
+  _getEditingPlan() {
+    // Editor view: maintains a working copy for drag operations
+    if (this._editingPlan) return this._editingPlan;
+    // Initialize from saved config or defaults
+    this._editingPlan = JSON.parse(JSON.stringify(this._getFloorPlan()));
+    return this._editingPlan;
+  }
+
+  _renderFloorPlan(d, floor) {
+    // Legacy — no longer used for dashboard, kept for editor
+    const plan = this._getFloorPlan();
+    const floorData = plan[floor];
+    if (!floorData) return '<div style="color:var(--text-dim);padding:20px;text-align:center;">No floor data</div>';
+
+    const areaMap = {};
+    (d.areasGrid || []).forEach(a => { areaMap[a.name.toLowerCase()] = a.active; });
+    const isOcc = (name) => !!areaMap[name.toLowerCase()];
+
+    let svg = '<svg viewBox="' + this._esc((floorData.viewBox || '0 0 320 140')) + '" class="fp-svg"><defs><filter id="glow-fp"><feGaussianBlur stdDeviation="3" result="g"/><feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+
+    for (const rm of (floorData.rooms || [])) {
+      const {name, x, y, w, h, type} = rm;
+      if (type === 'bath') { svg += '<rect x="'+this._esc(x)+'" y="'+this._esc(y)+'" width="'+this._esc(w)+'" height="'+this._esc(h)+'" rx="2" fill="rgba(10,13,18,0.6)" stroke="#0f2029" stroke-width="0.5"/><text x="'+this._esc((x+w/2))+'" y="'+this._esc((y+h/2+2))+'" text-anchor="middle" fill="#2a3b47" font-size="5" font-family="JetBrains Mono, monospace">BATH</text>'; continue; }
+      if (type === 'stairs') { svg += '<rect x="'+this._esc(x)+'" y="'+this._esc(y)+'" width="'+this._esc(w)+'" height="'+this._esc(h)+'" rx="1" fill="rgba(10,20,30,0.4)" stroke="#0a7d94" stroke-width="0.5" stroke-dasharray="2,2"/>'; continue; }
+      if (type === 'door') { const occ=isOcc(name); svg += '<rect x="'+this._esc(x)+'" y="'+this._esc(y)+'" width="'+this._esc(w)+'" height="'+this._esc(h)+'" rx="2" fill="'+(occ?'rgba(255,157,46,0.1)':'rgba(10,13,18,0.4)')+'" stroke="'+(occ?'#ff9d2e':'#0f2029')+'" stroke-width="0.5"/><text x="'+this._esc((x+w/2))+'" y="'+this._esc((y+h/2+2))+'" text-anchor="middle" fill="'+(occ?'#ff9d2e':'#2a3b47')+'" font-size="4" font-family="JetBrains Mono, monospace">'+this._esc(name.toUpperCase())+'</text>'; continue; }
+      const occ = isOcc(name); const fill = occ ? 'rgba(0,242,254,0.12)' : 'rgba(10,13,18,0.6)'; const stroke = occ ? '#00f2fe' : '#0f2029';
+      svg += '<g class="fp-room"><rect x="'+this._esc(x)+'" y="'+this._esc(y)+'" width="'+this._esc(w)+'" height="'+this._esc(h)+'" rx="2" fill="'+fill+'" stroke="'+stroke+'" stroke-width="'+(occ?1.5:0.8)+'"/><text x="'+this._esc((x+w/2))+'" y="'+this._esc((y+h/2))+'" text-anchor="middle" fill="'+(occ?'#00f2fe':'#567685')+'" font-size="'+(w>80?7:5)+'" font-family="Orbitron, monospace">'+this._esc(name.toUpperCase())+'</text></g>';
+    }
+    svg += '</svg>';
+    return svg;
+  }
+
+  async _toggleAreaLights(areaId, roomName, isOn) {
+    if (!this._hass || !areaId) return;
+    const turnOn = !isOn;
+    try {
+      // jh-r22-lights (step 164, review round 22 #7): through the backend (the seam, never a manual heater), not a raw call
+      const res = await this._hass.callWS({ type: 'jarvis/area_lights_set', area_id: areaId, on: turnOn });
+      // jh-r23-lights (step 165, review round 23 #12): success only for what the backend confirms; a failed light is said
+      const done = Array.isArray(res && res.done) ? res.done : [];
+      const failed = Array.isArray(res && res.failed) ? res.failed : (res ? [] : ['?']);
+      // jh-r26-lights (step 168, review round 26 #7, #11): the backend's group function may leave lights out (hidden, a heater
+      // light) and a light may not confirm. Success (toast and haptic) only when something was switched and nothing was
+      // failed, unconfirmed or left out; otherwise the toast says exactly what was switched, what was left out (by name) and
+      // what did not confirm, and "nothing was switched" when nothing was
+      const unconfirmed = Array.isArray(res && res.unconfirmed) ? res.unconfirmed : [];
+      const leftOut = Array.isArray(res && res.left_out) ? res.left_out : [];
+      const leftNames = Array.isArray(res && res.left_out_names) && res.left_out_names.length ? res.left_out_names : leftOut;
+      if (failed.length || unconfirmed.length || leftOut.length || !done.length) {
+        const parts = [];
+        if (done.length) parts.push(done.length + ' switched ' + (turnOn ? 'on' : 'off'));
+        if (failed.length) parts.push(failed.length + ' of ' + (done.length + failed.length + unconfirmed.length) + ' lights not switched');
+        if (unconfirmed.length) parts.push(unconfirmed.length + ' not confirmed');
+        if (leftOut.length) parts.push('left out: ' + leftNames.join(', '));
+        if (!parts.length) parts.push('nothing was switched');
+        this._toast('✗ ' + roomName + ': ' + parts.join('; '), (failed.length || unconfirmed.length || leftOut.length) ? 'err' : 'info');
+      } else {
+        this._jhHapticConfirm(this._jhAreaLights(areaId), turnOn ? 'on' : 'off');   // jh-haptic
+        this._toast((turnOn ? '◯ ' : '● ') + roomName + ' lights ' + (turnOn ? 'on' : 'off'), 'ok');
+      }
+      // Reflect the new state quickly rather than waiting for the 5s poll.
+      setTimeout(() => { try { this._fetchLiveData(); } catch (e) {} }, 500);
+      return { done, failed, unconfirmed, left_out: leftOut };
+    } catch (err) {
+      this._toast('✗ ' + roomName + ' lights — ' + (err && err.message || err), 'err');
+      return null;
+    }
+  }
+
+  _build3DHouse() {
+    const mount = this.shadowRoot?.querySelector('#res-iso');
+    if (!mount) return;
+    this._renderHouse3d();
+    this._buildResidenceAnnotations();
+    this._wire3DDrag();
+  }
+
+  // Panel floor key -> model floor key ('bsmt' is 'b' in the model).
+  // Convert the editor's rooms (SVG units) to the 3D model's real feet, so the
+  // house geometry is built from the floor plan (FT_PER_UNIT = 0.2) (v7.94.0).
+  _planToFeet(plan) {
+    const FT = 0.2, out = {};
+    Object.keys(plan || {}).forEach(fk => {
+      out[fk] = (((plan[fk] || {}).rooms) || []).filter(r => r.type !== 'outdoor').map(r => ({
+        name: (r.name || '').toLowerCase(),
+        label: (r.name || '').toUpperCase(),
+        x: (r.x || 0) * FT, y: (r.y || 0) * FT, w: (r.w || 0) * FT, d: (r.h || 0) * FT,
+        type: r.type, roof: r.roof,
+        points: (Array.isArray(r.points) && r.points.length >= 3) ? r.points.map(p => [p[0] * FT, p[1] * FT]) : undefined,
+      }));
+    });
+    return this._snapFeet(out);
+  }
+  // Map a coordinate to its cluster representative (groups values within `tol`).
+  _snapMap(vals, tol) {
+    const s = vals.slice().sort((a, b) => a - b), reps = [];
+    let cur = null;
+    s.forEach(v => { if (cur && v - cur.start <= tol) { cur.vals.push(v); } else { cur = { vals: [v], start: v }; reps.push(cur); } });
+    const means = reps.map(g => g.vals.reduce((a, b) => a + b, 0) / g.vals.length);
+    return v => { let best = v, bd = tol + 1e-6; means.forEach(m => { const d = Math.abs(v - m); if (d < bd) { bd = d; best = m; } }); return best; };
+  }
+  // Align nearly-touching room edges (3D only) so exterior walls render seamless (v7.94.0).
+  _snapFeet(out) {
+    const TOL = 1.0;   // feet
+    Object.keys(out || {}).forEach(fk => {
+      const rooms = out[fk] || [];
+      if (rooms.length < 2) return;
+      const xs = [], ys = [];
+      rooms.forEach(r => { xs.push(r.x, r.x + r.w); ys.push(r.y, r.y + r.d); if (r.points) r.points.forEach(p => { xs.push(p[0]); ys.push(p[1]); }); });
+      const sx = this._snapMap(xs, TOL), sy = this._snapMap(ys, TOL);
+      rooms.forEach(r => {
+        const x0 = sx(r.x), x1 = sx(r.x + r.w), y0 = sy(r.y), y1 = sy(r.y + r.d);
+        r.x = x0; r.w = x1 - x0; r.y = y0; r.d = y1 - y0;
+        if (r.points) r.points = r.points.map(p => [sx(p[0]), sy(p[1])]);
+      });
+    });
+    return out;
+  }
+  _house3dPlan() { return this._planToFeet(this._getFloorPlan()); }
+
+  // Placed openings -> feet, with open/closed resolved from each mapped sensor
+  // (v7.94.0). When the opening anchors to a room-edge or the footprint, the
+  // resolved centre is emitted too (x/y, feet) so the 3D model can draw it on
+  // the REAL wall — incl. L-room notch walls and detached buildings.
+  _elementsToFeet(raw, plan) {
+    const FT = 0.2, states = this._hass?.states || {}, out = {};
+    // Resolve anchors on the SNAPPED feet plan so openings sit exactly on the
+    // walls the renderer draws (editor coords drift up to ~0.5 ft post-snap).
+    const fp = this._planToFeet(plan);
+    Object.keys(raw || {}).forEach(fk => {
+      const rooms = (fp[fk] || []).map(r => ({ ...r, h: r.d }));
+      out[fk] = (raw[fk] || []).map(e => {
+        let open = false;
+        if (e.entity && states[e.entity]) { const s = states[e.entity].state; open = (s === 'on' || s === 'open'); }
+        const a = this._openingAnchorRooms(rooms, e);
+        return { type: e.type, kind: e.kind, wall: a ? a.wall : e.wall, room: e.room, slope: e.slope,
+                 pos: (e.pos != null ? e.pos : 0.5), w: (e.w || 20) * FT, open,
+                 x: a ? a.x : undefined, y: a ? a.y : undefined };
+      });
+    });
+    return out;
+  }
+  _house3dElements() { return this._elementsToFeet(this._getFloorElements(), this._getFloorPlan()); }
+
+  // Live 3D preview for the editor — built from the working copies so it updates
+  // as you edit, before saving (v7.94.0).
+  _viewPresetBar(scope) {
+    const views = [['FRONT', 0], ['RIGHT', 90], ['REAR', 180], ['LEFT', 270], ['ISO', 35]];
+    return '<div class="view-presets">' + views.map(v =>
+      '<button class="view-btn" data-vscope="' + this._esc(scope) + '" data-vtheta="' + v[1] + '">' + v[0] + '</button>').join('') +
+      '<span class="view-hint">drag to rotate</span></div>';
+  }
+  _setView(scope, theta) {
+    if (scope === 'editor') { this._editorTheta = theta; this._refreshEditorPreview(); }
+    else { this._house3dTheta = theta; this._renderHouse3d(); }
+  }
+  _wireEditorPreviewDrag() {
+    const el = this.shadowRoot && this.shadowRoot.querySelector('#fp-3d-preview');
+    if (!el || el._dragWired) return;
+    el._dragWired = true;
+    let dragging = false, lastX = 0, raf = null;
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = null; this._refreshEditorPreview(); }); };
+    const move = (e) => { if (!dragging) return; const p = (e.touches && e.touches[0]) ? e.touches[0] : e; if (e.cancelable) e.preventDefault(); this._editorTheta -= (p.clientX - lastX) * 0.6; lastX = p.clientX; schedule(); };
+    const up = () => { dragging = false; el.classList.remove('dragging'); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); window.removeEventListener('touchmove', move); window.removeEventListener('touchend', up); };
+    const down = (e) => { dragging = true; lastX = ((e.touches && e.touches[0]) ? e.touches[0] : e).clientX; el.classList.add('dragging'); window.addEventListener('mousemove', move); window.addEventListener('mouseup', up); window.addEventListener('touchmove', move, { passive: false }); window.addEventListener('touchend', up); };
+    el.addEventListener('mousedown', down); el.addEventListener('touchstart', down, { passive: true });
+  }
+
+  _renderEditorPreview() {
+    try {
+      const plan = this._planToFeet(this._getEditingPlan());
+      const elements = this._elementsToFeet(this._getEditingElements(), this._getEditingPlan());
+      const spec = this._houseSpec();
+      const garage = this._house3dGarage();
+      const box = JARVIS3D.fixedBox({ floor: 'all', spec, plan, elements, garage });
+      return JARVIS3D.renderSVG({ theta: this._editorTheta, floor: 'all', lit: this._house3dLit(), spec, plan, elements, garage, box });
+    } catch (e) { return '<div class="fp-3d-empty">3D preview</div>'; }
+  }
+  _refreshEditorPreview() {
+    const el = this.shadowRoot && this.shadowRoot.querySelector('#fp-3d-preview');
+    if (el) el.innerHTML = this._renderEditorPreview();
+  }
+
+  // Per-bay garage door open/closed from the split door_mapping slots (v7.94.0).
+  _house3dGarage() {
+    const cfg = this._data().config || {};
+    const map = cfg.door_mapping || {};
+    const bays = Math.max(0, Math.min(Number(cfg.garage_bays) || 0, 8));
+    const states = this._hass?.states || {};
+    const out = [];
+    for (let i = 1; i <= bays; i++) {
+      const eid = map['garage_' + i] || (i === 1 ? (map['garage'] || '') : '');
+      let open = false;
+      if (eid && states[eid]) { const s = states[eid].state; open = (s === 'on' || s === 'open'); }
+      out.push({ open });
+    }
+    return out;
+  }
+
+  _jhResidenceExt() {
+    const m = (typeof window !== 'undefined' && window.JarvisResidenceModels) || {};
+    return m[this._residenceStyle()] || null;
+  }
+
+  _house3dFloor() {
+    if (this._jhResidenceExt()?.singleFloor) { this._currentFloor = 'all'; return 'all'; }   // jh-residence-ext
+    const f = this._currentFloor || 'all';
+    return f === 'bsmt' ? 'b' : f;
+  }
+
+  // Live presence -> per-room lit state for the model.
+  // States: 'on' (area occupied), 'mmwave' (a presence/mmWave sensor is
+  // actively detecting — stronger signal than a bare area flag), 'dom'
+  // (dominant room). mmWave overlays on top of plain occupancy (v7.94.0).
+  // jh-room-aliases (step 158, the live audit C6): a room of the 3D house (the generic model's rooms, the editor's plan rooms)
+  // also lights up under the Home Assistant area's aliases, the same source the voice rooms use (_jh_area_named), so "Bath"
+  // on the house matches the area "Bathroom" with the alias "Bath". Read live from hass.areas; nothing is hard-coded.
+  _jhAreaKeys(name, areaId) {
+    const areas = (this._hass && this._hass.areas) || {}, low = String(name || '').toLowerCase();
+    const a = (areaId && areas[areaId]) || Object.values(areas).find(x => String((x && x.name) || '').toLowerCase() === low);
+    const keys = low ? [low] : [];
+    ((a && a.aliases) || []).forEach(al => { const k = String(al || '').trim().toLowerCase(); if (k && !keys.includes(k)) keys.push(k); });
+    return keys;
+  }
+
+  _house3dLit() {
+    const d = this._data();
+    const lit = {}, rank = { on: 1, mmwave: 2, dom: 3 };
+    const put = (name, id, st) => this._jhAreaKeys(name, id).forEach((k, i) => {
+      if (i === 0 || (rank[lit[k]] || 0) < rank[st]) lit[k] = st;   // an alias never lowers what a room's own name has
+    });
+    (d.areasGrid || []).forEach(a => { if (a.active) put(a.name, a.id, 'on'); });
+    // Overlay genuine mmWave detection from the overview feed, when present.
+    const mm = this._mmwave && this._mmwave.rooms;
+    if (Array.isArray(mm)) {
+      mm.forEach(r => {
+        if (r.detecting_count > 0) put(r.name, r.area_id, 'mmwave');
+      });
+    }
+    const dom = d.dominantRoom && d.dominantRoom.name;
+    if (dom) put(dom, null, 'dom');   // dominant still wins
+    return lit;
+  }
+
+  // mmWave presence overview (v7.94.0): live per-room sensor state, fetched
+  // when the residence tab is shown and refreshed on the poll while it's open.
+  async _fetchMmwave() {
+    if (!this._hass) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/mmwave_overview" });
+      this._mmwave = res || { rooms: [], summary: {} };
+    } catch (_) {
+      this._mmwave = { rooms: [], summary: {}, error: true };
+    }
+    this._renderMmwave();
+    // Fresh mmWave state feeds the floor-plan glow too (v7.94.0) — rebuild it
+    // so a room actively detected lights up on the house, not just the list.
+    if (this._currentTab === 'residence') this._build3DHouse();
+  }
+
+  _renderMmwave() {
+    const list = this.shadowRoot?.getElementById("mmwave-list");
+    const sumEl = this.shadowRoot?.getElementById("mmwave-summary");
+    if (!list) return;
+    const data = this._mmwave || { rooms: [], summary: {} };
+    const s = data.summary || {};
+    if (sumEl) {
+      sumEl.textContent = s.rooms_with_mmwave
+        ? `◉ ${s.rooms_detecting || 0}/${s.rooms_with_mmwave} OCCUPIED`
+        : "◉ NONE";
+    }
+    if (data.error) {
+      list.innerHTML = `<div class="mmwave-empty">Couldn't read sensors — restart Home Assistant after updating, then reopen.</div>`;
+      return;
+    }
+    const rooms = data.rooms || [];
+    if (!rooms.length) {
+      list.innerHTML = `<div class="mmwave-empty">No presence, motion, or mmWave sensors found. Assign occupancy sensors to areas in Home Assistant and they'll appear here.</div>`;
+      return;
+    }
+    list.innerHTML = rooms.map(r => {
+      const on = r.detecting_count > 0;
+      const sensorLine = r.sensor_count > 1
+        ? `${r.detecting_count}/${r.sensor_count} sensors`
+        : `${r.sensor_count} sensor`;
+      const tag = r.outdoor ? `<span class="mmwave-out">▲ OUT</span>` : "";
+      return `<div class="mmwave-room ${on ? 'live' : ''}">
+        <div class="mmwave-dot ${on ? 'on' : ''}"></div>
+        <div class="mmwave-body">
+          <div class="mmwave-name">${this._esc(r.name)} ${tag}</div>
+          <div class="mmwave-meta">${on ? 'OCCUPIED' : 'clear'} · ${this._esc(sensorLine)} · ${on ? 'now' : this._esc(r.freshest)}</div>
+        </div>
+      </div>`;
+    }).join("");
+  }
+  // Live door open/closed state, keyed to the model's doors (from the backend).
+  _house3dDoors() {
+    const d = this._data();
+    return (d && d.doors) || {};
+  }
+
+  // Home spec from config (type/specs). Only fields the user configured are set, so the
+  // model falls back to its approved default layout otherwise. Roof pitch + sensible dormer
+  // counts come from the home type unless explicitly overridden.
+  _styleDefaults(style) {
+    const T = {
+      cape_cod:  { roof: 'gable', pitch: 1.0,  dormersFront: 2, dormersRear: 1 },
+      colonial:  { roof: 'gable', pitch: 0.7,  dormersFront: 0, dormersRear: 0 },
+      dutch_colonial: { roof: 'gambrel', pitch: 0.6, dormersFront: 2, dormersRear: 1 },
+      ranch:     { roof: 'hip',   pitch: 0.5,  dormersFront: 0, dormersRear: 0 },
+      two_story: { roof: 'gable', pitch: 0.65, dormersFront: 0, dormersRear: 0 },
+      craftsman: { roof: 'hip',   pitch: 0.6,  dormersFront: 1, dormersRear: 0 },
+      modern:    { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
+      townhouse: { roof: 'gable', pitch: 0.85, dormersFront: 0, dormersRear: 0 },
+      apartment: { roof: 'flat',  pitch: 0.12, dormersFront: 0, dormersRear: 0 },
+      cabin:     { roof: 'gable', pitch: 1.25, dormersFront: 2, dormersRear: 1 },
+      semi_detached: { roof: 'gable', pitch: 0.9, dormersFront: 0, dormersRear: 0 },
+      end_terrace:   { roof: 'gable', pitch: 0.9, dormersFront: 0, dormersRear: 0 },
+      terrace:       { roof: 'gable', pitch: 0.85, dormersFront: 0, dormersRear: 0 },
+    };
+    return T[style] || T.cape_cod;
+  }
+  _houseSpec() {
+    const c = this._data().config || {};
+    const style = c.residence_style || 'cape_cod';
+    const sd = this._styleDefaults(style);
+    const num = (v) => (v === '' || v == null ? null : Number(v));
+    const fEx = num(c.dormers_front), rEx = num(c.dormers_rear);
+    const spec = {};
+    spec.roof = c.home_roof || sd.roof || 'gable';
+    spec.stories = num(c.home_stories) != null ? num(c.home_stories) : 1.5;
+    if (sd.pitch != null) spec.pitch = sd.pitch;
+    // Cape Cod with default dormers => let the model render its exact approved layout.
+    spec.dormersFront = fEx != null ? fEx : sd.dormersFront;
+    spec.dormersRear = rEx != null ? rEx : sd.dormersRear;
+    // A single-storey building gets no roof dormers — they're a 1.5+ storey
+    // feature. Only the STYLE default is suppressed; an explicit pick wins.
+    if (spec.stories <= 1) {
+      // The backend injects dormers_front=2 / dormers_rear=1 when unset, so
+      // "explicit" only counts when the value differs from those defaults.
+      if (fEx == null || fEx === 2) spec.dormersFront = 0;
+      if (rEx == null || rEx === 1) spec.dormersRear = 0;
+    }
+    // 'dormer' roof type = gable with front dormers baked in (explicit pick wins).
+    if (spec.roof === 'dormer') spec.dormersFront = Math.max(spec.dormersFront || 0, 2);
+    if (num(c.garage_bays) != null) spec.garageBays = num(c.garage_bays);
+    if (c.chimney_side) spec.chimney = c.chimney_side;
+    // #324: center / multiple chimneys (common on European houses) + where the
+    // basement is entered. Defaults preserve the prior single-edge chimney and
+    // the auto exterior bulkhead, so existing homes render byte-for-byte as before.
+    spec.chimneyCount = Math.max(1, Math.min(4, num(c.chimney_count) || 1));
+    spec.basementEntrance = c.basement_entrance || 'bulkhead';
+    // Attached housing (UK semi / terrace): which side(s) share a party wall —
+    // 'none' | 'left' | 'right' | 'both'. Explicit setting beats style default.
+    spec.attached = c.home_attached || sd.attached || 'none';
+    return spec;
+  }
+
+  // Draw (or redraw) just the SVG — cheap enough to call on every drag frame.
+  _renderHouse3d() {
+    const mount = this.shadowRoot?.querySelector('#res-iso');
+    if (!mount || typeof JARVIS3D === 'undefined') return;
+    const _jhExt = this._jhResidenceExt();   // jh-residence-ext: a registered style draws itself
+    if (_jhExt && typeof _jhExt.render === 'function') {
+      try { if (_jhExt.render.call(this, mount) === true) return; } catch (e) { console.warn('JARVIS: residence style failed', e); }
+    }
+    const floor = this._house3dFloor();
+    const spec = this._houseSpec();
+    const plan = this._house3dPlan();
+    const elements = this._house3dElements();
+    const garage = this._house3dGarage();
+    const key = floor + '|' + JSON.stringify(spec) + '|' + JSON.stringify(plan) + '|' + JSON.stringify(elements) + '|' + JSON.stringify(garage);
+    if (this._house3dBoxKey !== key) {
+      this._house3dBox = JARVIS3D.fixedBox({ floor, spec, plan, elements, garage });
+      this._house3dBoxKey = key;
+    }
+    mount.innerHTML = JARVIS3D.renderSVG({
+      theta: this._house3dTheta, floor, lit: this._house3dLit(), doors: this._house3dDoors(), box: this._house3dBox, spec, plan, elements, garage
+    });
+    const d = this._data();
+    const occ = (d.areasGrid || []).filter(a => a.active).length;
+    const tot = (d.areasGrid || []).length || 14;
+    const occEl = this.shadowRoot.getElementById('res-occ');
+    if (occEl) occEl.textContent = occ + ' / ' + tot;
+  }
+
+  _buildResidenceAnnotations() {
+    const d = this._data();
+    const areas = d.areasGrid || [];
+    const addrEl = this.shadowRoot.querySelector('#res-addr');
+    if (addrEl) {
+      const hc = this._hass && this._hass.config;
+      addrEl.textContent = (hc && hc.location_name) ||
+        (hc && hc.latitude != null ? (Number(hc.latitude).toFixed(4) + ', ' + Number(hc.longitude).toFixed(4)) : 'LOCATION NOT SET');
+    }
+    const cfgBeds = d.config && d.config.home_bedrooms, cfgBaths = d.config && d.config.home_bathrooms;
+    const beds = (cfgBeds != null && cfgBeds !== '') ? Number(cfgBeds) : (areas.filter(a => a.bedroom).length || d.bedrooms || 0);
+    const baths = (cfgBaths != null && cfgBaths !== '') ? Number(cfgBaths) : areas.filter(a => /bath/i.test(a.name || '')).length;
+    const bbEl = this.shadowRoot.querySelector('#res-bb');
+    if (bbEl) bbEl.textContent = beds + ' / ' + (baths || '—');
+    const sqEl = this.shadowRoot.querySelector('#res-sqft');
+    if (sqEl) {
+      let sqft = d.config && d.config.floor_plan_sqft;
+      if (!sqft) {
+        const plan = this._getFloorPlan();
+        let u = 0;
+        Object.keys(plan).forEach(fk => (plan[fk] && plan[fk].rooms || []).forEach(r => {
+          if (r.type === 'door' || r.type === 'stairs') return;
+          u += (r.w || 0) * (r.h || 0);
+        }));
+        // Clamp so a mis-scaled editor plan can never print an absurd number.
+        sqft = Math.min(5000, Math.max(600, Math.round(u * 0.032 / 50) * 50));
+      }
+      sqEl.textContent = sqft ? '~' + Number(sqft).toLocaleString() : '—';
+    }
+    const styleTag = this.shadowRoot.querySelector('#res-style-tag');
+    if (styleTag) {
+      const rs = this._resStyles()[this._residenceStyle()];
+      styleTag.textContent = (rs && rs.label) ? rs.label.toUpperCase() : '—';
+    }
+
+    // Leader-line callouts retired: the rotatable 3D model can't anchor fixed leader
+    // lines, and presence now reads directly off lit windows (all view) and labeled
+    // rooms (floor views). Clear any stale callouts.
+    const co = this.shadowRoot.querySelector('#res-callouts');
+    if (co) co.innerHTML = '';
+  }
+
+  // Home-style templates: the massing/roof shell that floors + rooms populate.
+  _resStyles() {
+    return {
+      cape_cod:  { label: 'Cape Cod',   roof: 'gable', pitch: 1.0 },
+      colonial:  { label: 'Colonial',   roof: 'gable', pitch: 0.7 },
+      dutch_colonial: { label: 'Dutch Colonial', roof: 'gambrel', pitch: 0.6 },
+      ranch:     { label: 'Ranch',      roof: 'hip',   pitch: 0.5 },
+      two_story: { label: 'Two-Story',  roof: 'gable', pitch: 0.65 },
+      craftsman: { label: 'Craftsman',  roof: 'hip',   pitch: 0.6 },
+      modern:    { label: 'Modern',     roof: 'flat',  pitch: 0 },
+      townhouse: { label: 'Townhouse',  roof: 'gable', pitch: 0.85 },
+      apartment: { label: 'Apartment',  roof: 'flat',  pitch: 0 },
+      cabin:     { label: 'Cabin',      roof: 'gable', pitch: 1.25 },
+      semi_detached: { label: 'Semi-Detached (UK)', roof: 'gable', pitch: 0.9 },
+      end_terrace:   { label: 'End-of-Terrace (UK)', roof: 'gable', pitch: 0.9 },
+      terrace:       { label: 'Mid Terrace (UK)',   roof: 'gable', pitch: 0.85 },
+      // Jarvis Home patch (2026-11-15): jh-residence-ext - styles another component registered
+      ...Object.fromEntries(Object.entries((typeof window !== 'undefined' && window.JarvisResidenceModels) || {})
+        .filter(([k, m]) => m && typeof m === 'object')
+        .map(([k, m]) => [k, { label: String(m.label || k), roof: m.roof || 'flat', pitch: Number(m.pitch) || 0 }])),
+    };
+  }
+
+  _residenceStyle() {
+    const d = this._data();
+    const s = (d.config && d.config.residence_style) || 'cape_cod';
+    return this._resStyles()[s] ? s : 'cape_cod';
+  }
+
+  _residenceStyleOptions(d) {
+    const styles = this._resStyles();
+    const cur = (d.config && d.config.residence_style) || 'cape_cod';
+    return Object.keys(styles).map(k =>
+      '<option value="' + this._esc(k) + '"' + (k === cur ? ' selected' : '') + '>' + this._esc(styles[k].label) + '</option>'
+    ).join('');
+  }
+
+  _roofTypePairs() {
+    return [['','Style default'],['gable','Gable'],['hip','Hip'],['gambrel','Gambrel / Dutch'],['mansard','Mansard'],['flat','Flat'],['shed','Shed (lean-to)'],['dormer','Gable + dormers'],['mshape','M-shaped'],['butterfly','Butterfly'],['jerkinhead','Jerkinhead (clipped gable)'],['crossgable','Cross gable'],['hipvalley','Hip & valley']];
+  }
+
+  // <option> builders for the Residence/Home config selects.
+  _opts(values, current) {
+    return values.map(v => '<option value="' + this._esc(v) + '"' + (String(v) === String(current) ? ' selected' : '') + '>' + this._esc(v) + '</option>').join('');   // jh-r19-xss
+  }
+  _optsLabeled(pairs, current) {
+    return pairs.map(([v, label]) => '<option value="' + this._esc(v) + '"' + (String(v) === String(current) ? ' selected' : '') + '>' + this._esc(label) + '</option>').join('');   // jh-r19-xss
+  }
+
+  _wireResidenceControls() {
+    const sel = this.shadowRoot.getElementById('res-style-sel');
+    if (sel && !sel._wired) {
+      sel._wired = true;
+      sel.addEventListener('change', async () => {
+        const val = sel.value;
+        this._zoomAuto = true;  // refit massing for the new style
+        if (this._liveData && this._liveData.config) this._liveData.config.residence_style = val;
+        this._build3DHouse();
+        const rs = this._resStyles()[val];
+        this._toast('◉ Home style → ' + (rs ? rs.label : val), 'ok');
+        try { await this._saveConfig('residence_style', val); } catch (_) {}
+      });
+    }
+    // jh-doors (step 155): one row per real door or window sensor; its optional position on the generic 3D house is one of the
+    // model's door slots (door_mapping slot -> entity, as before: a slot holds one sensor, a sensor one slot)
+    this.shadowRoot.querySelectorAll('.door-map-sel[data-door-eid]').forEach((ds) => {
+      if (ds._wired) return;
+      ds._wired = true;
+      ds.addEventListener('change', async () => {
+        const eid = ds.getAttribute('data-door-eid');
+        const cfg = (this._liveData && this._liveData.config) || {};
+        const map = Object.assign({}, cfg.door_mapping || {});
+        Object.keys(map).forEach((k) => { if (map[k] === eid) delete map[k]; });
+        // jh-r16-doors: 'auto' = the slot it gets by itself; 'not on the 3D house' for a sensor the backend would place by itself is
+        // saved as that slot set to 'none' (the backend then leaves the slot empty instead of guessing)
+        const _jhSlots = this._doorSlots(), _jhCan = this._jhDoorAuto(eid, map, _jhSlots, true);
+        if (ds.value === 'auto') { if (_jhCan && map[_jhCan] === 'none') delete map[_jhCan]; }
+        else if (ds.value) map[ds.value] = eid;
+        else if (_jhCan && !map[_jhCan]) map[_jhCan] = 'none';
+        if (this._liveData && this._liveData.config) this._liveData.config.door_mapping = map;
+        this._build3DHouse();
+        this._toast('\u25c9 Door mapping updated', 'ok');
+        try { await this._saveConfig('door_mapping', JSON.stringify(map)); } catch (_) {}
+        this._jhDoorRefresh();
+      });
+    });
+  }
+
+  // Residence model door slots → friendly labels.
+  _doorSlots() {
+    const bays = Math.max(0, Math.min(Number((this._data().config || {}).garage_bays) || 0, 8));
+    const garage = [];
+    for (let i = 1; i <= bays; i++) garage.push(['garage_' + i, 'Garage Door ' + i]);
+    if (!bays) garage.push(['garage', 'Garage Door']);   // no bay count set -> single slot
+    return [
+      ['front', 'Front Door'],
+      ...garage,
+      ['garage_rear', 'Garage Side / Rear'],
+      ['kitchen_garage', 'Kitchen ↔ Garage'],
+      ['cellar', 'Cellar / Bulkhead'],
+      ['basement', 'Basement'],
+    ];
+  }
+
+  // Door-like entities for the mapping dropdowns (covers, locks, door sensors).
+  _entName(eid) {
+    // Safe entity display name: never throws if the entity is missing from
+    // hass.states (e.g. a stale entity_id still referenced in config).
+    const st = (this._hass && this._hass.states) ? this._hass.states[eid] : null;
+    return (st && st.attributes && st.attributes.friendly_name) || eid;
+  }
+  _trackerOptions(selected) {
+    const states = this._hass?.states || {};
+    const hasCoords = (st) => !!(st && st.attributes &&
+      st.attributes.latitude != null && st.attributes.longitude != null);
+    // Every entity JARVIS can read a live origin from: persons and device
+    // trackers by domain, zones (a fixed origin like "Work"), plus any other
+    // entity that actually exposes GPS lat/lon (e.g. a geocoded-location sensor)
+    // \u2014 matching exactly what the backend accepts for an origin (_entity_coords),
+    // so the picker no longer hides valid choices.
+    const cands = Object.keys(states).filter(eid => {
+      const dom = eid.split('.')[0];
+      if (dom === 'person' || dom === 'device_tracker' || dom === 'zone') return true;
+      return dom === 'sensor' && hasCoords(states[eid]);
+    }).sort();
+    if (selected && !cands.includes(selected)) cands.unshift(selected);
+    const opts = cands.map(eid => `<option value="${this._esc(eid)}"${eid === selected ? ' selected' : ''}>${this._esc(this._entName(eid))}</option>`).join('');
+    return `<option value=""${selected ? '' : ' selected'}>\u2014 none \u2014</option>` + opts;
+  }
+  _travelSensorOptions(selected) {
+    const states = this._hass?.states || {};
+    // The backend reads this sensor's state as minutes (float), so surface the
+    // likely drive-time sensors: a duration device_class, a minutes/hours unit,
+    // or a travel-ish name from the common HA travel-time integrations. Kept
+    // curated (not every one of hundreds of sensors) but broadened so more real
+    // candidates show; a currently-selected entity is always kept visible.
+    const cands = Object.keys(states).filter(eid => {
+      const dom = eid.split('.')[0]; if (dom !== 'sensor') return false;
+      const a = states[eid].attributes || {}, dc = a.device_class || '', unit = a.unit_of_measurement || '';
+      return dc === 'duration'
+        || /^(min|mins|minute|minutes|h|hr|hrs|hour|hours)$/i.test(unit)
+        || /travel|commute|duration|eta|arrival|route|waze|maps|mapbox|tomtom|here[_ ]?travel|traffic|drive[_ ]?time|driving|depart|time_to|to_work|to_home/i.test(eid);
+    }).sort();
+    if (selected && !cands.includes(selected)) cands.unshift(selected);
+    const opts = cands.map(eid => `<option value="${this._esc(eid)}"${eid === selected ? ' selected' : ''}>${this._esc(this._entName(eid))}</option>`).join('');
+    return `<option value=""${selected ? '' : ' selected'}>\u2014 none \u2014</option>` + opts;
+  }
+
+  _carSensorOptions(selected) {
+    // Candidate "car / head-unit connected" binary sensors. The HA companion
+    // app exposes an Android Auto sensor (binary_sensor.<phone>_android_auto);
+    // also surface generic connectivity/car sensors so any setup can pick one.
+    const states = this._hass?.states || {};
+    const cands = Object.keys(states).filter(eid => {
+      if (eid.split('.')[0] !== 'binary_sensor') return false;
+      const a = states[eid].attributes || {}, dc = a.device_class || '', fn = a.friendly_name || '';
+      return /android[_ ]?auto|head[_ ]?unit|\bcar\b/i.test(eid) || dc === 'connectivity' || /android auto|head unit|\bcar\b/i.test(fn);
+    }).sort();
+    if (selected && !cands.includes(selected)) cands.unshift(selected);
+    const opts = cands.map(eid => `<option value="${this._esc(eid)}"${eid === selected ? ' selected' : ''}>${this._esc(this._entName(eid))}</option>`).join('');
+    return `<option value=""${selected ? '' : ' selected'}>\u2014 auto-detect \u2014</option>` + opts;
+  }
+
+  _doorEntityOptions(selected, placeholder = '— auto-detect —') {
+    const states = this._hass?.states || {};
+    const cands = [];
+    // Openings map to an open/closed source: any cover or lock, plus contact-type
+    // binary_sensors. Match window sensors (device_class 'window') and loosely-named
+    // contacts by name too, so the full set of a user's openings is assignable.
+    const OPEN_DC = ['door', 'window', 'garage_door', 'opening'];
+    const OPEN_RE = /door|garage|gate|cellar|bulkhead|hatch|window|contact|entry|slider|sash|casement|patio|french|skylight|opening|sliding/i;
+    Object.keys(states).forEach(eid => {
+      const dom = eid.split('.')[0];
+      const at = states[eid].attributes || {};
+      const dc = at.device_class || '';
+      const fn = at.friendly_name || '';
+      const ok = dom === 'cover' || dom === 'lock' ||
+        (dom === 'binary_sensor' && (OPEN_DC.includes(dc) || OPEN_RE.test(eid) || OPEN_RE.test(fn)));
+      if (ok) cands.push(eid);
+    });
+    cands.sort();
+    if (selected && !cands.includes(selected)) cands.unshift(selected);
+    const opts = cands.map(eid => {
+      const fn = this._entName(eid);
+      return `<option value="${this._esc(eid)}"${eid === selected ? ' selected' : ''}>${this._esc(fn)}</option>`;
+    }).join('');
+    return `<option value=""${selected ? '' : ' selected'}>${this._esc(placeholder)}</option>` + opts;
+  }
+
+  // jh-doors (step 155, the owner): the DOORS row shows the home's own door, window, garage door and opening sensors
+  // (binary_sensor device_class), by name, with their area and live open/closed state; it follows the sensors as they are added
+  // or removed, and names no demo door. The generic 3D house still draws its doors at its model positions (door_mapping
+  // slot -> entity, as before, blank = auto-detect by name); each real sensor may be put at one of them. With a residence model of
+  // its own (a residence extension) the generic positions are not used, so that choice is left out.
+  // jh-r16-doors (review round 16): as upstream allowed, the rows also hold covers that are doors (device_class garage, door or
+  // gate, or a door word in the name and no window-covering class), every lock, and contact sensors with no device_class and a
+  // door or window word in the name (whole words); and always every entity the saved door_mapping already names, so it can be
+  // seen, moved or cleared. Hidden and diagnostic entities stay out unless they are mapped.
+  _jhDoorWord(eid, name, doorOnly) {
+    const t = (String(eid || '').split('.').pop() + ' ' + String(name || '')).toLowerCase().replace(/[_.\-]+/g, ' ');
+    return (doorOnly ? /\b(?:doors?|garage|gates?|cellar|bulkhead|hatch)\b/
+      : /\b(?:doors?|garage|gates?|cellar|bulkhead|hatch|windows?|contact|entry|slider|sash|casement|patio|french|skylight|opening|sliding)\b/).test(t);
+  }
+
+  _jhDoors(map) {
+    const h = this._hass || {}, states = h.states || {}, ents = h.entities || {}, devs = h.devices || {}, areas = h.areas || {};
+    const DC = ['door', 'window', 'garage_door', 'opening'];
+    const COVER = ['garage', 'door', 'gate'], NOT_DOOR = ['shade', 'shutter', 'blind', 'curtain', 'awning', 'window', 'damper'];
+    const m = map || ((this._liveData && this._liveData.config) || {}).door_mapping || {};
+    const mapped = Object.values(m).filter((v) => typeof v === 'string' && v.includes('.'));
+    const keep = (eid) => {
+      if (ents[eid] && (ents[eid].hidden || ents[eid].entity_category)) return false;
+      const at = (states[eid] && states[eid].attributes) || {}, dom = eid.split('.')[0], dc = at.device_class || '';
+      if (dom === 'binary_sensor') return DC.includes(dc) || (!dc && this._jhDoorWord(eid, at.friendly_name));
+      if (dom === 'cover') return COVER.includes(dc) || (!NOT_DOOR.includes(dc) && this._jhDoorWord(eid, at.friendly_name, true));
+      return dom === 'lock';
+    };
+    return [...new Set(Object.keys(states).filter(keep).concat(mapped))]
+      .map((eid) => {
+        const e = ents[eid] || {}, aid = e.area_id || (devs[e.device_id] || {}).area_id || '';
+        return { eid, name: String(this._jhHaName(eid)), area: String((areas[aid] || {}).name || ''), state: states[eid] ? states[eid].state : 'missing' };
+      })
+      .sort((x, y) => (x.area || '\uffff').localeCompare(y.area || '\uffff') || x.name.localeCompare(y.name));
+  }
+
+  _jhDoorStateText(s, eid) {   // jh-r16-doors: the state in the words of its kind (a lock is locked or unlocked)
+    const dom = String(eid || '').split('.')[0];
+    if (s === 'missing') return 'NOT FOUND';
+    if (dom === 'cover' || dom === 'lock') return String(s || 'unknown').toUpperCase();
+    return s === 'on' ? 'OPEN' : s === 'off' ? 'CLOSED' : String(s || 'unknown').toUpperCase();
+  }
+
+  _jhDoorIsOpen(s, eid) {   // as the backend's door_state.entity_is_open
+    const dom = String(eid || '').split('.')[0];
+    if (!s || ['unknown', 'unavailable', 'missing'].includes(s)) return false;
+    if (dom === 'cover') return !['closed', 'closing'].includes(s);
+    if (dom === 'lock') return ['unlocked', 'open', 'opening', 'jammed'].includes(s);
+    return s === 'on';
+  }
+
+  _jhDoorClassify(eid, name) {   // jh-r16-doors: the backend's door_state.classify, word for word
+    const s = (String(eid || '') + ' ' + String(name || '')).toLowerCase(), has = (...k) => k.some((x) => s.includes(x));
+    if (has('cellar', 'bulkhead', 'hatch')) return 'cellar';
+    if (s.includes('basement')) return 'basement';
+    if (s.includes('garage') && has('kitchen', 'interior', 'inside', 'house', 'mud')) return 'kitchen_garage';
+    if (s.includes('kitchen') && s.includes('garage')) return 'kitchen_garage';
+    if (s.includes('garage') && has('man', 'side', 'rear', 'back', 'walk', 'person', 'entry', 'people')) return 'garage_rear';
+    if (s.includes('garage')) return 'garage';
+    if (s.includes('front') && !s.includes('garage')) return 'front';
+    return '';
+  }
+
+  _jhDoorAuto(eid, map, slots, anyway) {   // the 3D house slot the backend gives this entity by itself (no explicit mapping)
+    const st = ((this._hass && this._hass.states) || {})[eid];
+    if (!st) return '';
+    const at = st.attributes || {}, dom = eid.split('.')[0], dc = at.device_class || '';
+    const slot = this._jhDoorClassify(eid, at.friendly_name || '');
+    if (!slot || !(slots || []).some(([s]) => s === slot)) return '';
+    if (map[slot] && !(anyway && map[slot] === 'none')) return '';   // that slot is set by hand (an entity, or 'not on the 3D house')
+    // jh-r17-doors (step 159, review round 17 #9): a sensor mapped by hand to a slot is only there, never also at its auto slot
+    if (Object.keys(map).some((k) => map[k] === eid)) return '';
+    const ok = dom === 'binary_sensor' ? ['door', 'garage_door', 'opening'].includes(dc)
+      : dom === 'cover' ? (['garage', 'door', 'gate'].includes(dc) || !['shade', 'shutter', 'blind', 'curtain', 'awning', 'window', 'damper'].includes(dc))
+      : false;
+    return ok ? slot : '';
+  }
+
+  _jhDoorStateSync() {   // the live open/closed state, on every Home Assistant update
+    const root = this.shadowRoot;
+    if (!root) return;
+    const states = (this._hass && this._hass.states) || {};
+    root.querySelectorAll('.door-state[data-door-eid]').forEach((el) => {
+      const st = states[el.getAttribute('data-door-eid')];
+      const de = el.getAttribute('data-door-eid'), s = st ? st.state : 'missing';   // jh-r16-doors
+      const t = this._jhDoorStateText(s, de);
+      if (el.textContent !== t) el.textContent = t;
+      el.classList.toggle('open', this._jhDoorIsOpen(s, de));
+    });
+  }
+
+  _jhDoorRefresh() {
+    const box = this.shadowRoot && this.shadowRoot.querySelector('.door-map');
+    if (!box) return;
+    const t = document.createElement('div');
+    t.innerHTML = this._renderDoorMapping(this._data());
+    box.replaceWith(t.firstElementChild);
+    this._wireResidenceControls();
+  }
+
+  _renderDoorMapping(d) {
+    const map = (d && d.config && d.config.door_mapping) || {};
+    let own = false;   // a residence model of its own: the generic positions are not used
+    try { own = typeof this._jhResidenceExt === 'function' && !!this._jhResidenceExt(); } catch (e) { own = false; }
+    const slots = own ? [] : this._doorSlots();
+    const rows = this._jhDoors(map).map((x) => {
+      const at = slots.find(([slot]) => map[slot] === x.eid);
+      // jh-r16-doors: the slot the backend gives it by itself is shown as such ('(auto)'); 'not on the 3D house' only when true
+      const can = at ? '' : this._jhDoorAuto(x.eid, map, slots, true), auto = can && !map[can] ? can : '';
+      const canLbl = can ? ((slots.find(([s]) => s === can) || [can, can])[1]) : '';
+      const pick = own ? '' : `<select class="door-map-sel" data-door-eid="${this._esc(x.eid)}" aria-label="Where ${this._esc(x.name)} is on the 3D house">`
+        + (can ? `<option value="auto"${auto ? ' selected' : ''}>3D house: ${this._esc(canLbl)} (auto)</option>` : '')
+        + `<option value=""${at || auto ? '' : ' selected'}>\u2014 not on the 3D house \u2014</option>`
+        + slots.map(([slot, label]) => `<option value="${this._esc(slot)}"${at && at[0] === slot ? ' selected' : ''}>3D house: ${this._esc(label)}</option>`).join('')
+        + `</select>`;
+      return `<div class="door-map-row"><label title="${this._esc(x.eid)}">${this._esc(x.name)}`
+        + (x.area ? ` <span class="door-area">${this._esc(x.area)}</span>` : '')
+        + ` <span class="door-state${this._jhDoorIsOpen(x.state, x.eid) ? ' open' : ''}" data-door-eid="${this._esc(x.eid)}">${this._esc(this._jhDoorStateText(x.state, x.eid))}</span></label>${pick}</div>`;
+    }).join('');
+    return `<div class="door-map"><div class="door-map-head">DOORS \u00b7 your door and window sensors`
+      + (own ? '' : ` <span class="door-map-hint">(where each is on the 3D house is optional)</span>`) + `</div>`
+      + `<div class="door-map-grid">${rows || '<div class="door-map-none">No door or window sensors found.</div>'}</div></div>`;
+  }
+
+  _update3DTransform() { /* 2D isometric — no transform to apply */ }
+
+
+  _wire3DDrag() {
+    const scene = this.shadowRoot?.querySelector('#house3d-scene');
+    if (!scene || scene._house3dWired) return;
+    scene._house3dWired = true;
+    let dragging = false, lastX = 0, startX = 0, startY = 0, axis = null, raf = null;
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = null; this._renderHouse3d(); }); };
+    const pt = (e) => (e.touches && e.touches[0] ? e.touches[0] : e);
+    const move = (e) => {
+      if (!dragging) return;
+      const p = pt(e);
+      // On touch, decide the gesture's axis once: horizontal rotates the model,
+      // vertical is a page scroll — so dragging up/down the phone never fights
+      // the model, and a sideways drag never scrolls the page mid-rotation.
+      if (axis === null) {
+        const dx = Math.abs(p.clientX - startX), dy = Math.abs(p.clientY - startY);
+        if (dx < 6 && dy < 6) return;          // too small to classify yet
+        axis = dx >= dy ? 'x' : 'y';
+        if (axis === 'y') { dragging = false; return; }  // release to the page scroller
+      }
+      if (e.cancelable) e.preventDefault();    // horizontal → keep the page from scrolling
+      this._house3dTheta -= (p.clientX - lastX) * 0.5;
+      lastX = p.clientX;
+      schedule();
+    };
+    const up = () => {
+      dragging = false; axis = null; scene.classList.remove('dragging');
+      window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
+      window.removeEventListener('touchmove', move); window.removeEventListener('touchend', up);
+    };
+    const down = (e) => {
+      const p = pt(e);
+      dragging = true; axis = null; startX = lastX = p.clientX; startY = p.clientY;
+      scene.classList.add('dragging');
+      window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
+      window.addEventListener('touchmove', move, { passive: false });   // non-passive: rotation can block scroll
+      window.addEventListener('touchend', up);
+    };
+    scene.addEventListener('mousedown', (e) => { down(e); e.preventDefault(); });
+    scene.addEventListener('touchstart', (e) => down(e), { passive: true });
+  }
+
+  // ---- Floor-plan real dimensions (v7.94.0) ----
+  // Editor grid: a 50-unit major gridline = 10 ft, so 0.2 ft per unit. These
+  // real per-room dimensions are the source the 3D structure is built from.
+  _fpUnits() { return (this._data().config?.floor_plan_units === 'metric') ? 'metric' : 'imperial'; }
+  _fpUnitLabel() { return this._fpUnits() === 'metric' ? 'm' : 'ft'; }
+  _fpToReal(u) {
+    const ft = (u || 0) * 0.2;
+    return this._fpUnits() === 'metric' ? Math.round(ft * 0.3048 * 10) / 10 : Math.round(ft * 10) / 10;
+  }
+  _fpFromReal(v) {
+    const ft = this._fpUnits() === 'metric' ? (v / 0.3048) : v;
+    return Math.max(8, Math.round(ft / 0.2));
+  }
+  _fpDim(u) { return this._fpToReal(u) + (this._fpUnits() === 'metric' ? 'm' : "'"); }
+
+  _renderFloorPlanEditor(d) {
+    const plan = this._getEditingPlan();
+    const floor = this._editorFloor || '1f';
+    const floorData = plan[floor];
+    if (!floorData) return '';
+
+    let html = '';
+
+    // Floor selector + address
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">';
+    html += '<div class="floor-tabs">';
+    for (const fk of Object.keys(plan)) {
+      html += '<button class="floor-tab fp-ed-floor ' + (fk === floor ? 'active' : '') + '" data-ed-floor="' + this._esc(fk) + '">' + this._esc(plan[fk].label) + '</button>';
+    }
+    html += '</div>';
+    html += '<div style="display:flex;gap:6px;align-items:center;">';
+    html += '<label class="ctrl" style="padding:5px 10px;font-size:9px;cursor:pointer;">Import BG <input type="file" accept="image/*" class="fp-import-img" style="display:none"/></label>';
+    // Import a floor plan straight from a vacuum-robot map / dashboard image
+    // entity — no manual upload (#405). Populated from jarvis/floorplan_sources.
+    html += '<select class="fp-import-entity ctrl" title="Import a floor plan from a vacuum map or image entity" style="padding:5px 8px;font-size:9px;max-width:170px;"><option value="">Map/vacuum…</option></select>';
+    html += '<button class="ctrl" id="fp-import-entity-btn" style="padding:5px 10px;font-size:9px;">Import Map</button>';
+    // Auto-detect room SHAPES from the selected vacuum/map entity (#405 follow-up)
+    // — segments the map's room colours into polygons you review, then Save.
+    html += '<button class="ctrl" id="fp-detect-rooms-btn" title="Auto-detect room shapes from the selected vacuum/map entity" style="padding:5px 10px;font-size:9px;">Detect Rooms</button>';
+    html += '<button class="ctrl" id="fp-export" style="padding:5px 10px;font-size:9px;">Export</button>';
+    html += '<label class="ctrl" style="padding:5px 10px;font-size:9px;cursor:pointer;">Import <input type="file" accept=".json,application/json" class="fp-import-layout" style="display:none"/></label>';
+    html += '<button class="ctrl" id="fp-add-room" style="padding:5px 10px;font-size:9px;">+ Add Room</button>';
+    html += '<button class="ctrl" id="fp-add-lroom" title="Add an L-shaped room you can reshape corner-by-corner" style="padding:5px 10px;font-size:9px;">+ L Room</button>';
+    html += '<button class="ctrl" id="fp-add-zone" style="padding:5px 10px;font-size:9px;margin-left:6px;">+ Outdoor Zone</button>';
+    { const _pp = this._propertyPts(); const _has = _pp.length >= 3;
+      html += '<button class="ctrl" id="fp-add-property" style="padding:5px 10px;font-size:9px;margin-left:6px;">' + (_has ? 'Clear Property' : '+ Property Line') + '</button>';
+      if (_has) html += '<span class="fp-land-size" style="margin-left:8px;font-family:var(--font-mono);font-size:9px;color:#ffb85a;">Lot: ' + this._propertyArea(_pp) + '</span>'; }
+    html += '<button class="ctrl" id="fp-units" style="padding:5px 10px;font-size:9px;">Units: ' + (this._fpUnits() === 'metric' ? 'Metric' : 'Imperial') + '</button>';
+    { const _cfg = (this._data().config || {});
+      html += '<label style="margin-left:10px;font-family:var(--font-mono);font-size:9px;color:var(--text-dim);letter-spacing:0.08em;display:flex;align-items:center;gap:5px;">HOUSE'
+        + '<select class="ctrl" id="fp-home-type" style="padding:3px 6px;font-size:9px;">' + this._residenceStyleOptions(this._data()) + '</select></label>';
+      html += '<label style="margin-left:6px;font-family:var(--font-mono);font-size:9px;color:var(--text-dim);letter-spacing:0.08em;display:flex;align-items:center;gap:5px;">ATTACHED'
+        + '<select class="ctrl" id="fp-home-attached" style="padding:3px 6px;font-size:9px;">' + this._optsLabeled([['none','Detached'],['left','Semi — party wall left'],['right','Semi — party wall right'],['top','Semi — party wall top'],['bottom','Semi — party wall bottom'],['both','Terrace — both sides']], _cfg.home_attached ?? 'none') + '</select></label>';
+      html += '<label style="margin-left:6px;font-family:var(--font-mono);font-size:9px;color:var(--text-dim);letter-spacing:0.08em;display:flex;align-items:center;gap:5px;">ROOF'
+        + '<select class="ctrl" id="fp-home-roof" style="padding:3px 6px;font-size:9px;">' + this._optsLabeled(this._roofTypePairs(), _cfg.home_roof ?? '') + '</select></label>'; }
+    html += '</div>';
+    html += '</div>';
+
+    // Instructions
+    html += '<div style="font-size:9px;color:var(--text-dim);font-family:var(--font-mono);letter-spacing:0.06em;margin-bottom:6px;">DRAG to move · Bottom-right handle to resize · Right-click to delete · Click to select · select a room → ◇ Reshape for L-shapes · drag door/window markers onto any wall</div>';
+
+    // Floor plan canvas (full width)
+    html += this._viewPresetBar('editor');
+    html += '<div class="fp-3d-preview" id="fp-3d-preview">' + this._renderEditorPreview() + '</div>';
+    html += '<div class="fp-zoom-bar" style="display:flex;align-items:center;gap:8px;margin:4px 0 6px;">'
+      + '<button class="ctrl" id="fp-zoom-fit" style="padding:4px 10px;font-size:9px;">\u2922 Fit</button>'
+      + '<span style="font-size:9px;color:var(--text-faint);font-family:var(--font-mono);">scroll to zoom \u00b7 middle-drag or drag empty space to pan</span></div>';
+    html += '<div class="fp-editor-canvas" id="fp-editor-canvas" style="min-height:820px;">';
+    html += this._renderEditableSVG(plan, floor);
+    html += '</div>';
+    html += this._renderOpenings(floor);
+    html += this._renderCameras(floor);
+    html += this._renderPlanEntities(floor);
+
+    // Selected room info
+    html += '<div id="fp-selected-info" style="font-family:var(--font-mono);font-size:11px;color:var(--cyan);padding:8px 0;min-height:22px;letter-spacing:0.08em;"></div>';
+
+    // Actions
+    html += '<div style="display:flex;gap:8px;">';
+    html += '<button class="ctrl primary" id="fp-save">Save Layout</button>';
+    html += '<button class="ctrl" id="fp-reset">Reset Default</button>';
+    html += '</div>';
+    return html;
+  }
+
+  _optInEntityDatalist() {
+    const states = this._hass?.states || {};
+    return Object.keys(states).filter(eid => {
+      const dom = eid.split('.')[0];
+      return dom === 'binary_sensor' || dom === 'device_tracker' || dom === 'person' || dom === 'sensor';
+    }).sort().map(eid =>
+      `<option value="${this._esc(eid)}">${this._esc(this._entName(eid))}</option>`).join('');
+  }
+  _plList() {
+    let incl = (this._data().config && this._data().config.pattern_include_entities) || [];
+    if (!Array.isArray(incl)) { try { incl = JSON.parse(incl) || []; } catch (_) { incl = []; } }
+    return incl;
+  }
+  async _plSave(incl) {
+    await this._saveConfig('pattern_include_entities', JSON.stringify(incl));
+    if (this._liveData && this._liveData.config) this._liveData.config.pattern_include_entities = incl;
+    await this._fetchAndRender();   // re-fetch from backend + full re-render (matches toggles)
+  }
+
+  // Arrival-greeting doors: a selected list of door entity IDs, saved as a JSON
+  // list (same round-trip as pattern_include_entities). The panel offers these as
+  // a dropdown of door/entry/lock/cover entities + removable chips (#60).
+  _greetDoorsList() {
+    let ds = (this._data().config && this._data().config.arrival_greeting_doors) || [];
+    if (!Array.isArray(ds)) { try { ds = JSON.parse(ds) || []; } catch (_) { ds = []; } }
+    return ds;
+  }
+  async _greetDoorsSave(ds) {
+    await this._saveConfig('arrival_greeting_doors', JSON.stringify(ds));
+    if (this._liveData && this._liveData.config) this._liveData.config.arrival_greeting_doors = ds;
+    await this._fetchAndRender();
+  }
+  _greetDoorChips() {
+    const ds = this._greetDoorsList();
+    return ds.length
+      ? ds.map((e, i) => `<span class="pl-chip">${this._esc(this._entName(e))}<button class="greet-door-del" data-i="${i}" title="Remove">×</button></span>`).join('')
+      : '<span class="pl-empty">No doors selected — the greeting stays off until you add one.</span>';
+  }
+  _exclArr(v) {
+    if (!v) return [];
+    if (Array.isArray(v)) return v;
+    try { const j = JSON.parse(v); return Array.isArray(j) ? j : []; } catch (_) { return []; }
+  }
+  _allEntityDatalist() {
+    const states = this._hass?.states || {};
+    return Object.keys(states).sort().map(eid =>
+      `<option value="${this._esc(eid)}">${this._esc(this._entName(eid))}</option>`).join('');
+  }
+  _domainDatalist() {
+    const states = this._hass?.states || {};
+    const doms = [...new Set(Object.keys(states).map(e => e.split('.')[0]))].sort();
+    return doms.map(dm => `<option value="${this._esc(dm)}">${this._esc(dm)}</option>`).join('');
+  }
+  _labelDatalist() {
+    const labels = (this._data() && this._data().available_labels) || [];
+    return labels.map(l => `<option value="${this._esc(l.name)}">${this._esc(l.name)}</option>`).join('');
+  }
+  async _exclSave(key, arr) {
+    await this._saveConfig(key, JSON.stringify(arr));
+    if (this._liveData && this._liveData.config) this._liveData.config[key] = arr;
+    await this._fetchAndRender();
+  }
+  _renderExcludedEntities(d) {
+    const cfg = d.config || {};
+    const ents = this._exclArr(cfg.excluded_entities);
+    const doms = this._exclArr(cfg.excluded_domains);
+    const labs = this._exclArr(cfg.excluded_labels);
+    const chipRow = (arr, cls) => arr.length
+      ? arr.map((e, i) => `<span class="pl-chip">${this._esc(e)}<button class="${cls}" data-i="${i}" title="Remove">\u00d7</button></span>`).join('')
+      : '<span class="pl-empty">None.</span>';
+    return `
+      <div class="panel">
+        <div class="head"><span>Excluded Entities</span><span class="side">SCOPE</span></div>
+        <div class="appliance-intro">Entities you exclude are removed from JARVIS's awareness \u2014 presence detection, room routing, the observer and routine learning all skip them. Home Assistant still has the entity, and JARVIS can still control it if you ask for it by name. Use this to silence noise such as a virtual occupancy sensor another integration exposes, or lights and switches you don't want JARVIS reacting to.</div>
+        <div class="pl-entities">
+          <div class="pl-ehead">Exclude specific entities</div>
+          <div class="pl-add"><input id="excl-ent-input" list="excl-ent-list" class="op-field pl-input" placeholder="type to find an entity\u2026" autocomplete="off"><datalist id="excl-ent-list">${this._allEntityDatalist()}</datalist><button class="ctrl" id="excl-ent-add">+ Add</button></div>
+          <div class="pl-chips" id="excl-ent-chips">${chipRow(ents, 'excl-ent-del')}</div>
+        </div>
+        <div class="pl-entities">
+          <div class="pl-ehead">Exclude whole domains <span class="pl-hint">e.g. light, switch \u2014 every entity in the domain</span></div>
+          <div class="pl-add"><input id="excl-dom-input" list="excl-dom-list" class="op-field pl-input" placeholder="type a domain\u2026" autocomplete="off"><datalist id="excl-dom-list">${this._domainDatalist()}</datalist><button class="ctrl" id="excl-dom-add">+ Add</button></div>
+          <div class="pl-chips" id="excl-dom-chips">${chipRow(doms, 'excl-dom-del')}</div>
+        </div>
+        <div class="pl-entities">
+          <div class="pl-ehead">Exclude by label <span class="pl-hint">every entity carrying a Home Assistant label</span></div>
+          <div class="pl-add"><input id="excl-lab-input" list="excl-lab-list" class="op-field pl-input" placeholder="type a label\u2026" autocomplete="off"><datalist id="excl-lab-list">${this._labelDatalist()}</datalist><button class="ctrl" id="excl-lab-add">+ Add</button></div>
+          <div class="pl-chips" id="excl-lab-chips">${chipRow(labs, 'excl-lab-del')}</div>
+        </div>
+        <div class="cfg-row" style="margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
+          <label>Data retention (days) <span class="cfg-hint">cap how long raw observations (state changes, commands, chat, activity) are kept so the DB can't grow without limit — 0 keeps everything. Default 90; learning only uses the last week or two.</span></label>
+          <input class="cfg-field cfg-num" type="number" min="0" max="3650" step="1" data-cfg-key="db_retention_days" value="${this._esc(cfg.db_retention_days ?? '')}" placeholder="90">
+        </div>
+        <div class="cfg-row">
+          <label>Flush learned source after (days) <span class="cfg-hint">learned routines live on once learned, so the raw state-changes that fed them can go sooner than chat/activity. 0 = use the retention above. Keep ≥ 30 so the miner isn't starved.</span></label>
+          <input class="cfg-field cfg-num" type="number" min="0" max="3650" step="1" data-cfg-key="db_source_retention_days" value="${this._esc(cfg.db_source_retention_days ?? '')}" placeholder="0">
+        </div>
+        <div class="cfg-row">
+          <label>Database location <span class="cfg-hint">host the JARVIS .db files on another volume or network share (absolute path). Blank = default &lt;config&gt;/jarvis. Existing DBs are copied over on first use; applies after a restart.</span></label>
+          <input class="cfg-field" type="text" data-cfg-key="db_storage_path" value="${this._esc(cfg.db_storage_path || '')}" placeholder="/mnt/share/jarvis">
+        </div>
+      </div>
+`;
+  }
+  _roomAt(floor, x, y) {
+    const rooms = ((this._getEditingPlan()[floor] || {}).rooms) || [];
+    for (let i = 0; i < rooms.length; i++) {
+      const r = rooms[i];
+      if (r.type === 'stairs' || r.type === 'door') continue;
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r.name;
+    }
+    let best = null, bd = 1e18;
+    rooms.forEach(r => { const cx = r.x + r.w / 2, cy = r.y + r.h / 2, d = (cx - x) * (cx - x) + (cy - y) * (cy - y); if (d < bd) { bd = d; best = r.name; } });
+    return best || 'the area';
+  }
+  _openingDescriptions(floor) {
+    const out = [];
+    (this._elemsFor(floor) || []).forEach(e => {
+      if (e.type === 'door' && (e.kind === 'cased' || e.kind === 'interior') && e.room) {
+        out.push((e.kind === 'cased' ? 'cased opening at ' : 'interior door at ') + e.room);
+      }
+    });
+    const rooms = ((this._getEditingPlan()[floor] || {}).rooms) || [];
+    if (rooms.some(r => r.type === 'stairs')) out.push('open staircase');
+    return out;
+  }
+  _renderCameras(floor) {
+    const cams = this._camsFor(floor), uL = this._fpUnitLabel();
+    const geo = cams.length ? this._planGeometry(floor) : null;
+    const zoneNames = new Set((((this._getEditingPlan()[floor] || {}).rooms) || []).filter(r => r.type === 'outdoor').map(r => r.name));
+    const rows = cams.map((c, i) => {
+      const cov = geo ? this._computeCoverage(floor, c, geo) : {};
+      const order = Object.keys(cov).sort((a, b) => cov[b] - cov[a]);
+      const covLine = order.length
+        ? '<div class="cam-cov">sees: ' + order.map(rn => '<span class="cam-cov-room' + (cov[rn] >= 0.7 ? ' full' : '') + (zoneNames.has(rn) ? ' zone' : '') + '">' + this._esc(rn) + ' ' + Math.round(cov[rn] * 100) + '%</span>').join(' \u00b7 ') + '</div>'
+        : '<div class="cam-cov cam-cov-none">nothing in view \u2014 aim it, widen the FOV, or extend the range</div>';
+      const row = '<div class="cam-row" data-ci="' + i + '">'
+        + '<span class="cam-tag ' + (c.indoor === false ? 'out' : 'in') + '">CAM ' + (i + 1) + '</span>'
+        + ' <select class="cam-field" data-cam="entity" data-ci="' + i + '" title="camera entity">' + this._cameraEntityOptions(c.entity || '') + '</select>'
+        + ' <label class="cam-lbl">aim <input class="cam-field" data-cam="angle" data-ci="' + i + '" type="range" min="0" max="359" step="1" value="' + this._esc((c.angle != null ? c.angle : 270)) + '" title="facing direction"></label>'
+        + ' <label class="cam-lbl">FOV <input class="cam-field" data-cam="fov" data-ci="' + i + '" type="range" min="20" max="170" step="5" value="' + this._esc((c.fov != null ? c.fov : 90)) + '" title="field-of-view width"></label>'
+        + ' <label class="cam-lbl">range <input class="cam-field cam-num" data-cam="range" data-ci="' + i + '" type="number" min="5" step="5" value="' + this._fpToReal(c.range != null ? c.range : 55) + '" title="how far it sees (outdoor)"> ' + uL + '</label>'
+        + ' <button class="cam-io ' + (c.indoor === false ? 'out' : 'in') + '" data-ci="' + i + '" title="indoor = bounded by walls, outdoor = by range">' + (c.indoor === false ? 'OUTDOOR' : 'INDOOR') + '</button>'
+        + ' <button class="op-del cam-del" data-ci="' + i + '" title="Remove">\u00d7</button>'
+        + '</div>';
+      const cvg = c.coverage;
+      const llmLine = (cvg && cvg.reason)
+        ? '<div class="cam-cov-llm">' + ((cvg.covered && cvg.covered.length) ? '<span class="cam-cov-conf">\u2713 confirms ' + cvg.covered.map(r => this._esc(r)).join(', ') + '</span> \u2014 ' : '') + '<span class="cam-cov-reason">' + this._esc(cvg.reason) + '</span></div>'
+        : '';
+      return '<div class="cam-item">' + row + covLine + llmLine + '</div>';
+    }).join('');
+    return '<div class="fp-cameras">'
+      + '<div class="op-headr">CAMERAS \u00b7 field of view <span class="op-hint">drop a camera, bind its entity, aim it \u00b7 drag the dot on the plan to move \u00b7 indoor sees until walls, outdoor by range \u00b7 right-click a dot to delete</span></div>'
+      + '<div class="op-add"><button class="ctrl" id="cam-add">+ Camera</button>' + (cams.length ? '<button class="ctrl" id="cam-compute" title="AI: judge what each camera can confirm + describe it">Compute coverage</button>' : '') + '</div>'
+      + (rows || '<div class="op-empty">No cameras placed on this floor yet \u2014 add one above.</div>')
+      + '</div>';
+  }
+  _renderPlanEntities(floor) {
+    const ents = this._entsFor(floor);
+    let _op = parseFloat(this._data().config?.floor_plan_bg_opacity);
+    if (!(isFinite(_op) && _op >= 0 && _op <= 1)) _op = 0.2;
+    let hasBg = false;
+    try { const b = this._data().config?.floor_plan_bg; const bd = typeof b === 'string' ? JSON.parse(b || '{}') : (b || {}); hasBg = !!bd[floor]; } catch (_) {}
+    const chips = ents.length
+      ? ents.map((e, i) => '<span class="pl-chip">' + this._esc(this._entMarkerStyle(e.e).name) + '<button class="ent-del" data-ei="' + i + '" title="Remove">\u00d7</button></span>').join('')
+      : '<span class="pl-empty">No devices placed on this floor yet.</span>';
+    return '<div class="fp-entities">'
+      + '<div class="op-headr">DEVICES ON PLAN <span class="op-hint">add a device, then drag its pin on the plan \u00b7 tap a pin to open its controls</span></div>'
+      + '<div class="pl-add"><input id="fp-ent-input" list="fp-ent-list" class="op-field pl-input" placeholder="type to find an entity\u2026" autocomplete="off"><datalist id="fp-ent-list">' + this._allEntityDatalist() + '</datalist><button class="ctrl" id="ent-add">+ Add</button></div>'
+      + '<div class="pl-chips">' + chips + '</div>'
+      + '<div class="op-headr" style="margin-top:10px;">IMPORTED PLAN <span class="op-hint">' + (hasBg ? 'opacity of the uploaded floor-plan image behind the rooms' : 'upload a floor-plan image above, then set its opacity here') + '</span></div>'
+      + '<label class="cam-lbl">opacity <input id="fp-bg-op" type="range" min="0" max="1" step="0.05" value="' + _op + '"> <span id="fp-bg-op-val">' + Math.round(_op * 100) + '%</span></label>'
+      + '</div>';
+  }
+  _mediaPlayerOptions(selected) {
+    const states = this._hass?.states || {};
+    const eids = Object.keys(states).filter(e => e.startsWith('media_player.')).sort();
+    if (selected && !eids.includes(selected)) eids.unshift(selected);
+    const opts = eids.map(e => {
+      const st = states[e];
+      const fn = (st && st.attributes && st.attributes.friendly_name) || e;
+      return '<option value="' + this._esc(e) + '"' + (e === selected ? ' selected' : '') + '>' + this._esc(fn) + '</option>';
+    }).join('');
+    return '<option value="">\u2014 none \u2014</option>' + opts;
+  }
+  _renderModeBindings(d) {
+    const areas = d.areasGrid || [];
+    const labAreas = Array.isArray(d.config?.lab_areas) ? d.config.lab_areas : [];
+    const movieArea = d.config?.movie_area || '';
+    const chips = areas.length
+      ? areas.map(a => '<button class="area-chip ' + (labAreas.includes(a.id) ? 'on' : '') + '" data-lab-area="' + this._esc(a.id) + '">' + this._esc(a.name) + '</button>').join('')
+      : '<span class="mode-bind-empty">No rooms detected yet.</span>';
+    const areaOpts = '<option value="">\u2014 none \u2014</option>' +
+      areas.map(a => '<option value="' + this._esc(a.id) + '"' + (a.id === movieArea ? ' selected' : '') + '>' + this._esc(a.name) + '</option>').join('');
+    return '<div class="mode-bindings">' +
+      '<div class="mode-bind-head">MODE BINDINGS \u00b7 scope Lab &amp; Movie to specific rooms</div>' +
+      '<div class="mode-bind-row"><label>Lab rooms <span class="mode-bind-sub">quiet only here</span></label><div class="area-chips" id="lab-area-chips">' + chips + '</div></div>' +
+      '<div class="mode-bind-row"><label>Movie room</label><select class="cfg-field" data-cfg-key="movie_area">' + areaOpts + '</select></div>' +
+      '<div class="mode-bind-row"><label>Movie player <span class="mode-bind-sub">optional</span></label><select class="cfg-field" data-cfg-key="movie_media_player">' + this._mediaPlayerOptions(d.config?.movie_media_player || '') + '</select></div>' +
+      '<div class="mode-bind-row"><label>Movie dim %</label><input class="cfg-field cfg-num" type="number" min="0" max="100" step="5" data-cfg-key="movie_dim_pct" value="' + this._esc((d.config?.movie_dim_pct ?? '')) + '" placeholder="15"></div>' +
+      '</div>';
+  }
+
+  _renderRoutineLearning(d) {
+    const doorsOn = !!(d.config && d.config.pattern_learn_doors);
+    const presOn = !!(d.config && d.config.pattern_learn_presence);
+    const btnsOn = !!(d.config && d.config.pattern_learn_buttons);
+    const garageOn = !!(d.config && d.config.suggest_garage_confirmation);
+    let incl = (d.config && d.config.pattern_include_entities) || [];
+    if (!Array.isArray(incl)) { try { incl = JSON.parse(incl) || []; } catch (_) { incl = []; } }
+    const chips = incl.length
+      ? incl.map((e, i) => `<span class="pl-chip">${this._esc(e)}<button class="pl-del" data-i="${i}" title="Remove">\u00d7</button></span>`).join('')
+      : '<span class="pl-empty">No specific entities added.</span>';
+    return `
+      <div class="panel">
+        <div class="head"><span>Routine Learning</span><span class="side">PATTERNS</span></div>
+        <div class="appliance-intro">JARVIS learns routines from device activity (lights, locks, thermostats\u2026) and skips noisy door/window and presence signals by default. Opt them in to build routines from them \u2014 for example, closing a garage door once a car is parked in its bay.</div>
+        <div class="toggle-list">
+          <div class="toggle-row">
+            <span class="toggle-label">Learn doors &amp; windows</span>
+            <span class="toggle-desc">Door, window and garage contact sensors</span>
+            <button class="toggle-btn ${doorsOn ? 'on' : 'off'}" data-cfg-key="pattern_learn_doors" data-cfg-val="${doorsOn ? 'false' : 'true'}">${doorsOn ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Learn presence &amp; arrivals</span>
+            <span class="toggle-desc">People and device trackers (home / away)</span>
+            <button class="toggle-btn ${presOn ? 'on' : 'off'}" data-cfg-key="pattern_learn_presence" data-cfg-val="${presOn ? 'false' : 'true'}">${presOn ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Learn button &amp; remote presses</span>
+            <span class="toggle-desc">Suggest "press &rarr; scene / action" automations</span>
+            <button class="toggle-btn ${btnsOn ? 'on' : 'off'}" data-cfg-key="pattern_learn_buttons" data-cfg-val="${btnsOn ? 'false' : 'true'}">${btnsOn ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">&#9888; Confirmed garage/cover sequences</span>
+            <span class="toggle-desc">Safety-sensitive: suggest "arrive &rarr; open, confirm, then close a cover" routines. Off by default; you still approve each one.</span>
+            <button class="toggle-btn ${garageOn ? 'on' : 'off'}" data-cfg-key="suggest_garage_confirmation" data-cfg-val="${garageOn ? 'false' : 'true'}" data-confirm="This lets JARVIS SUGGEST automations that close a garage door or cover automatically once a confirmation sensor fires. Nothing installs without your explicit approval, and each suggestion is flagged safety-sensitive. Enable these suggestions?">${garageOn ? 'ON' : 'OFF'}</button>
+          </div>
+        </div>
+        <div class="pl-entities">
+          <div class="pl-ehead">Also learn specific entities <span class="pl-hint">for a skipped-domain entity you want as a routine trigger \u2014 e.g. a bay occupancy sensor</span></div>
+          <div class="pl-add"><input id="pl-entity-input" list="pl-entity-list" class="op-field pl-input" placeholder="type to find an entity\u2026" autocomplete="off"><datalist id="pl-entity-list">${this._optInEntityDatalist()}</datalist><button class="ctrl" id="pl-add-entity">+ Add</button></div>
+          <div class="pl-chips" id="pl-chips">${chips}</div>
+        </div>
+      </div>
+`;
+  }
+
+  _renderOpenings(floor) {
+    const els = this._elemsFor(floor), uL = this._fpUnitLabel();
+    const rooms = ((this._getEditingPlan()[floor] || {}).rooms) || [];
+    const anchorRooms = rooms.filter(r => r.type !== 'outdoor' && r.type !== 'stairs' && r.type !== 'door');
+    const rsel = (e, i) => '<select class="op-field op-room" data-op="room" data-i="' + i + '" title="building/room whose wall holds this opening"><option value="">\u2014 footprint \u2014</option>' + anchorRooms.map(r => '<option value="' + this._esc(r.name) + '"' + (e.room === r.name ? ' selected' : '') + '>' + this._esc(r.name) + '</option>').join('') + '</select>';
+    // Wall-edge picker: one option per edge of the anchor (room polygon or the
+    // footprint rectangle). Labels show the outward direction so notch walls of
+    // an L-shape and detached buildings are distinguishable.
+    const esel = (e, i) => {
+      const pts = this._anchorPts(rooms, e);
+      if (!pts || pts.length < 2) return '';
+      const sel = (Number.isInteger(e.edge) && e.edge >= 0 && e.edge < pts.length) ? e.edge : this._edgeForWall(pts, e.wall || 'front');
+      const winding = this._polyWinding(pts), rect = pts.length === 4;
+      const AR = ['\u2192', '\u2198', '\u2193', '\u2199', '\u2190', '\u2196', '\u2191', '\u2197'];
+      const nm = ['Front', 'Right', 'Back', 'Left'];
+      let o = '';
+      for (let k = 0; k < pts.length; k++) {
+        const n = this._edgeNormal(pts, k, winding);
+        const ar = AR[((Math.round(Math.atan2(n.ny, n.nx) / (Math.PI / 4))) % 8 + 8) % 8];
+        o += '<option value="' + k + '"' + (k === sel ? ' selected' : '') + '>' + (rect ? nm[k] : 'Wall ' + (k + 1)) + ' ' + ar + '</option>';
+      }
+      return '<select class="op-field" data-op="edge" data-i="' + i + '" title="which wall edge (drag the marker on the plan to pick)">' + o + '</select>';
+    };
+    const rows = els.map((e, i) => {
+      const isD = e.type === 'dormer';
+      const t = isD ? (e.slope === 'rear' ? 'REAR DORMER' : 'FRONT DORMER')
+        : (e.type === 'window' ? (e.kind === 'interior' ? 'INT WINDOW' : 'WINDOW')
+        : (e.kind === 'interior' ? 'INT DOOR' : (e.kind === 'cellar' ? 'CELLAR'
+        : (e.kind === 'cased' ? 'CASED OPENING' : (e.kind === 'french' ? 'BALCONY DOOR' : 'EXT DOOR')))));
+      // Every opening can anchor to any building/room's wall — pick the room
+      // (or leave it on the whole footprint), then the edge — or just drag the
+      // marker on the plan and it snaps to the nearest wall.
+      const place = isD
+        ? ('<select class="op-field" data-op="slope" data-i="' + i + '" title="roof slope"><option value="front"' + (e.slope !== 'rear' ? ' selected' : '') + '>Front slope</option><option value="rear"' + (e.slope === 'rear' ? ' selected' : '') + '>Rear slope</option></select>')
+        : (rsel(e, i) + ' ' + esel(e, i));
+      const kc = isD ? ' op-dormer' : (e.kind === 'interior' ? ' op-int' : (e.kind === 'cellar' ? ' op-cellar' : (e.kind === 'cased' ? ' op-cased' : '')));
+      return '<div class="op-row" data-i="' + i + '">'
+        + '<span class="op-type op-' + this._esc((isD ? 'dormer' : e.type)) + kc + '">' + t + '</span>'
+        + place
+        + ' <input class="op-field op-pos" data-op="pos" data-i="' + i + '" type="range" min="0" max="1" step="0.02" value="' + this._esc((e.pos != null ? e.pos : 0.5)) + '" title="position along the wall">'
+        + (isD ? '' : ' <input class="op-field" data-op="w" data-i="' + i + '" type="number" min="1" step="0.5" value="' + this._fpToReal(e.w || 20) + '" style="width:46px"> ' + uL)
+        + (e.kind === 'cased' ? ' <span class="op-cased-tag">open passage \u00b7 no sensor</span>' : ' <select class="op-field op-ent" data-op="entity" data-i="' + i + '" title="open/closed sensor">' + this._doorEntityOptions(e.entity || '') + '</select>')
+        + ' <button class="op-del" data-i="' + i + '" title="Remove">\u00d7</button>'
+        + '</div>';
+    }).join('');
+    const dBtns = floor === '2f' ? '<button class="ctrl" id="op-add-fdormer">+ Front Dormer</button><button class="ctrl" id="op-add-rdormer">+ Rear Dormer</button>' : '';
+    return '<div class="fp-openings">'
+      + '<div class="op-headr">OPENINGS \u00b7 windows, doors &amp; dormers <span class="op-hint">drag a marker on the plan and it snaps onto the nearest wall \u2014 incl. L-room notch walls and detached buildings \u00b7 or pick the room + wall edge below \u00b7 a balcony door is full-height glass \u00b7 a cased opening is a doorway with no door \u00b7 dormers on the 2nd floor</span></div>'
+      + '<div class="op-add"><button class="ctrl" id="op-add-window">+ Window</button><button class="ctrl" id="op-add-intwindow">+ Interior Window</button><button class="ctrl" id="op-add-extdoor">+ Exterior Door</button><button class="ctrl" id="op-add-frenchdoor">+ Balcony Door</button><button class="ctrl" id="op-add-cellar">+ Cellar Door</button><button class="ctrl" id="op-add-intdoor">+ Interior Door</button><button class="ctrl" id="op-add-cased">+ Cased Opening</button>' + dBtns + '</div>'
+      + (rows || '<div class="op-empty">No openings placed on this floor yet \u2014 add one above.</div>')
+      + '</div>';
+  }
+
+  _renderEditableSVG(plan, floor) {
+    const floorData = plan[floor];
+    if (!floorData) return '';
+    // Auto-fit the viewBox to the actual rooms (+ padding for edge window markers
+    // and protruding dormers) so larger properties and edge elements aren't
+    // clipped (v7.94.0). Drag uses getScreenCTM so it adapts to any viewBox.
+    let vb = floorData.viewBox || '0 0 320 140';
+    const _rms = floorData.rooms || [];
+    if (_rms.length) {
+      let ax0 = Infinity, ay0 = Infinity, ax1 = -Infinity, ay1 = -Infinity;
+      _rms.forEach(r => {
+        ax0 = Math.min(ax0, r.x); ay0 = Math.min(ay0, r.y);
+        ax1 = Math.max(ax1, r.x + (r.w || 0)); ay1 = Math.max(ay1, r.y + (r.h || r.d || 0));
+      });
+      let _pp = []; try { _pp = this._propertyPts() || []; } catch (_) { _pp = []; }
+      _pp.forEach(p => { ax0 = Math.min(ax0, p[0]); ay0 = Math.min(ay0, p[1]); ax1 = Math.max(ax1, p[0]); ay1 = Math.max(ay1, p[1]); });
+      if (isFinite(ax0) && isFinite(ax1)) {
+        // With a property boundary, the lot IS the workspace — frame it tightly so the
+        // whole property (front/back/sides) is visible and zones drop anywhere on it.
+        // Without one, keep a generous margin around the house to place zones.
+        const pad = Math.max(120, Math.max(ax1 - ax0, ay1 - ay0) * 0.25);
+        ax0 -= pad; ay0 -= pad; ax1 += pad; ay1 += pad;
+        vb = ax0.toFixed(0) + ' ' + ay0.toFixed(0) + ' ' +
+             Math.max(ax1 - ax0, 200).toFixed(0) + ' ' + Math.max(ay1 - ay0, 140).toFixed(0);
+      }
+    }
+
+    if (this._editVB) { const _v = this._editVB; vb = _v.x + ' ' + _v.y + ' ' + _v.w + ' ' + _v.h; }   // user zoom/pan overrides auto-fit
+    let svg = '<svg viewBox="' + this._esc(vb) + '" class="fp-svg fp-editor-svg" id="fp-editor-svg" style="width:100%;height:100%;min-height:760px;background:rgba(0,5,10,0.9);border:1px solid var(--line);border-radius:var(--radius);cursor:crosshair;">';
+
+    // Grid — 10px with 50px major lines
+    svg += '<defs>';
+    svg += '<pattern id="fp-grid-sm" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M 10 0 L 0 0 0 10" fill="none" stroke="rgba(0,242,254,0.04)" stroke-width="0.2"/></pattern>';
+    svg += '<pattern id="fp-grid-lg" width="50" height="50" patternUnits="userSpaceOnUse"><path d="M 50 0 L 0 0 0 50" fill="none" stroke="rgba(0,242,254,0.1)" stroke-width="0.3"/></pattern>';
+    svg += '</defs>';
+    // Grid spans the ACTUAL viewBox (negative coords included) so the front yard and
+    // the yard beside the garage — which live at x<0 / y<0 — are on the grid too.
+    const _vbp = vb.split(' ').map(Number);
+    const _gx = _vbp[0], _gy = _vbp[1], _gw = _vbp[2], _gh = _vbp[3];
+    svg += '<rect class="fp-grid-rect" x="' + this._esc(_gx) + '" y="' + this._esc(_gy) + '" width="' + this._esc(_gw) + '" height="' + this._esc(_gh) + '" fill="url(#fp-grid-sm)"/>';
+    svg += '<rect class="fp-grid-rect" x="' + this._esc(_gx) + '" y="' + this._esc(_gy) + '" width="' + this._esc(_gw) + '" height="' + this._esc(_gh) + '" fill="url(#fp-grid-lg)"/>';
+
+    // Axis labels across the whole viewBox
+    for (let x = Math.ceil(_gx / 50) * 50; x < _gx + _gw; x += 50) {
+      svg += '<text x="' + x + '" y="' + this._esc((_gy + 8)) + '" fill="rgba(0,242,254,0.15)" font-size="3" font-family="JetBrains Mono">' + x + '</text>';
+    }
+    for (let y = Math.ceil(_gy / 50) * 50; y < _gy + _gh; y += 50) {
+      svg += '<text x="' + this._esc((_gx + 2)) + '" y="' + y + '" fill="rgba(0,242,254,0.15)" font-size="3" font-family="JetBrains Mono">' + y + '</text>';
+    }
+
+    // Background image
+    const bgs = this._data().config?.floor_plan_bg;
+    if (bgs) {
+      try {
+        const bgData = typeof bgs === 'string' ? JSON.parse(bgs) : bgs;
+        if (bgData[floor]) {
+          let _bgOp = parseFloat(this._data().config?.floor_plan_bg_opacity);
+          if (!(isFinite(_bgOp) && _bgOp >= 0 && _bgOp <= 1)) _bgOp = 0.2;
+          svg += '<image href="' + this._esc(bgData[floor]) + '" x="0" y="0" width="100%" height="100%" opacity="' + _bgOp + '" preserveAspectRatio="xMidYMid meet"/>';
+        }
+      } catch (_) {}
+    }
+
+    // Property boundary (the lot) — draw behind rooms; vertices are draggable.
+    var _prop = [];
+    try { _prop = this._propertyPts() || []; } catch (_) { _prop = []; }
+    if (_prop.length >= 2) {
+      var _ppath = _prop.map(function (p, k) { return (k ? 'L' : 'M') + p[0] + ' ' + p[1]; }).join(' ') + ' Z';
+      svg += '<path class="fp-prop-path" d="' + this._esc(_ppath) + '" fill="rgba(255,180,90,0.03)" stroke="#ffb85a" stroke-width="1" stroke-dasharray="6 4" pointer-events="none"/>';
+      for (var _vi = 0; _vi < _prop.length; _vi++) {
+        var _a = _prop[_vi], _b = _prop[(_vi + 1) % _prop.length];
+        svg += '<circle class="fp-prop-mid" data-prop-edge="' + _vi + '" cx="' + ((_a[0] + _b[0]) / 2) + '" cy="' + ((_a[1] + _b[1]) / 2) + '" r="2.2" fill="none" stroke="#ffb85a" stroke-width="0.7" opacity="0.5" style="cursor:copy"/>';
+      }
+      for (var _pi = 0; _pi < _prop.length; _pi++) {
+        svg += '<circle class="fp-prop-vtx" data-prop-vtx="' + _pi + '" cx="' + this._esc(_prop[_pi][0]) + '" cy="' + this._esc(_prop[_pi][1]) + '" r="3" fill="#ffb85a" stroke="#0a0a0a" stroke-width="0.7" style="cursor:grab"/>';
+      }
+    }
+
+    // Ghost of the floor directly below — a red footprint reference so this floor's
+    // rooms can be kept within it (v7.94.0). Enclosed rooms only (not outdoor zones).
+    var _below = this._floorBelow(floor), _belowRooms = [];
+    if (_below) { try { _belowRooms = ((this._getEditingPlan()[_below] || {}).rooms || []).filter(function (r) { return r.type !== 'outdoor'; }); } catch (_) { _belowRooms = []; } }
+    if (_belowRooms.length) {
+      var _gbx = 1e9, _gby = 1e9;
+      _belowRooms.forEach(function (r) {
+        var gp = (r.points && r.points.length >= 3) ? r.points : [[r.x, r.y], [r.x + r.w, r.y], [r.x + r.w, r.y + r.h], [r.x, r.y + r.h]];
+        gp.forEach(function (p) { if (p[0] < _gbx) _gbx = p[0]; if (p[1] < _gby) _gby = p[1]; });
+        svg += '<path d="' + gp.map(function (p, k) { return (k ? 'L' : 'M') + Number(p[0]) + ' ' + Number(p[1]); }).join(' ') + ' Z" fill="none" stroke="rgba(255,90,90,0.45)" stroke-width="1" stroke-dasharray="4 3" pointer-events="none"/>';
+      });
+      svg += '<text x="' + _gbx.toFixed(1) + '" y="' + (_gby - 3).toFixed(1) + '" fill="rgba(255,120,120,0.85)" font-size="5" font-family="JetBrains Mono, monospace" pointer-events="none">\u2193 ' + this._esc(_below.toUpperCase()) + ' BELOW (stay within)</text>';
+    }
+
+    // Rooms
+    for (let i = 0; i < (floorData.rooms || []).length; i++) {
+      const rm = floorData.rooms[i];
+      const colors = {room:'#00f2fe',bath:'#567685',stairs:'#0a7d94',door:'#ff9d2e',outdoor:'#00f5a0'};
+      const c = colors[rm.type] || '#00f2fe';
+      const _out = rm.type === 'outdoor';
+      const fs = rm.w > 80 ? 7 : (rm.w > 50 ? 5.5 : (rm.w > 25 ? 4 : 3));
+      if (_out || (rm.points && rm.points.length >= 3)) {
+        const _zpts = this._zonePoints(rm);
+        let _zcx = 0, _zcy = 0; _zpts.forEach(p => { _zcx += p[0]; _zcy += p[1]; }); _zcx /= _zpts.length; _zcy /= _zpts.length;
+        svg += '<g class="fp-zone" data-zone-idx="' + i + '">';
+        svg += '<path class="fp-zone-path" data-zone-idx="' + i + '" d="' + this._propPathD(_zpts) + '" fill="' + c + '" fill-opacity="0.06" stroke="' + c + '" stroke-width="1"' + (_out ? ' stroke-dasharray="4 3"' : '') + ' style="cursor:move"/>';
+        svg += '<text x="' + _zcx.toFixed(1) + '" y="' + _zcy.toFixed(1) + '" text-anchor="middle" fill="' + c + '" font-size="' + fs + '" font-family="Orbitron, monospace" letter-spacing="0.3" pointer-events="none">' + this._esc(rm.name.toUpperCase()) + '</text>';
+        for (let _vi = 0; _vi < _zpts.length; _vi++) { const _a = _zpts[_vi], _b = _zpts[(_vi + 1) % _zpts.length]; svg += '<circle class="fp-zone-mid" data-zone-idx="' + i + '" data-edge="' + _vi + '" cx="' + ((_a[0] + _b[0]) / 2) + '" cy="' + ((_a[1] + _b[1]) / 2) + '" r="2" fill="none" stroke="' + c + '" stroke-width="0.6" opacity="0.5" style="cursor:copy"/>'; }
+        for (let _vi = 0; _vi < _zpts.length; _vi++) { svg += '<circle class="fp-zone-vtx" data-zone-idx="' + i + '" data-vtx="' + _vi + '" cx="' + this._esc(_zpts[_vi][0]) + '" cy="' + this._esc(_zpts[_vi][1]) + '" r="2.8" fill="' + c + '" stroke="#0a0a0a" stroke-width="0.6" style="cursor:grab"/>'; }
+        svg += '</g>';
+      } else {
+      svg += '<g class="fp-drag-room" data-idx="' + i + '" style="cursor:move">';
+      svg += '<rect x="' + this._esc(rm.x) + '" y="' + this._esc(rm.y) + '" width="' + this._esc(rm.w) + '" height="' + this._esc(rm.h) + '" rx="2" fill="' + (_out ? 'rgba(0,245,160,0.04)' : 'rgba(0,242,254,0.06)') + '" stroke="' + c + '" stroke-width="1"' + (_out ? ' stroke-dasharray="4 3"' : '') + ' class="fp-drag-rect"/>';
+      svg += '<text x="' + this._esc((rm.x + rm.w/2)) + '" y="' + this._esc((rm.y + rm.h/2 + 2)) + '" text-anchor="middle" fill="' + c + '" font-size="' + fs + '" font-family="Orbitron, monospace" letter-spacing="0.3" pointer-events="none">' + this._esc(rm.name.toUpperCase()) + '</text>';
+      if (rm.w > 30 && rm.h > 24) svg += '<text x="' + this._esc((rm.x + rm.w/2)) + '" y="' + this._esc((rm.y + rm.h/2 + fs + 2.5)) + '" text-anchor="middle" fill="' + c + '" opacity="0.6" font-size="' + (fs*0.72).toFixed(1) + '" font-family="JetBrains Mono, monospace" pointer-events="none">' + this._fpDim(rm.w) + ' \u00d7 ' + this._fpDim(rm.h) + '</text>';
+      svg += '<rect x="' + this._esc((rm.x + rm.w - 8)) + '" y="' + this._esc((rm.y + rm.h - 8)) + '" width="8" height="8" fill="' + c + '" opacity="0.3" rx="1" class="fp-resize-handle" data-idx="' + i + '" style="cursor:nwse-resize"/>';
+      svg += '</g>';
+      }
+    }
+
+    // Labels
+    for (const lbl of (floorData.labels || [])) {
+      svg += '<text x="' + this._esc(lbl.x) + '" y="' + this._esc(lbl.y) + '" text-anchor="middle" fill="#1a3040" font-size="4" font-family="JetBrains Mono, monospace">' + this._esc(lbl.text) + '</text>';
+    }
+
+    // placed openings as wall markers (v7.94.0) — edge-anchored + draggable:
+    // drag a marker and it snaps onto the nearest room edge, so openings land
+    // on L-room notch walls and detached buildings, not just the bbox sides.
+    var _els = (this._getEditingElements()[floor]) || [];
+    if (_els.length && floorData.rooms && floorData.rooms.length) {
+      var mnx = 1e9, mny = 1e9, mxx = -1e9, mxy = -1e9;
+      floorData.rooms.forEach(function (r) { if (r.type === 'outdoor') return; mnx = Math.min(mnx, r.x); mny = Math.min(mny, r.y); mxx = Math.max(mxx, r.x + r.w); mxy = Math.max(mxy, r.y + r.h); });
+      _els.forEach((e, i) => {
+        if (e.type === 'dormer') {
+          var dp = e.pos != null ? e.pos : 0.5, dcx = mnx + dp * (mxx - mnx), dcy = e.slope === 'rear' ? mxy : mny;
+          svg += '<rect class="op-marker" data-op-marker="' + i + '" x="' + (dcx - 4) + '" y="' + (dcy - 3) + '" width="8" height="6" fill="#b06aff" opacity="0.9" rx="1.5" pointer-events="none"/>';
+          return;
+        }
+        var a = this._openingAnchorRooms(floorData.rooms, e);
+        if (!a) return;
+        var w = e.w || 20;
+        var col = e.type === 'window' ? '#00f2fe' : (e.kind === 'interior' ? '#5a7a8a' : (e.kind === 'cellar' ? '#c98a2a' : (e.kind === 'cased' ? '#78b9d7' : (e.kind === 'french' ? '#4fd4e0' : '#ffaa28'))));
+        var deg = Math.atan2(a.uy, a.ux) * 180 / Math.PI;
+        svg += '<g class="fp-op" data-op-i="' + i + '" transform="translate(' + a.x.toFixed(1) + ' ' + a.y.toFixed(1) + ') rotate(' + deg.toFixed(1) + ')" style="cursor:grab">'
+          + '<rect class="op-marker" data-op-marker="' + i + '" x="' + (-w / 2) + '" y="-2" width="' + this._esc(w) + '" height="4" fill="' + col + '" opacity="0.9" rx="1"/>'
+          + '<rect x="' + (-w / 2 - 2) + '" y="-5" width="' + this._esc((w + 4)) + '" height="10" fill="#000" fill-opacity="0"/>'
+          + '</g>';
+      });
+    }
+
+    // Cameras — icon + FOV cone, clipped to walls (bleeds through openings).
+    var _cams = [];
+    try { _cams = this._camsFor(floor) || []; } catch (_) { _cams = []; }
+    var _camGeo = _cams.length ? this._planGeometry(floor) : null;
+    for (var _ci = 0; _ci < _cams.length; _ci++) {
+      var _cam = _cams[_ci], _out = _cam.indoor === false;
+      svg += '<g class="fp-cam" data-cam-idx="' + _ci + '">'
+        + '<path class="fp-cam-cone" d="' + this._clippedCone(_cam, _camGeo) + '" fill="' + (_out ? 'rgba(255,170,60,0.10)' : 'rgba(255,80,80,0.10)') + '" stroke="' + (_out ? 'rgba(255,185,90,0.6)' : 'rgba(255,110,110,0.6)') + '" stroke-width="0.7" pointer-events="none"/>'
+        + '<circle class="fp-cam-dot" cx="' + this._esc(_cam.x) + '" cy="' + this._esc(_cam.y) + '" r="3.2" fill="' + (_out ? '#ffaa3c' : '#ff5a5a') + '" stroke="#fff" stroke-width="0.7" style="cursor:grab"/>'
+        + '<text x="' + this._esc(_cam.x) + '" y="' + (_cam.y - 5) + '" text-anchor="middle" fill="' + (_out ? '#ffaa3c' : '#ff7a7a') + '" font-size="5" font-family="JetBrains Mono, monospace" pointer-events="none">' + (_ci + 1) + '</text>'
+        + '</g>';
+    }
+
+    // Placed device pins — live state; drag to move, tap to control (v7.94.0).
+    var _ents = [];
+    try { _ents = this._entsFor(floor) || []; } catch (_) { _ents = []; }
+    for (var _ei = 0; _ei < _ents.length; _ei++) {
+      var _ent = _ents[_ei];
+      if (!_ent || !_ent.e) continue;
+      var _ms = this._entMarkerStyle(_ent.e);
+      var _nm = _ms.name.length > 16 ? (_ms.name.slice(0, 15) + '\u2026') : _ms.name;
+      svg += '<g class="fp-ent" data-ent-idx="' + _ei + '" data-ent-id="' + this._esc(_ent.e) + '" style="cursor:pointer">'
+        + '<circle class="fp-ent-dot" cx="' + this._esc(_ent.x) + '" cy="' + this._esc(_ent.y) + '" r="3" fill="' + this._esc(_ms.color) + '" stroke="#0a0a0a" stroke-width="0.7"/>'
+        + '<text class="fp-ent-nm" x="' + this._esc(_ent.x) + '" y="' + (_ent.y - 4) + '" text-anchor="middle" fill="' + this._esc(_ms.color) + '" font-size="3.4" font-family="JetBrains Mono, monospace" pointer-events="none">' + this._esc(_nm) + '</text>'
+        + '<text class="fp-ent-val" x="' + this._esc(_ent.x) + '" y="' + this._esc((_ent.y + 6.5)) + '" text-anchor="middle" fill="#9fb3c0" font-size="3" font-family="JetBrains Mono, monospace" pointer-events="none">' + this._esc(_ms.val) + '</text>'
+        + '</g>';
+    }
+
+    svg += '</svg>';
+    return svg;
+  }
+
+
+
+  _renderOnboarding(d) {
+    const ob = d.onboarding;
+    if (!ob || !ob.show) return '';
+    const steps = ob.steps || [];
+    const rows = steps.map(s => `
+      <div class="ob-step ${s.done ? 'ob-done' : ''}">
+        <span class="ob-check">${s.done ? '✓' : '○'}</span>
+        <div class="ob-step-text">
+          <div class="ob-step-label">${this._esc(s.label)}</div>
+          <div class="ob-step-hint">${this._esc(s.hint)}</div>
+        </div>
+        ${s.jump ? `<button class="ob-step-go" data-ob-jump="${this._esc(s.jump)}" title="Go to this setting">→</button>` : ''}
+      </div>`).join('');
+    return `
+      <div class="onboarding-card">
+        <div class="ob-head">
+          <div class="ob-title">Welcome — let's get JARVIS working for you</div>
+          <button class="ob-dismiss" id="ob-dismiss" title="Dismiss">✕</button>
+        </div>
+        <div class="ob-sub">JARVIS is installed and its brain is online. A few quick steps unlock the rest — none are required, and you can talk to it right now.</div>
+        <div class="ob-progress"><span>${this._esc(ob.done_count)}/${this._esc(ob.total)} done</span><i style="width:${Math.round((ob.done_count/ob.total)*100)}%"></i></div>
+        <div class="ob-steps">${rows}</div>
+        <div class="ob-actions">
+          <button class="ob-go" data-tab-jump="settings">Open Settings →</button>
+          <span class="ob-tip">Tip: try asking JARVIS <em>"what's the weather"</em> or <em>"is anything open in the house?"</em></span>
+        </div>
+      </div>`;
+  }
+
+  _html() {
+    const d = this._data();
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2,"0");
+    const mm = String(now.getMinutes()).padStart(2,"0");
+    const ss = String(now.getSeconds()).padStart(2,"0");
+    const days = ["SUN","MON","TUE","WED","THU","FRI","SAT"];
+    const mons = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+
+    const statusRow = (key, stateObj) => `
+      <div class="status-row ${this._esc(stateObj.level)}">
+        <span class="k"><span class="dot ${this._esc(stateObj.level)}"></span>${key}</span>
+        <span class="v">${this._esc(stateObj.state)}</span>
+      </div>`;
+
+    // Capability icons + labels — option C: icons above text codes
+    const CAP_ICONS = {
+      sat:    '<svg viewBox="0 0 24 24"><path d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M19,11C19,14.53 16.39,17.44 13,17.93V21H11V17.93C7.61,17.44 5,14.53 5,11H7A5,5 0 0,0 12,16A5,5 0 0,0 17,11H19Z"/></svg>',
+      spkr:   '<svg viewBox="0 0 24 24"><path d="M14,3.23V5.29C16.89,6.15 19,8.83 19,12C19,15.17 16.89,17.84 14,18.7V20.77C18,19.86 21,16.28 21,12C21,7.72 18,4.14 14,3.23M16.5,12C16.5,10.23 15.5,8.71 14,7.97V16C15.5,15.29 16.5,13.76 16.5,12M3,9V15H7L12,20V4L7,9H3Z"/></svg>',
+      mmwave: '<svg viewBox="0 0 24 24"><path d="M5,17L9.5,12.5L13.5,16.5L17,13L21,17L19.59,18.41L17,15.83L13.5,19.33L9.5,15.33L5,19.83L3.59,18.41L5,17M5,10.5L9.5,6L13.5,10L17,6.5L21,10.5L19.59,11.91L17,9.33L13.5,12.83L9.5,8.83L5,13.33L3.59,11.91L5,10.5Z"/></svg>',
+      cam:    '<svg viewBox="0 0 24 24"><path d="M17,10.5V7A1,1 0 0,0 16,6H4A1,1 0 0,0 3,7V17A1,1 0 0,0 4,18H16A1,1 0 0,0 17,17V13.5L21,17.5V6.5L17,10.5Z"/></svg>',
+      light:  '<svg viewBox="0 0 24 24"><path d="M12,2A7,7 0 0,0 5,9C5,11.38 6.19,13.47 8,14.74V17A1,1 0 0,0 9,18H15A1,1 0 0,0 16,17V14.74C17.81,13.47 19,11.38 19,9A7,7 0 0,0 12,2M9,21A1,1 0 0,0 10,22H14A1,1 0 0,0 15,21V20H9V21Z"/></svg>',
+      switch: '<svg viewBox="0 0 24 24"><path d="M17,7H7A5,5 0 0,0 2,12A5,5 0 0,0 7,17H17A5,5 0 0,0 22,12A5,5 0 0,0 17,7M17,15A3,3 0 0,1 14,12A3,3 0 0,1 17,9A3,3 0 0,1 20,12A3,3 0 0,1 17,15Z"/></svg>',
+      lock:   '<svg viewBox="0 0 24 24"><path d="M12,17A2,2 0 0,0 14,15C14,13.89 13.1,13 12,13A2,2 0 0,0 10,15A2,2 0 0,0 12,17M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10C4,8.89 4.9,8 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z"/></svg>',
+      climate:'<svg viewBox="0 0 24 24"><path d="M15,13V5A3,3 0 0,0 12,2A3,3 0 0,0 9,5V13A5,5 0 1,0 15,13M12,4A1,1 0 0,1 13,5V8H11V5A1,1 0 0,1 12,4Z"/></svg>',
+      door:   '<svg viewBox="0 0 24 24"><path d="M12,3V6H7V18H12V21H19V3H12M17,19H13V18H15V6H13V5H17V19Z"/></svg>',
+      leak:   '<svg viewBox="0 0 24 24"><path d="M12,20A6,6 0 0,1 6,14C6,10 12,3.25 12,3.25C12,3.25 18,10 18,14A6,6 0 0,1 12,20Z"/></svg>',
+      alarm:  '<svg viewBox="0 0 24 24"><path d="M21,19V20H3V19L5,17V11C5,7.9 7.03,5.17 10,4.29C10,4.2 10,4.1 10,4A2,2 0 0,1 12,2A2,2 0 0,1 14,4C14,4.1 14,4.2 14,4.29C16.97,5.17 19,7.9 19,11V17L21,19M14,21A2,2 0 0,1 12,23A2,2 0 0,1 10,21"/></svg>',
+    };
+    const capLabel = (c) => c.toUpperCase();
+    const capIcon  = (c) => CAP_ICONS[c] || '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/></svg>';
+
+    const areaTile = (a) => {
+      const caps = a.caps || [];
+      const iconsRow = caps.length
+        ? `<div class="area-caps">
+             ${caps.slice(0, 5).map(c => `
+               <div class="cap" title="${this._esc(capLabel(c))}">
+                 <span class="cap-icon">${capIcon(c)}</span>
+                 <span class="cap-lbl">${this._esc(capLabel(c))}</span>
+               </div>
+             `).join("")}
+           </div>`
+        : `<div class="area-caps"><div class="cap cap-empty"><span class="cap-lbl">—</span></div></div>`;
+      const hasLights = (a.lights_total || 0) > 0;
+      const lit = hasLights && (a.lights_on || 0) > 0;
+      const ctlOn = (this._liveData && this._liveData.config && this._liveData.config.light_control_enabled) !== false;
+      const lightCtl = hasLights
+        ? `<button class="area-light ${lit ? 'on' : ''} ${ctlOn ? '' : 'static'}" data-light-area="${this._esc(a.id || '')}" data-area-name="${this._esc(a.name)}" title="${this._esc(a.lights_on)}/${this._esc(a.lights_total)} lights on${ctlOn ? ' — tap to toggle' : ''}">
+             <span class="al-dot"></span>${lit ? 'ON' : 'OFF'}
+           </button>`
+        : '';
+      // v7.94.0: temp/humidity readout + sparkline, when the area has a sensor.
+      const spark = this._sparklines?.[a.id] || {};
+      const tempSpark = spark.temp ? this._sparklineSvg(spark.temp, 'var(--cyan-dim)') : '';
+      const humSpark = spark.humidity ? this._sparklineSvg(spark.humidity, 'var(--green)') : '';
+      const readingsRow = (a.temp || a.humidity) ? `
+        <div class="area-readings">
+          ${a.temp ? `<span class="area-reading">${this._esc(a.temp)}${tempSpark}</span>` : ''}
+          ${a.humidity ? `<span class="area-reading">${this._esc(a.humidity)}${humSpark}</span>` : ''}
+        </div>` : '';
+      return `
+        <div class="area ${a.active ? 'active' : ''} ${a.bedroom ? 'bedroom' : ''}" data-area-id="${this._esc(a.id || '')}" tabindex="0" role="button" aria-label="${this._esc(a.name)} details">
+          ${iconsRow}
+          ${readingsRow}
+          <div class="area-foot">
+            <div class="area-name" title="${this._esc(a.name)}">${this._esc(a.name)}</div>
+            ${lightCtl}
+          </div>
+        </div>`;
+    };
+
+    return `
+<div class="app">
+
+  <!-- MASTHEAD -->
+  <div class="masthead">
+    <button class="menu-btn" id="menu-btn" title="Menu" aria-label="Open sidebar">
+      <svg viewBox="0 0 24 24"><path d="M3,6H21V8H3V6M3,11H21V13H3V11M3,16H21V18H3V16Z"/></svg>
+    </button>
+    <div class="brand"><img class="brand-logo" src="/jarvis_panel_static/jarvis-logo.png" alt="" onerror="this.style.display='none'"/>J·A·R·V·I·S <span>// v${this._esc(this._liveData?.version || '—')}</span><span class="status-badge ${this._liveData?.lockdown?.active ? 'alert' : ''}">[ STATUS: ${this._liveData?.lockdown?.active ? 'LOCKDOWN' : 'NOMINAL'} ]</span></div>
+    <div class="greeting"><span id="greeting-text">${this._greeting()}</span>, <b>${this._esc(this._honorific())}</b></div>
+    <div class="masthead-right">
+      <div class="gsearch" id="gsearch">
+        <input id="gsearch-input" class="gsearch-input" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search entities & settings…" aria-label="Search entities and settings" />
+        <div class="gsearch-results" id="gsearch-results" role="listbox" hidden></div>
+      </div>
+      <div class="clock">
+        <div class="time" id="clock-time">${hh}:${mm}:${ss}</div>
+        <div class="date" id="clock-date">${days[now.getDay()]} · ${String(now.getDate()).padStart(2,"0")} · ${mons[now.getMonth()]} · ${now.getFullYear()}</div>
+      </div>
+      <button class="lockdown-toggle ${this._liveData?.lockdown?.active ? 'on' : ''}" id="lockdown-btn"
+        role="switch" aria-checked="${this._liveData?.lockdown?.active ? 'true' : 'false'}" aria-label="Lockdown"
+        title="${this._liveData?.lockdown?.active ? 'Lockdown engaged — tap to lift' : 'Tap to engage lockdown'}">
+        <span class="ld-switch" aria-hidden="true"><span class="ld-knob"></span></span>
+        <span class="ld-label">LOCKDOWN</span>
+        <span class="ld-state">${this._liveData?.lockdown?.active ? 'ARMED' : 'OFF'}</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- TAB NAV -->
+  <div class="tab-bar">
+    <button class="tab ${this._currentTab === 'dashboard' ? 'active' : ''}" data-tab="dashboard">Command Center</button>
+    <button class="tab ${this._currentTab === 'chat' ? 'active' : ''}" data-tab="chat">Chat</button>
+    <button class="tab ${this._currentTab === 'residence' ? 'active' : ''}" data-tab="residence">Residence</button>
+    <button class="tab ${this._currentTab === 'intrusion' ? 'active' : ''}" data-tab="intrusion">Intrusion</button>
+    <button class="tab ${this._currentTab === 'faces' ? 'active' : ''}" data-tab="faces">Faces</button>
+    <button class="tab ${this._currentTab === 'suggestions' ? 'active' : ''}" data-tab="suggestions">Suggestions</button>
+    <button class="tab ${this._currentTab === 'settings' ? 'active' : ''}" data-tab="settings">Settings</button>
+    <button class="tab ${this._currentTab === 'logs' ? 'active' : ''}" data-tab="logs">Logs</button>
+    <button class="tab ${this._currentTab === 'memory' ? 'active' : ''}" data-tab="memory">Memory</button>
+  </div>
+
+  ${this._currentTab === 'dashboard' ? `
+  <!-- ═══ DASHBOARD TAB ═══ -->
+
+  ${this._renderOnboarding(d)}
+
+  <!-- MAIN GRID -->
+  <div class="grid">
+
+    <!-- LEFT: STATUS -->
+    <div class="c-status panel">
+      <div class="head">
+        <span>System Status</span>
+        <span class="side">◉ LIVE</span>
+      </div>
+      <div class="status-list">
+        ${statusRow("Observer",   d.observer)}
+        ${statusRow("Sleep",      d.sleep)}
+        ${statusRow("LLM Providers", d.llm_providers)}
+        ${statusRow("Broadcast",  d.broadcast)}
+        ${statusRow("Notify",     d.notify)}
+        ${statusRow("Satellites", d.satellites)}
+      </div>
+      <div class="meta">
+        Bedrooms <span>${this._esc(d.bedrooms)}</span><br>
+        Areas Monitored <span>${this._esc(d.areas)}</span><br>
+        Announcements Today <span>${this._esc(d.announcements_today)}</span><br>
+        Uptime <span>${this._esc(d.uptime)}</span>
+      </div>
+      <div class="meta" id="cognitive-stats" style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;">
+        <span style="color:var(--cyan);font-family:var(--font-display);font-size:9px;letter-spacing:0.2em;">COGNITIVE CORE</span><br>
+        <span class="loading-cog" style="font-size:10px;color:var(--text-dim);">Loading...</span>
+      </div>
+    </div>
+
+    <!-- CENTER: CAMERA WATCH — full width (residence now has its own tab) -->
+    <div class="c-camera panel">
+      <div class="head">
+        <span>Camera Watch</span>
+        <button class="cam-diag-btn" id="cam-diag-btn" title="Probe this camera's frame sources end-to-end">DIAG</button>
+        <span class="side" id="cam-state">◉ LIVE</span>
+      </div>
+      <div class="cam-sel" id="cam-sel"></div>
+      <div class="cam-feed" id="cam-feed">
+        <div class="cam-none">NO CAMERA SELECTED</div>
+        <div class="cam-tag" id="cam-tag"></div>
+        <div class="cam-vig"></div><div class="cam-scan"></div>
+      </div>
+      <div class="cam-strip" id="cam-strip"></div>
+    </div>
+
+    <!-- RIGHT: ACTIVITY -->
+    <div class="c-right">   <!-- jh-ptz (step 145): the right column, the Activity Feed and under it the camera move card -->
+    <div class="c-ptz panel" id="jh-ptz" hidden></div>   <!-- jh-ptz-top (step 153): the camera move card ABOVE the Activity Feed; none when the camera cannot move -->
+    <div class="c-log panel">
+      <div class="head">
+        <span>Activity Feed</span>
+        <span class="side" id="activity-count">LAST ${d.activity.length}</span>
+      </div>
+      <input id="activity-search" class="log-search activity-search" type="text" placeholder="search…" autocomplete="off" value="${this._esc(this._activitySearch || '')}" />
+      <div class="log" id="activity-feed">
+        ${this._activityFiltered().rows.map(e => this._evtRowHtml(e)).join("")}
+      </div>
+    </div>
+    </div>
+
+  </div>
+
+  <!-- AREAS -->
+  <div class="panel">
+    <div class="head">
+      <span>Areas · ${this._esc(d.areas)} Registered</span>
+      <span class="side">◉ ${d.areasGrid.filter(a => a.active).length} Occupied</span>
+    </div>
+    <div class="areas">
+      ${d.areasGrid.map(areaTile).join("")}
+    </div>
+  </div>
+
+  <!-- GOALS -->
+  ${this._renderGoals(d)}
+
+  <!-- QUICK ACTIONS (dashboard only — full settings in Settings tab) -->
+  <div class="panel">
+    <div class="head">
+      <span>Quick Actions</span>
+      <span class="side">CMD</span>
+    </div>
+    <div class="controls">
+      ${this._jhQaButtons(d)}
+    </div>
+    <div class="qa-result" id="qa-analysis-result"></div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'residence' ? `
+  <!-- ═══ RESIDENCE TAB ═══ -->
+  <div class="res-tab">
+    <div class="res-main panel floorplan-panel">
+      <div class="head">
+        <span>Residence Overview</span>
+        <span class="side">◉ PRESENCE</span>
+      </div>
+
+      <!-- style template + floor controls -->
+      <div class="res-controls">
+        <div class="res-style">
+          <label>HOME STYLE</label>
+          <select class="res-style-sel" id="res-style-sel">
+            ${this._residenceStyleOptions(d)}
+          </select>
+        </div>
+        <div class="floor-tabs" style="${this._jhResidenceExt()?.singleFloor ? 'display:none' : ''}">
+          <button class="floor-tab ${this._currentFloor === 'all' ? 'active' : ''}" data-floor="all">All</button>
+          <button class="floor-tab ${this._currentFloor === '1f' ? 'active' : ''}" data-floor="1f">1st Floor</button>
+          ${String(d.config?.home_stories ?? '1.5') !== '1' ? `<button class="floor-tab ${this._currentFloor === '2f' ? 'active' : ''}" data-floor="2f">2nd Floor</button>` : ''}
+          ${(d.config?.has_basement !== false) ? `<button class="floor-tab ${this._currentFloor === 'bsmt' ? 'active' : ''}" data-floor="bsmt">Basement</button>` : ''}
+        </div>
+      </div>
+
+      ${this._viewPresetBar('residence')}
+      <div class="floorplan-wrap res-wrap-big" id="floorplan-wrap">
+        <div class="house3d-scene iso-scene" id="house3d-scene">
+          <div class="res-iso" id="res-iso"></div>
+          <div class="res-callouts" id="res-callouts"></div>
+          <div class="res-banner">
+            <div class="res-banner-t">PROPERTY · <span id="res-addr">ADDRESS NOT SET</span></div>
+            <div class="res-banner-s">SATELLITE + ARCHITECTURAL DATA MERGE</div>
+          </div>
+          <div class="res-stat">
+            <div class="res-stat-i"><label>EST SQ FT</label><b id="res-sqft">—</b></div>
+            <div class="res-stat-i"><label>BED / BATH</label><b id="res-bb">—</b></div>
+            <div class="res-stat-i"><label>STYLE</label><b id="res-style-tag">—</b></div>
+            <div class="res-stat-i"><label>OCCUPIED</label><b id="res-occ">—</b></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dom-info">
+        <div class="dom-left">
+          <div class="dom-name-wrap"><div class="dom-name" id="dom-name">${this._esc(d.dominantRoom.name)}</div><button type="button" class="dom-pinned" id="dom-pinned" hidden title="Back to the room that follows presence" aria-label="Back to automatic"></button></div>
+          <div class="dom-sub" id="dom-sub">${this._esc(d.dominantRoom.subtitle)}</div>
+        </div>
+        <div class="dom-gauges">
+          ${this._domGauges(d.dominantRoom)}
+        </div>
+      </div>
+
+      ${this._renderDoorMapping(d)}
+    </div>
+
+    <!-- mmWave presence overview (v7.94.0) -->
+    <div class="res-side panel mmwave-panel">
+      <div class="head">
+        <span>mmWave Presence</span>
+        <span class="side" id="mmwave-summary">◉ SCAN</span>
+      </div>
+      <div class="mem-sub">Live occupancy per room from presence / motion / mmWave sensors — the ground truth behind the floor-plan glow.</div>
+      <div class="mmwave-list" id="mmwave-list">
+        <div class="mmwave-empty">Reading sensors…</div>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'faces' ? `
+  <!-- ═══ FACES TAB (#140) ═══ -->
+  <div class="faces-page">
+    <div class="panel faces-panel">
+      <div class="head">
+        <span>Faces</span>
+        <span class="side" id="faces-count">◉ WHITELIST</span>
+      </div>
+      <div class="mem-sub">Faces JARVIS recognizes from your vision backend — Frigate face recognition, or middleware like Double Take paired with external detectors such as CompreFace or DeepStack. JARVIS runs no face engine of its own; flag the people who live here as residents so it can tell a household member from a guest or an unknown face, and stand intrusion monitoring down when the person it sees is a resident. A recognized face that isn't a resident is a <b>guest</b> — the <code>jarvis_face_recognized</code> event carries that status (<code>relationship</code>: resident / guest / unknown) so your automations can treat household and visitors differently.</div>
+      <div class="faces-add-row">
+        <input class="cfg-field" id="faces-add-name" type="text" placeholder="Add a resident by name"/>
+        <button class="btn primary" id="faces-add-btn">+ Add resident</button>
+        <button class="btn" id="faces-refresh">⟳ Refresh</button>
+      </div>
+      <div class="faces-src-row">
+        <label>Identity source</label>
+        <select class="cfg-field" data-cfg-key="recognition_source">${this._optsLabeled([['both','Both (Double Take + Frigate)'],['frigate','Frigate only (sub_label)'],['doubletake','Double Take only']], d.config?.recognition_source || 'both')}</select>
+      </div>
+      <div class="mem-sub faces-llm-note">Which backend's face identities JARVIS trusts. A Frigate or Double Take recognition always <b>overrides</b> a best-effort LLM guess on the same camera.</div>
+      <div class="faces-llm-row">
+        <label>Best-effort face recognition <span class="faces-exp">EXPERIMENTAL</span></label>
+        <button class="toggle-btn ${d.config?.llm_face_recognition ? 'on' : 'off'}" data-cfg-key="llm_face_recognition" data-cfg-val="${d.config?.llm_face_recognition ? 'false' : 'true'}">${d.config?.llm_face_recognition ? 'ON' : 'OFF'}</button>
+      </div>
+      <div class="mem-sub faces-llm-note">No dedicated face backend? With this on, JARVIS asks its own local vision model whether a camera frame matches a resident's <b>reference photo</b> (set one on each resident card below). It's a rough guess — results are clearly marked <b>LLM GUESS</b>, and this never disables intrusion alerts. For reliable recognition, use Frigate's native face recognition instead.</div>
+      <div class="faces-llm-row">
+        <label>Train from Frigate / Double Take <span class="faces-exp">EXPERIMENTAL</span></label>
+        <button class="toggle-btn ${d.config?.llm_face_autotrain ? 'on' : 'off'}" data-cfg-key="llm_face_autotrain" data-cfg-val="${d.config?.llm_face_autotrain ? 'false' : 'true'}">${d.config?.llm_face_autotrain ? 'ON' : 'OFF'}</button>
+      </div>
+      <div class="mem-sub faces-llm-note">When Frigate or Double Take recognizes a resident with high confidence, JARVIS can auto-save that frame as their reference photo — so the best-effort matcher learns residents with no manual upload. Auto-saved photos are tagged <b>auto</b> and never overwrite one you set yourself; this feeds only the guess path above and never affects intrusion alerts.</div>
+      <div class="faces-llm-row">
+        <label>Add household members from their profile picture</label>
+        <button class="toggle-btn ${d.config?.jh_faces_from_profile !== false ? 'on' : 'off'}" data-cfg-key="jh_faces_from_profile" data-cfg-val="${d.config?.jh_faces_from_profile !== false ? 'false' : 'true'}">${d.config?.jh_faces_from_profile !== false ? 'ON' : 'OFF'}</button>
+      </div>
+      <div class="mem-sub faces-llm-note">When someone with a Home Assistant login gets a profile picture (Settings &gt; People), JARVIS adds them here as a resident once, with a small copy of that picture as their reference photo (tagged <b>profile</b>). An existing resident or a photo you set yourself is never changed, and a resident you remove is not added again.</div>
+      <div class="faces-body" id="faces-body"><div class="mmwave-empty">Loading recognized faces…</div></div>
+      <div class="voices-body" id="voices-body"></div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'settings' ? `
+  <!-- ═══ SETTINGS TAB ═══ -->
+  <div class="settings-page">
+
+    <div class="settings-subnav">
+      ${[
+        ['general', 'General'], ['voice', 'Voice & Audio'],
+        ['learning', 'Learning'], ['safety', 'Safety & Energy'],
+        ['cameras', 'Cameras'], ['home', 'Home & Extras'],
+        ['floorplan', 'Floor Plan'], ['governance', 'Governance'],
+      ].map(([id, label]) => `<button class="settings-subnav-btn ${this._settingsSection === id ? 'active' : ''}" data-settings-section="${id}">${label}</button>`).join('')}
+    </div>
+
+    <div class="settings-grid">
+      ${this._renderConfigParity(d)}
+      ${this._jhQaSettings(d)}
+      ${this._jhHapticSettings()}
+      ${this._jhPronounSettings(d)}
+      ${this._jhOptSettings(d)}
+      ${this._jhWatchSettings(d)}
+      <!-- RESIDENCE / HOME -->
+      <div class="panel">
+        <div class="head">
+          <span>Residence / Home</span>
+          <span class="side">3D MODEL</span>
+        </div>
+        <div class="home-cfg">
+          <div class="cfg-row">
+            <label>Home type</label>
+            <select class="cfg-field" data-cfg-key="residence_style">${this._residenceStyleOptions(d)}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Attached side <span class="cfg-sub">UK semi / terrace party wall</span></label>
+            <select class="cfg-field" data-cfg-key="home_attached">${this._optsLabeled([['','Style default'],['none','Detached'],['left','Semi — party wall left'],['right','Semi — party wall right'],['top','Semi — party wall top'],['bottom','Semi — party wall bottom'],['both','Terrace — both sides']], d.config?.home_attached ?? '')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Roof type <span class="cfg-sub">overrides the style's roof</span></label>
+            <select class="cfg-field" data-cfg-key="home_roof">${this._optsLabeled(this._roofTypePairs(), d.config?.home_roof ?? '')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Stories</label>
+            <select class="cfg-field" data-cfg-key="home_stories">${this._opts(['1','1.5','2','3'], String(d.config?.home_stories ?? '1.5'))}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Garage bays</label>
+            <select class="cfg-field" data-cfg-key="garage_bays">${this._opts(['0','1','2','3','4'], String(d.config?.garage_bays ?? '3'))}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Front dormers</label>
+            <select class="cfg-field" data-cfg-key="dormers_front">${this._opts(['0','1','2','3'], String(d.config?.dormers_front ?? '2'))}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Rear dormers</label>
+            <select class="cfg-field" data-cfg-key="dormers_rear">${this._opts(['0','1','2'], String(d.config?.dormers_rear ?? '1'))}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Chimney</label>
+            <select class="cfg-field" data-cfg-key="chimney_side">${this._optsLabeled([['right','East / right'],['left','West / left'],['center','Center / ridge'],['none','None']], d.config?.chimney_side || 'right')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Chimneys</label>
+            <select class="cfg-field" data-cfg-key="chimney_count">${this._opts(['1','2','3','4'], String(d.config?.chimney_count ?? '1'))}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Basement</label>
+            <button class="toggle-btn ${(d.config?.has_basement !== false) ? 'on' : 'off'}" data-cfg-key="has_basement" data-cfg-val="${(d.config?.has_basement !== false) ? 'false' : 'true'}">${(d.config?.has_basement !== false) ? 'YES' : 'NO'}</button>
+          </div>
+          ${(d.config?.has_basement !== false) ? `
+          <div class="cfg-row">
+            <label>Cellar entrance</label>
+            <select class="cfg-field" data-cfg-key="basement_entrance">${this._optsLabeled([['bulkhead','Exterior bulkhead'],['interior','Interior stairs (inside)']], d.config?.basement_entrance || 'bulkhead')}</select>
+          </div>` : ''}
+          <div class="cfg-row">
+            <label>Bedrooms</label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="12" data-cfg-key="home_bedrooms" value="${this._esc(d.config?.home_bedrooms ?? '')}" placeholder="3">
+          </div>
+          <div class="cfg-row">
+            <label>Bathrooms</label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="12" step="0.5" data-cfg-key="home_bathrooms" value="${this._esc(d.config?.home_bathrooms ?? '')}" placeholder="2">
+          </div>
+          <div class="cfg-row">
+            <label>Square feet</label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="20000" step="50" data-cfg-key="floor_plan_sqft" value="${this._esc(d.config?.floor_plan_sqft ?? '')}" placeholder="1800">
+          </div>
+          <div class="home-cfg-hint">Drives the Residence 3D model + property stats. Detailed room layout is edited in the floor-plan editor.</div>
+        </div>
+      </div>
+      <!-- GENERAL -->
+      <div class="panel">
+        <div class="head">
+          <span>General</span>
+          <span class="side">CORE</span>
+        </div>
+        <div class="home-cfg" style="margin-bottom:10px;">
+          <div class="cfg-row">
+            <label>Panel language</label>
+            <select id="ui-lang-select" class="cfg-field" data-cfg-key="ui_language">${this._optsLabeled([['auto','Auto (Home Assistant)'],['en','English'],['zh','中文（简体）'],['zh-hant','中文（繁體）'],['cs','Čeština'],['da','Dansk'],['de','Deutsch'],['es','Español'],['fr','Français'],['it','Italiano'],['nl','Nederlands'],['nb','Norsk bokmål'],['pl','Polski'],['pt','Português'],['pt-br','Português (Brasil)'],['ro','Română'],['ru','Русский'],['sk','Slovenčina'],['fi','Suomi'],['sv','Svenska'],['tr','Türkçe'],['uk','Українська']], d.config?.ui_language || 'auto')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>JARVIS speaks</label>
+            <select class="cfg-field" data-cfg-key="output_language">${this._optsLabeled([['','Auto (Home Assistant)'],['en','English'],['zh','中文 (Chinese)'],['cs','Čeština (Czech)'],['da','Dansk (Danish)'],['nl','Nederlands (Dutch)'],['fi','Suomi (Finnish)'],['fr','Français (French)'],['de','Deutsch (German)'],['el','Ελληνικά (Greek)'],['he','עברית (Hebrew)'],['hu','Magyar (Hungarian)'],['id','Indonesia (Indonesian)'],['it','Italiano (Italian)'],['ja','日本語 (Japanese)'],['ko','한국어 (Korean)'],['nb','Norsk (Norwegian)'],['pl','Polski (Polish)'],['pt','Português (Portuguese)'],['ro','Română (Romanian)'],['ru','Русский (Russian)'],['sk','Slovenčina (Slovak)'],['es','Español (Spanish)'],['sv','Svenska (Swedish)'],['th','ไทย (Thai)'],['tr','Türkçe (Turkish)'],['uk','Українська (Ukrainian)'],['vi','Tiếng Việt (Vietnamese)']], d.config?.output_language || '')}</select>
+          </div>
+          <div class="mem-sub" style="margin-top:2px;">“Panel language” translates this dashboard. “JARVIS speaks” is the language of JARVIS's own briefings, camera analysis and announcements — set it when your Home Assistant runs in English but you want JARVIS in another language. Auto follows Home Assistant. A spoken request in another language is still answered in that language.</div>
+        </div>
+        <div class="toggle-list">
+          <div class="toggle-row">
+            <span class="toggle-label">Announcements</span>
+            <span class="toggle-desc">Master switch — all proactive speech</span>
+            <button class="toggle-btn ${(d.config?.announcements_enabled) ? 'on' : 'off'}"
+              data-cfg-key="announcements_enabled"
+              data-cfg-val="${(d.config?.announcements_enabled) ? 'false' : 'true'}">
+              ${(d.config?.announcements_enabled) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Notifications only</span>
+            <span class="toggle-desc">Mute speakers — proactive announcements go to your phone/text instead (incl. critical). No unsolicited speaker interruptions.</span>
+            <button class="toggle-btn ${(d.config?.announce_notify_only) ? 'on' : 'off'}"
+              data-cfg-key="announce_notify_only"
+              data-cfg-val="${(d.config?.announce_notify_only) ? 'false' : 'true'}">
+              ${(d.config?.announce_notify_only) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Sentinel</span>
+            <span class="toggle-desc">Door/garage/lock-left-open alerts</span>
+            <button class="toggle-btn ${(d.config?.sentinel_enabled) ? 'on' : 'off'}"
+              data-cfg-key="sentinel_enabled"
+              data-cfg-val="${(d.config?.sentinel_enabled) ? 'false' : 'true'}">
+              ${(d.config?.sentinel_enabled) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Intrusion: breach only</span>
+            <span class="toggle-desc">Treat interior motion as residents/pets &mdash; an intrusion is only investigated on a real breach (an exterior door/window/garage opening) or a person confirmed on a camera. Cuts motion false alarms. Turn off to also seed from bare motion while away/armed.</span>
+            <button class="toggle-btn ${(d.config?.intrusion_breach_only !== false) ? 'on' : 'off'}"
+              data-cfg-key="intrusion_breach_only"
+              data-cfg-val="${(d.config?.intrusion_breach_only !== false) ? 'false' : 'true'}">
+              ${(d.config?.intrusion_breach_only !== false) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Observer</span>
+            <span class="toggle-desc">AI event awareness (uses API)</span>
+            <button class="toggle-btn ${(d.config?.observer_enabled) ? 'on' : 'off'}"
+              data-cfg-key="observer_enabled"
+              data-cfg-val="${(d.config?.observer_enabled) ? 'false' : 'true'}">
+              ${(d.config?.observer_enabled) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Nighttime cover securing</span>
+            <span class="toggle-desc">What JARVIS may close on its own at night once the house is asleep. <b>Doors, garage &amp; gate only</b> (default) secures perimeter openings but never rolls a motorized shutter/blind/shade down over a window or patio door you might need as a fire exit. <b>Every open cover</b> restores the old behaviour. <b>Never close covers</b> leaves them alone (locks still auto-lock). Excluded entities are never touched in any mode.</span>
+            <select class="cfg-field" data-cfg-key="nighttime_lockdown_covers">${this._optsLabeled([['secure','Doors, garage &amp; gate only (default)'],['all','Every open cover (legacy)'],['off','Never close covers']], d.config?.nighttime_lockdown_covers || 'secure')}</select>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Cognition</span>
+            <span class="toggle-desc">Local triage — sees all telemetry, gates cloud</span>
+            <button class="toggle-btn ${(d.config?.cognition_enabled) ? 'on' : 'off'}"
+              data-cfg-key="cognition_enabled"
+              data-cfg-val="${(d.config?.cognition_enabled) ? 'false' : 'true'}">
+              ${(d.config?.cognition_enabled) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Adaptive interruptions</span>
+            <span class="toggle-desc">Interrupt less after recent alerts were dismissed as unneeded</span>
+            <button class="toggle-btn ${(d.config?.adaptive_interruption_budget) ? 'on' : 'off'}"
+              data-cfg-key="adaptive_interruption_budget"
+              data-cfg-val="${(d.config?.adaptive_interruption_budget) ? 'false' : 'true'}">
+              ${(d.config?.adaptive_interruption_budget) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Adaptive suggestions</span>
+            <span class="toggle-desc">Tune the suggestion bar from how often past suggestions were useful</span>
+            <button class="toggle-btn ${(d.config?.adaptive_suggestion_threshold) ? 'on' : 'off'}"
+              data-cfg-key="adaptive_suggestion_threshold"
+              data-cfg-val="${(d.config?.adaptive_suggestion_threshold) ? 'false' : 'true'}">
+              ${(d.config?.adaptive_suggestion_threshold) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Adaptive awareness</span>
+            <span class="toggle-desc">Tune the anticipation/anomaly bar from how welcome recent alerts were</span>
+            <button class="toggle-btn ${(d.config?.adaptive_cognition_threshold) ? 'on' : 'off'}"
+              data-cfg-key="adaptive_cognition_threshold"
+              data-cfg-val="${(d.config?.adaptive_cognition_threshold) ? 'false' : 'true'}">
+              ${(d.config?.adaptive_cognition_threshold) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Camera Watch</span>
+            <span class="toggle-desc">Inspect doorbell presses (vision + event-media)</span>
+            <button class="toggle-btn ${(d.config?.camera_auto_analyze) ? 'on' : 'off'}"
+              data-cfg-key="camera_auto_analyze"
+              data-cfg-val="${(d.config?.camera_auto_analyze) ? 'false' : 'true'}">
+              ${(d.config?.camera_auto_analyze) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Analyze Motion Events</span>
+            <span class="toggle-desc">Also inspect Frigate person/object detections, not just doorbell presses (needs Camera Watch on)</span>
+            <button class="toggle-btn ${(d.config?.camera_auto_analyze_motion) ? 'on' : 'off'}"
+              data-cfg-key="camera_auto_analyze_motion"
+              data-cfg-val="${(d.config?.camera_auto_analyze_motion) ? 'false' : 'true'}">
+              ${(d.config?.camera_auto_analyze_motion) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Analyze HA motion (no NVR)</span>
+            <span class="toggle-desc">No Frigate/Nest? A Home Assistant motion/occupancy sensor firing silently analyzes the camera covering that room — so best-effort face recognition &amp; scene learning work on plain cameras. Throttled per camera; no spoken alerts.</span>
+            <button class="toggle-btn ${(d.config?.camera_motion_vision) ? 'on' : 'off'}"
+              data-cfg-key="camera_motion_vision"
+              data-cfg-val="${(d.config?.camera_motion_vision) ? 'false' : 'true'}">
+              ${(d.config?.camera_motion_vision) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Camera alerts</span>
+            <span class="toggle-desc">When auto reviews speak aloud. Everything is still analyzed &amp; logged — this only gates what's announced. Intrusion alerts are always spoken.</span>
+            <select class="cfg-field" data-cfg-key="camera_alert_level">${this._optsLabeled([['off','Off — observe only'],['urgent','Urgent only (default)'],['important','Important — + deliveries'],['all','Everything notable']], d.config?.camera_alert_level || 'urgent')}</select>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Property-only scope</span>
+            <span class="toggle-desc">Auto reviews consider only what happens on your property — the home and its own yard, driveway, path, porch &amp; entryways. Activity beyond the property line (the street, sidewalk, a neighbour, passing traffic) is ignored, so a street-facing camera won't narrate the public road. Turn off to also watch public areas. A manual "analyze" always reports the whole frame.</span>
+            <button class="toggle-btn ${(d.config?.camera_property_scope_only !== false) ? 'on' : 'off'}"
+              data-cfg-key="camera_property_scope_only"
+              data-cfg-val="${(d.config?.camera_property_scope_only !== false) ? 'false' : 'true'}">
+              ${(d.config?.camera_property_scope_only !== false) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Package Watch</span>
+            <span class="toggle-desc">Detect packages &amp; mail at the door</span>
+            <button class="toggle-btn ${(d.config?.package_detection) ? 'on' : 'off'}"
+              data-cfg-key="package_detection"
+              data-cfg-val="${(d.config?.package_detection) ? 'false' : 'true'}">
+              ${(d.config?.package_detection) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Visitor Learning</span>
+            <span class="toggle-desc">Silently learn from person events — never spoken</span>
+            <button class="toggle-btn ${(d.config?.visitor_learning) ? 'on' : 'off'}"
+              data-cfg-key="visitor_learning"
+              data-cfg-val="${(d.config?.visitor_learning) ? 'false' : 'true'}">
+              ${(d.config?.visitor_learning) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Rich Reasoning</span>
+            <span class="toggle-desc">Cloud-first judgment for medium+ events</span>
+            <button class="toggle-btn ${(d.config?.rich_reasoning) ? 'on' : 'off'}"
+              data-cfg-key="rich_reasoning"
+              data-cfg-val="${(d.config?.rich_reasoning) ? 'false' : 'true'}">
+              ${(d.config?.rich_reasoning) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Direct Reasoning</span>
+            <span class="toggle-desc">On = skip JARVIS's local classification and send chat input straight to the reasoning agent. For installs that front JARVIS with their own agent (#469); off keeps the zero-API local engine primary</span>
+            <button class="toggle-btn ${(d.config?.direct_reasoning) ? 'on' : 'off'}"
+              data-cfg-key="direct_reasoning"
+              data-cfg-val="${(d.config?.direct_reasoning) ? 'false' : 'true'}">
+              ${(d.config?.direct_reasoning) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Light Control</span>
+            <span class="toggle-desc">Off = still show which rooms have lights on, but disable toggling from the dashboard</span>
+            <button class="toggle-btn ${(d.config?.light_control_enabled !== false) ? 'on' : 'off'}"
+              data-cfg-key="light_control_enabled"
+              data-cfg-val="${(d.config?.light_control_enabled !== false) ? 'false' : 'true'}">
+              ${(d.config?.light_control_enabled !== false) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Appliance Power Guessing</span>
+            <span class="toggle-desc">Off = only announce appliances with native sensors or ones you've mapped (no guessing from the power meter)</span>
+            <button class="toggle-btn ${(d.config?.appliance_power_guessing) ? 'on' : 'off'}"
+              data-cfg-key="appliance_power_guessing"
+              data-cfg-val="${(d.config?.appliance_power_guessing) ? 'false' : 'true'}">
+              ${(d.config?.appliance_power_guessing) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SUB-AGENTS & AUTOMATION (v7.96.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Sub-Agents &amp; Automation</span>
+          <span class="side">AGENTS</span>
+        </div>
+        <div class="toggle-list">
+          <div class="toggle-row">
+            <span class="toggle-label">FRIDAY automator</span>
+            <span class="toggle-desc">⚠️ Advanced. A background sub-agent that can CONTROL devices, run scenes and scripts on its own — every other sub-agent is read-only. Off by default; enabling asks you to confirm.</span>
+            <button class="toggle-btn ${(d.config?.friday_automator === true) ? 'on' : 'off'}"
+              data-cfg-key="friday_automator"
+              data-cfg-val="${(d.config?.friday_automator === true) ? 'false' : 'true'}"
+              data-confirm="Enable the FRIDAY automator?&#10;&#10;Unlike every other sub-agent, FRIDAY can CONTROL your devices, run scenes and run scripts on its own. Only enable it if you want JARVIS to actuate your home autonomously.">
+              ${(d.config?.friday_automator === true) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Act without asking (kernel-governed)</span>
+            <span class="toggle-desc">⚠️ Lets JARVIS carry out automations you've already approved enough times WITHOUT asking each time — governed by the kernel's graduated-autonomy ladder. Security &amp; safety capabilities (unlock, disarm, garage/lockdown off) NEVER auto-act; they always ask. Off by default; turn it off here anytime.</span>
+            <button class="toggle-btn ${(d.config?.autonomy_enforce === true) ? 'on' : 'off'}"
+              data-cfg-key="autonomy_enforce"
+              data-cfg-val="${(d.config?.autonomy_enforce === true) ? 'false' : 'true'}"
+              data-confirm="Let JARVIS act without asking?&#10;&#10;When ON, JARVIS will perform convenience automations it has learned you approve (e.g. lights on at dusk) on its own, without a prompt each time — governed by the kernel's per-capability trust ladder.&#10;&#10;It will NEVER auto-act security- or safety-critical capabilities: unlocking doors, disarming the alarm, opening the garage, or turning lockdown off ALWAYS ask first, no matter how often approved.&#10;&#10;You can turn this back off here at any time. Enable kernel-governed autonomy?">
+              ${(d.config?.autonomy_enforce === true) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Proximity TTS volume</span>
+            <span class="toggle-desc">Soften announcements when mmWave distance sensors show you're close to the speaker. No effect in rooms without distance sensors; never dampens critical alerts.</span>
+            <button class="toggle-btn ${(d.config?.proximity_volume !== false) ? 'on' : 'off'}"
+              data-cfg-key="proximity_volume"
+              data-cfg-val="${(d.config?.proximity_volume !== false) ? 'false' : 'true'}">
+              ${(d.config?.proximity_volume !== false) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-label">Host hardware monitoring</span>
+            <span class="toggle-desc">Read the server's CPU temperature, memory pressure and NVMe I/O (from /proc and /sys) and fold critical stress into the infrastructure audit &amp; System Diagnostics.</span>
+            <button class="toggle-btn ${(d.config?.host_telemetry !== false) ? 'on' : 'off'}"
+              data-cfg-key="host_telemetry"
+              data-cfg-val="${(d.config?.host_telemetry !== false) ? 'false' : 'true'}">
+              ${(d.config?.host_telemetry !== false) ? 'ON' : 'OFF'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ANTICIPATION & MEMORY (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Anticipation &amp; Memory</span>
+          <span class="side">PROACTIVE</span>
+        </div>
+        <div class="home-cfg">
+          <div class="cfg-row">
+            <label>Departure alerts</label>
+            <button class="toggle-btn ${(d.config?.departure_alerts_enabled) ? 'on' : 'off'}" data-cfg-key="departure_alerts_enabled" data-cfg-val="${(d.config?.departure_alerts_enabled) ? 'false' : 'true'}">${(d.config?.departure_alerts_enabled) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Only for events with a location<span class="cfg-hint">skip "time to head out" for online meetings &amp; events with no place set</span></label>
+            <button class="toggle-btn ${(d.config?.departure_require_location !== false) ? 'on' : 'off'}" data-cfg-key="departure_require_location" data-cfg-val="${(d.config?.departure_require_location !== false) ? 'false' : 'true'}">${(d.config?.departure_require_location !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Routine alerts</label>
+            <button class="toggle-btn ${(d.config?.routine_alerts_enabled) ? 'on' : 'off'}" data-cfg-key="routine_alerts_enabled" data-cfg-val="${(d.config?.routine_alerts_enabled) ? 'false' : 'true'}">${(d.config?.routine_alerts_enabled) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Door/window/garage alerts<span class="cfg-hint">announce when one is open at an unusual time &mdash; they stay monitored for security either way</span></label>
+            <button class="toggle-btn ${(d.config?.door_window_alerts_enabled !== false) ? 'on' : 'off'}" data-cfg-key="door_window_alerts_enabled" data-cfg-val="${(d.config?.door_window_alerts_enabled !== false) ? 'false' : 'true'}">${(d.config?.door_window_alerts_enabled !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Memory threading</label>
+            <button class="toggle-btn ${(d.config?.memory_threading_enabled) ? 'on' : 'off'}" data-cfg-key="memory_threading_enabled" data-cfg-val="${(d.config?.memory_threading_enabled) ? 'false' : 'true'}">${(d.config?.memory_threading_enabled) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Learn motion/presence triggers</label>
+            <button class="toggle-btn ${(d.config?.pattern_learn_motion) ? 'on' : 'off'}" data-cfg-key="pattern_learn_motion" data-cfg-val="${(d.config?.pattern_learn_motion) ? 'false' : 'true'}">${(d.config?.pattern_learn_motion) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Sibling-burst coalescing (sec)</label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="600" step="10" data-cfg-key="observer_group_debounce" value="${this._esc(d.config?.observer_group_debounce ?? '')}" placeholder="90">
+          </div>
+          <div class="cfg-row">
+            <label>Continued conversation</label>
+            <button class="toggle-btn ${(d.config?.continued_conversation_enabled) ? 'on' : 'off'}" data-cfg-key="continued_conversation_enabled" data-cfg-val="${(d.config?.continued_conversation_enabled) ? 'false' : 'true'}">${(d.config?.continued_conversation_enabled) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Follow me between rooms<span class="cfg-hint">reopen the mic in the room you moved to (needs 2+ satellites)</span></label>
+            <button class="toggle-btn ${(d.config?.continued_conversation_multi_satellite) ? 'on' : 'off'}" data-cfg-key="continued_conversation_multi_satellite" data-cfg-val="${(d.config?.continued_conversation_multi_satellite) ? 'false' : 'true'}">${(d.config?.continued_conversation_multi_satellite) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Follow-up mic reopen (speaker-aware)</label>
+            <button class="toggle-btn ${(d.config?.continued_conversation_speaker_reopen !== false) ? 'on' : 'off'}" data-cfg-key="continued_conversation_speaker_reopen" data-cfg-val="${(d.config?.continued_conversation_speaker_reopen !== false) ? 'false' : 'true'}">${(d.config?.continued_conversation_speaker_reopen !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Use Home Assistant's TTS voice<span class="cfg-hint">briefings &amp; announcements use the voice selected in your HA Assist pipeline instead of JARVIS's built-in Piper voice &mdash; change voices in HA &rarr; Settings &rarr; Voice assistants, no config editing needed</span></label>
+            <button class="toggle-btn ${(d.config?.tts_use_ha_voice) ? 'on' : 'off'}" data-cfg-key="tts_use_ha_voice" data-cfg-val="${(d.config?.tts_use_ha_voice) ? 'false' : 'true'}">${(d.config?.tts_use_ha_voice) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row" style="margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
+            <label>Arrival greeting <span class="cfg-hint">greet a resident by name when they come through a chosen door &mdash; identified by face (if the door has a camera) or by their phone/tracker arriving home; stays silent if it can't tell who. Opt-in.</span></label>
+            <button class="toggle-btn ${(d.config?.arrival_greeting_enabled) ? 'on' : 'off'}" data-cfg-key="arrival_greeting_enabled" data-cfg-val="${(d.config?.arrival_greeting_enabled) ? 'false' : 'true'}">${(d.config?.arrival_greeting_enabled) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Doors <span class="cfg-hint">pick the door / entry sensors (locks and covers also listed) to watch; add as many as you like</span></label>
+            <div class="greet-doors-field" style="flex:1;min-width:0;">
+              <div class="pl-add">
+                <select class="op-field pl-input" id="greet-door-select">${this._doorEntityOptions('', '— pick a door to add —')}</select>
+                <button class="ctrl" id="greet-door-add">+ Add</button>
+              </div>
+              <div class="pl-chips" id="greet-door-chips">${this._greetDoorChips()}</div>
+            </div>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Greeting hours <span class="cfg-hint">only greet between these times; leave both blank for any time</span></label>
+            <span style="display:flex;gap:6px;align-items:center;">
+              <input class="cfg-field" type="time" data-cfg-key="arrival_greeting_start" value="${this._esc(d.config?.arrival_greeting_start || '')}">
+              <span style="color:var(--text-dim);font-size:10px;">to</span>
+              <input class="cfg-field" type="time" data-cfg-key="arrival_greeting_end" value="${this._esc(d.config?.arrival_greeting_end || '')}">
+            </span>
+          </div>
+          <div class="cfg-row" style="border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:12px;margin-bottom:2px;">
+            <label>&nbsp;&nbsp;↳ Repeat cooldown (min) <span class="cfg-hint">don't re-greet the same person within this many minutes</span></label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="1440" step="5" data-cfg-key="arrival_greeting_cooldown_min" value="${this._esc(d.config?.arrival_greeting_cooldown_min ?? '')}" placeholder="30">
+          </div>
+          <div class="cfg-row">
+            <label>Departure lead (min)</label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="240" step="5" data-cfg-key="departure_lead_minutes" value="${this._esc(d.config?.departure_lead_minutes ?? '')}" placeholder="30">
+          </div>
+          <div class="cfg-row">
+            <label>Memory window (hrs)</label>
+            <input class="cfg-field cfg-num" type="number" min="1" max="336" step="1" data-cfg-key="memory_threading_hours" value="${this._esc(d.config?.memory_threading_hours ?? '')}" placeholder="48">
+          </div>
+          <div class="cfg-row">
+            <label>Memory max turns</label>
+            <input class="cfg-field cfg-num" type="number" min="1" max="50" step="1" data-cfg-key="memory_threading_max" value="${this._esc(d.config?.memory_threading_max ?? '')}" placeholder="12">
+          </div>
+          <div class="cfg-row">
+            <label>Ask first after (min) <span class="cfg-hint">a vague command such as &ldquo;do all&rdquo; gets a question, not an action, when the chat was quiet this long; 0 = off</span></label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="240" step="1" data-cfg-key="vague_command_minutes" value="${this._esc(d.config?.vague_command_minutes ?? '')}" placeholder="10">
+          </div>
+          <div class="cfg-row">
+            <label>Fresh chat after (min) <span class="cfg-hint">after this many quiet minutes a chat starts without the earlier topic; 0 = off</span></label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="1440" step="1" data-cfg-key="jh_fresh_chat_minutes" value="${this._esc(d.config?.jh_fresh_chat_minutes ?? '')}" placeholder="30">
+          </div>
+          <div class="cfg-row">
+            <label>Origin tracker <span class="cfg-hint">where you set out from for drive-time &mdash; your phone or car GPS (a zone or a location sensor works too); blank uses whoever&rsquo;s tracked, then home</span></label>
+            <select class="cfg-field" data-cfg-key="departure_origin_entity">${this._trackerOptions(d.config?.departure_origin_entity || '')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>OSRM URL <span class="cfg-hint">optional self-hosted routing server (OSRM); blank uses the free public router</span></label>
+            <input class="cfg-field cfg-text" type="text" data-cfg-key="departure_osrm_url" value="${this._esc(d.config?.departure_osrm_url || '')}" placeholder="self-host (optional)">
+          </div>
+          <div class="cfg-row">
+            <label>Travel sensor <span class="cfg-hint">optional override &mdash; a sensor that already reports drive-time in minutes (Waze, Google/HERE Maps&hellip;); blank computes it from your origin via OSRM</span></label>
+            <select class="cfg-field" data-cfg-key="departure_travel_sensor">${this._travelSensorOptions(d.config?.departure_travel_sensor || '')}</select>
+          </div>
+          <div class="cfg-row" style="margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
+            <label>Driving mode <span class="cfg-hint">send alerts to the car screen (Android Auto) instead of the house when your phone is connected</span></label>
+            <button class="toggle-btn ${(d.config?.driving_mode_enabled) ? 'on' : 'off'}" data-cfg-key="driving_mode_enabled" data-cfg-val="${(d.config?.driving_mode_enabled) ? 'false' : 'true'}">${(d.config?.driving_mode_enabled) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Departure &amp; travel alerts</label>
+            <button class="toggle-btn ${(d.config?.driving_notify_travel !== false) ? 'on' : 'off'}" data-cfg-key="driving_notify_travel" data-cfg-val="${(d.config?.driving_notify_travel !== false) ? 'false' : 'true'}">${(d.config?.driving_notify_travel !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Proactive briefings</label>
+            <button class="toggle-btn ${(d.config?.driving_notify_briefings !== false) ? 'on' : 'off'}" data-cfg-key="driving_notify_briefings" data-cfg-val="${(d.config?.driving_notify_briefings !== false) ? 'false' : 'true'}">${(d.config?.driving_notify_briefings !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Security &amp; hazard alerts</label>
+            <button class="toggle-btn ${(d.config?.driving_notify_security !== false) ? 'on' : 'off'}" data-cfg-key="driving_notify_security" data-cfg-val="${(d.config?.driving_notify_security !== false) ? 'false' : 'true'}">${(d.config?.driving_notify_security !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Silence home speakers while driving</label>
+            <button class="toggle-btn ${(d.config?.driving_suppress_home_audio !== false) ? 'on' : 'off'}" data-cfg-key="driving_suppress_home_audio" data-cfg-val="${(d.config?.driving_suppress_home_audio !== false) ? 'false' : 'true'}">${(d.config?.driving_suppress_home_audio !== false) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>&nbsp;&nbsp;↳ Car connection sensor</label>
+            <select class="cfg-field" data-cfg-key="driving_car_sensor">${this._carSensorOptions(d.config?.driving_car_sensor || '')}</select>
+          </div>
+          <div class="home-cfg-hint">Departure warns when to leave for calendar events using your device location + open-source routing (Nominatim + OSRM). Routine alerts learn per-person timing over about a week. Continued conversation keeps the mic open after a question &mdash; best tuned on your satellites. Driving mode reroutes the alerts you pick to the car&rsquo;s Android Auto screen when your phone reports it&rsquo;s connected &mdash; leave the sensor on auto-detect to use the Home Assistant companion app&rsquo;s Android Auto sensor.</div>
+        </div>
+      </div>
+      <!-- AI MODELS -->
+      <div class="panel">
+        <div class="head">
+          <span>AI Models</span>
+          <span class="side">LLM</span>
+        </div>
+        <div class="model-list">
+          ${this._renderModelRoles(d)}
+        </div>
+        <div class="model-hint">Model lists are fetched live from each provider. Pick "Custom…" to enter one manually.</div>
+        <div class="model-hint">Groq, OpenAI, Google Gemini, Anthropic, a local Ollama server, and any OpenAI-compatible endpoint (Custom) are all supported. A provider marked <em>needs setup</em> has no key yet — add one in Settings → Devices &amp; Services → JARVIS → Configure, then it appears here ready to use.</div>
+        <div class="ctx-size-row" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line);display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-dim);letter-spacing:0.04em;">PROMPT SIZE \u00b7 entity names per type</span>
+          <input class="cfg-field cfg-num" type="number" min="0" max="15" step="1" data-cfg-key="home_context_max_entities" value="${this._esc(d.config?.home_context_max_entities ?? 15)}" style="width:56px;" title="Fewer names = smaller prompt">
+          <span style="font-size:9px;color:var(--text-faint);font-style:italic;max-width:520px;">Lower this (0 = counts only) if your LLM provider rejects requests for being too large \u2014 e.g. Groq\'s free tier caps tokens-per-minute. The assistant still discovers entities on demand, so nothing breaks.</span>
+        </div>
+        <div class="llm-url-row">
+          <span class="llm-url-label">CUSTOM URL</span>
+          <input class="custom-llm-url-input llm-url-input" type="text"
+            placeholder="http://gpu-server:11434/v1"
+            value="${this._esc(this._customLlmUrl(d.config))}"
+            title="OpenAI-compatible endpoint for the custom provider."/>
+        </div>
+        <div class="llm-url-row">
+          <span class="llm-url-label">OLLAMA URL</span>
+          <input class="ollama-llm-url-input llm-url-input" type="text"
+            placeholder="http://gpu-server:11434/v1"
+            value="${this._esc(this._ollamaLlmUrl(d.config))}"
+            title="Leave empty to use Ollama's default Home Assistant endpoint."/>
+        </div>
+        <div class="llm-url-row">
+          <span class="llm-url-label">OLLAMA num_ctx</span>
+          <input class="cfg-field cfg-num" type="number" min="512" max="131072" step="512"
+            data-cfg-key="ollama_num_ctx" value="${this._esc(d.config?.ollama_num_ctx ?? '')}" placeholder="8192"
+            title="Context window for local Ollama models. Larger = more context, but more VRAM and slower. Default 8192."/>
+        </div>
+      </div>
+
+      <!-- NOTIFICATIONS -->
+      <div class="panel">
+        <div class="head">
+          <span>Notifications</span>
+          <span class="side">PUSH</span>
+        </div>
+        <div class="toggle-list">
+          <div class="toggle-row">
+            <span class="toggle-label">Notify Device</span>
+            <span class="toggle-desc">Phone push for high/critical alerts</span>
+            <select class="notify-select" id="notify-select">
+              ${this._renderNotifyOptions(d)}
+            </select>
+          </div>
+          <div class="toggle-row">
+            <!-- jh-notify-private (step 158): alerts with private or admin data -->
+            <span class="toggle-label">Private alerts</span>
+            <span class="toggle-desc">Sentinel and system alerts, the answer watcher, briefings, messages JARVIS sends for an administrator. Admin phones only: the Home Assistant app of every administrator; when none can take it, the alert is kept in the Home Assistant log for administrators, never sent to the device above or shown as a notification. The device above: always that device. Household alerts such as an intrusion are unchanged.</span><!-- jh-r18-allow (step 160, review round 18 #3, #9) -->
+            <select class="notify-select" id="jh-notify-private" aria-label="Private alerts">
+              ${[["admin_phones", "Admin phones only"], ["notify_service", "The device above"]].map(([k, t]) => `<option value="${k}"${((d.config || {}).jh_notify_private || "admin_phones") === k ? " selected" : ""}>${t}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+      </div>
+      <!-- MUTED ANNOUNCEMENTS (#181) -->
+      <div class="panel">
+        <div class="head">
+          <span>Muted Announcements</span>
+          <span class="side">SHUSH</span>
+        </div>
+        <div class="mem-sub">Things JARVIS has been told to stop announcing — a window that's often open, a decorative light, etc. Muting an entity silences announcements <b>about it</b> while JARVIS keeps observing it normally (not the same as excluding it). Persists across restarts.</div>
+        <div class="mutes-body" id="mutes-body"><div class="mmwave-empty">Loading…</div></div>
+        <div class="doclib-controls">
+          <input class="cfg-field" id="mutes-add-entity" type="text" placeholder="entity_id to mute (e.g. binary_sensor.lounge_window)" style="flex:1;min-width:200px;"/>
+          <button class="btn primary" id="mutes-add-btn">Mute</button>
+          <button class="btn" id="mutes-refresh">⟳ Refresh</button>
+        </div>
+      </div>
+${this._renderRoutineLearning(d)}
+${this._renderExcludedEntities(d)}
+      <!-- APPLIANCES / ENERGY PROFILE -->
+      <div class="panel">
+        <div class="head">
+          <span>Appliances</span>
+          <span class="side">ENERGY PROFILE</span>
+        </div>
+        <div class="appliance-intro">Tell JARVIS which appliances exist so it names cycles correctly instead of guessing from the whole-home meter. Map a dedicated power or status entity when one exists (most accurate); otherwise set typical running watts so the meter can match it.</div>
+        <div class="appliance-list" id="appliance-list">
+          ${this._renderAppliances(d)}
+        </div>
+        <div class="appliance-actions">
+          <button class="btn" id="appliance-add">+ Add appliance</button>
+          <button class="btn primary" id="appliance-save">Save appliances</button>
+        </div>
+        <label class="appliance-unknown">
+          <input type="checkbox" id="appliance-unknown-toggle" ${d.config?.appliance_announce_unknown ? 'checked' : ''}/>
+          <span>Announce unidentified loads (loads matching no declared appliance)</span>
+        </label>
+      </div>
+
+      <!-- SENTINEL RULES -->
+      <div class="panel">
+        <div class="head">
+          <span>Sentinel Rules</span>
+          <span class="side">${(d.config?.sentinel_rules || []).length} RULES</span>
+        </div>
+        <div class="rule-list">
+          ${this._renderSentinelRules(d)}
+        </div>
+      </div>
+
+      <!-- OBSERVER STATS -->
+      <div class="panel">
+        <div class="head">
+          <span>Observer Tuning</span>
+          <span class="side">STATS</span>
+        </div>
+        <div class="status-list">
+          <div class="status-row ${d.config?.observer_stats?.running ? 'live' : 'off'}">
+            <span class="k">Status</span>
+            <span class="v">${d.config?.observer_stats?.running ? 'RUNNING' : 'STOPPED'}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Calls / Hour</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.calls_last_hour || 0)} / ${(d.config?.observer_stats?.rate_limit ?? 30) <= 0 ? '&#8734;' : this._esc(d.config?.observer_stats?.rate_limit ?? 30)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Hourly Cap</span>
+            <span class="v"><input type="number" min="0" step="1" class="rate-limit-input" value="${this._esc(d.config?.observer_stats?.rate_limit ?? 30)}" title="Max observer LLM calls per hour. 0 = unlimited (local LLM / high-quota tiers)." style="width:58px;background:rgba(0,0,0,0.4);border:1px solid var(--line-hot,#2a3f4a);color:var(--text,#cde);padding:2px 6px;border-radius:4px;font-family:inherit;font-size:inherit;text-align:right;"></span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Events 24h</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.events_24h || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Flagged 24h</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.flagged_24h || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Spoken 24h</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.spoken_24h || 0)}</span>
+          </div>
+          <div class="status-row ${d.config?.observer_stats?.cognition_enabled ? 'live' : 'off'}">
+            <span class="k">Cognition</span>
+            <span class="v">${d.config?.observer_stats?.cognition_enabled ? 'ACTIVE' : 'OFF'}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Tracked Entities</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.cog_entities || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Predictable</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.cog_predictable || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Routines Learned</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.cog_routines || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Presence Routines</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.cog_presence || 0)}</span>
+          </div>
+          ${(d.config?.observer_stats?.presence || []).map(p => `
+          <div class="status-row live">
+            <span class="k">${this._esc(p.name)}${p.gps ? ' 📍' : ''}</span>
+            <span class="v">${this._esc(p.zone)}${this._esc(p.distance_km != null ? ' · ' + p.distance_km + ' km' : '')}</span>
+          </div>`).join('')}
+          <div class="status-row live">
+            <span class="k">Cog Escalated</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.cog_escalated || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Local Decisions</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.local_rate || 0)}% (${this._esc(d.config?.observer_stats?.local_decisions || 0)} local / ${this._esc(d.config?.observer_stats?.cloud_calls || 0)} cloud)</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Learned Patterns</span>
+            <span class="v">${this._esc(d.config?.observer_stats?.learned_patterns || 0)}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">LLM Link</span>
+            <span class="v" style="${(d.config?.observer_stats?.llm_breaker === 'open') ? 'color:#ff8a8a' : ((d.config?.observer_stats?.llm_breaker === 'half_open') ? 'color:#ffcf6a' : '')}">${(d.config?.observer_stats?.llm_breaker === 'open') ? 'LOCAL-ONLY' : ((d.config?.observer_stats?.llm_breaker === 'half_open') ? 'PROBING' : 'ONLINE')}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- MEMORY -->
+      <div class="panel">
+        <div class="head">
+          <span>Memory</span>
+          <span class="side">RECALL</span>
+        </div>
+        <div class="status-list">
+          <div class="status-row live">
+            <span class="k">Backend</span>
+            <span class="v">${this._esc(d.config?.memory_stats?.backend || '—')}</span>
+          </div>
+          <div class="status-row live">
+            <span class="k">Stored Memories</span>
+            <span class="v">${this._esc(d.config?.memory_stats?.total_memories || 0)}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- OPERATIONAL MODE (Directive Layer, v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Operational Mode</span>
+          <span class="side" id="mode-active">…</span>
+        </div>
+        <div class="mem-sub" id="mode-desc">A high-level state that shifts JARVIS's whole behavior — proactivity, tone, what it surfaces. Safety always stays active.</div>
+        <div class="mode-auto-row">
+          <span class="mode-auto-label">AUTO · follow occupancy (away ↔ normal). Off = you set modes by hand or voice; discretionary modes (party/movie/lab/…) are always manual.</span>
+          <button class="toggle-btn ${d.config?.operational_mode_auto !== false ? 'on' : 'off'}" data-cfg-key="operational_mode_auto" data-cfg-val="${d.config?.operational_mode_auto !== false ? 'false' : 'true'}">${d.config?.operational_mode_auto !== false ? 'ON' : 'OFF'}</button>
+        </div>
+        <div class="mode-grid" id="mode-grid"></div>
+        ${this._renderModeBindings(d)}
+      </div>
+
+      <!-- WELLBEING CONTEXT (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Wellbeing Context</span>
+          <span class="side" id="bio-status">…</span>
+        </div>
+        <div class="mem-sub">Lets JARVIS read a connected wearable (heart rate, sleep, steps) so it can be quieter when you're resting. <strong>Context only — not medical.</strong> Off by default; health data stays private.</div>
+        <div class="doclib-controls">
+          <button class="cam-diag-btn" id="bio-toggle">◉ ENABLE</button>
+        </div>
+        <div class="bio-body" id="bio-body">
+          <div class="mmwave-empty">Loading…</div>
+        </div>
+      </div>
+
+      <!-- ENERGY MANAGEMENT (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Energy Management</span>
+          <span class="side" id="energy-draw">…</span>
+        </div>
+        <div class="mem-sub">Whole-home power, peak awareness, and load advice. Pick how much JARVIS may act — it never sheds critical loads (fridge, medical, network).</div>
+        <div class="energy-agency" id="energy-agency">
+          <span class="energy-agency-label">Agency</span>
+          <button class="mode-chip" data-agency="advisory">advisory</button>
+          <button class="mode-chip" data-agency="opt_in">opt-in</button>
+          <button class="mode-chip" data-agency="autonomous">autonomous</button>
+        </div>
+        <div class="energy-body" id="energy-body">
+          <div class="mmwave-empty">Loading…</div>
+        </div>
+      </div>
+
+      <!-- SYSTEM DIAGNOSTICS (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>System Diagnostics</span>
+          <span class="side" id="diag-overall">…</span>
+        </div>
+        <div class="mem-sub">Health of the core services JARVIS calls — LLM, embeddings, speech. A quick "is everything up?" check.</div>
+        <div class="doclib-controls">
+          <button class="cam-diag-btn" id="diag-refresh">⟳ RUN CHECK</button>
+          <button class="cam-diag-btn" id="diag-download" title="Download JARVIS's full diagnostics as a JSON file (credential-redacted) — for sharing when reporting an issue.">⬇ DOWNLOAD DIAG</button>
+        </div>
+        <div class="diag-body" id="diag-body">
+          <div class="mmwave-empty">Loading…</div>
+        </div>
+      </div>
+
+      <!-- MULTI-HAZARD MONITOR (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Hazard Monitor</span>
+          <span class="side" id="hazard-overall">OFF</span>
+        </div>
+        <div class="mem-sub">Real-time nearby earthquakes (USGS), severe-weather warnings (NWS), and natural disasters like wildfires (NASA EONET). Scoped to your home location; alerts speak and push like any JARVIS alert.</div>
+        <div class="haz-row">
+          <span class="haz-label">Monitor</span>
+          <button class="toggle-btn ${d.config?.hazard_monitor_enabled ? 'on' : 'off'}" data-cfg-key="hazard_monitor_enabled" data-cfg-val="${d.config?.hazard_monitor_enabled ? 'false' : 'true'}" id="haz-enable">${d.config?.hazard_monitor_enabled ? 'ON' : 'OFF'}</button>
+        </div>
+        <div class="haz-feeds">
+          <button class="toggle-btn ${d.config?.hazard_quakes_on !== false ? 'on' : 'off'}" data-cfg-key="hazard_quakes_on" data-cfg-val="${d.config?.hazard_quakes_on !== false ? 'false' : 'true'}">${d.config?.hazard_quakes_on !== false ? 'EARTHQUAKES ON' : 'EARTHQUAKES OFF'}</button>
+          <button class="toggle-btn ${d.config?.hazard_weather_on !== false ? 'on' : 'off'}" data-cfg-key="hazard_weather_on" data-cfg-val="${d.config?.hazard_weather_on !== false ? 'false' : 'true'}">${d.config?.hazard_weather_on !== false ? 'WEATHER ON' : 'WEATHER OFF'}</button>
+          <button class="toggle-btn ${d.config?.hazard_disasters_on !== false ? 'on' : 'off'}" data-cfg-key="hazard_disasters_on" data-cfg-val="${d.config?.hazard_disasters_on !== false ? 'false' : 'true'}">${d.config?.hazard_disasters_on !== false ? 'DISASTERS ON' : 'DISASTERS OFF'}</button>
+        </div>
+        <div class="haz-loc" id="haz-loc">Location: using home coordinates.</div>
+        <div class="haz-override">
+          <span class="haz-label">Override (optional)</span>
+          <input class="cfg-field cfg-text haz-in" type="text" inputmode="decimal" data-cfg-key="hazard_lat" value="${this._esc(d.config?.hazard_lat || '')}" placeholder="latitude">
+          <input class="cfg-field cfg-text haz-in" type="text" inputmode="decimal" data-cfg-key="hazard_lon" value="${this._esc(d.config?.hazard_lon || '')}" placeholder="longitude">
+        </div>
+        <div class="haz-tune">
+          <span class="haz-label">Quake radius (km)</span>
+          <input class="cfg-field cfg-text haz-in" type="text" inputmode="numeric" data-cfg-key="hazard_quake_radius_km" value="${this._esc(d.config?.hazard_quake_radius_km ?? 300)}">
+          <span class="haz-label">Min magnitude</span>
+          <input class="cfg-field cfg-text haz-in" type="text" inputmode="decimal" data-cfg-key="hazard_quake_min_mag" value="${this._esc(d.config?.hazard_quake_min_mag ?? 2.5)}">
+        </div>
+        <div class="doclib-controls">
+          <button class="cam-diag-btn" id="haz-scan">⟳ SCAN NOW</button>
+        </div>
+        <div class="haz-body" id="haz-body"></div>
+      </div>
+
+      <!-- SCHEDULED BRIEFINGS (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Briefings</span>
+          <span class="side">${(d.config?.briefing_morning_enabled || d.config?.briefing_evening_enabled) ? 'SCHEDULED' : 'OFF'}</span>
+        </div>
+        <div class="mem-sub">JARVIS speaks a summary at the times you set — weather and the day's forecast, your calendar, what happened overnight, power draw, and any active hazards nearby.</div>
+        <div class="haz-row">
+          <span class="haz-label">Morning</span>
+          <input class="cfg-field cfg-text haz-in" type="text" data-cfg-key="briefing_morning_time" value="${this._esc(d.config?.briefing_morning_time || '07:30')}" placeholder="07:30">
+          <button class="toggle-btn ${d.config?.briefing_morning_enabled ? 'on' : 'off'}" data-cfg-key="briefing_morning_enabled" data-cfg-val="${d.config?.briefing_morning_enabled ? 'false' : 'true'}">${d.config?.briefing_morning_enabled ? 'ON' : 'OFF'}</button>
+        </div>
+        <div class="haz-row">
+          <span class="haz-label">Evening</span>
+          <input class="cfg-field cfg-text haz-in" type="text" data-cfg-key="briefing_evening_time" value="${this._esc(d.config?.briefing_evening_time || '19:30')}" placeholder="19:30">
+          <button class="toggle-btn ${d.config?.briefing_evening_enabled ? 'on' : 'off'}" data-cfg-key="briefing_evening_enabled" data-cfg-val="${d.config?.briefing_evening_enabled ? 'false' : 'true'}">${d.config?.briefing_evening_enabled ? 'ON' : 'OFF'}</button>
+        </div>
+        <div class="haz-row">
+          <span class="haz-label">Only when someone's home</span>
+          <button class="toggle-btn ${d.config?.briefing_require_home !== false ? 'on' : 'off'}" data-cfg-key="briefing_require_home" data-cfg-val="${d.config?.briefing_require_home !== false ? 'false' : 'true'}">${d.config?.briefing_require_home !== false ? 'YES' : 'NO'}</button>
+        </div>
+        <div class="haz-label" style="margin:10px 0 6px">Include</div>
+        <div class="haz-feeds">
+          <button class="toggle-btn ${d.config?.briefing_include_weather !== false ? 'on' : 'off'}" data-cfg-key="briefing_include_weather" data-cfg-val="${d.config?.briefing_include_weather !== false ? 'false' : 'true'}">WEATHER</button>
+          <button class="toggle-btn ${d.config?.briefing_include_calendar !== false ? 'on' : 'off'}" data-cfg-key="briefing_include_calendar" data-cfg-val="${d.config?.briefing_include_calendar !== false ? 'false' : 'true'}">CALENDAR</button>
+          <button class="toggle-btn ${d.config?.briefing_include_events !== false ? 'on' : 'off'}" data-cfg-key="briefing_include_events" data-cfg-val="${d.config?.briefing_include_events !== false ? 'false' : 'true'}">OVERNIGHT</button>
+          <button class="toggle-btn ${d.config?.briefing_include_energy !== false ? 'on' : 'off'}" data-cfg-key="briefing_include_energy" data-cfg-val="${d.config?.briefing_include_energy !== false ? 'false' : 'true'}">ENERGY</button>
+          <button class="toggle-btn ${d.config?.briefing_include_hazards !== false ? 'on' : 'off'}" data-cfg-key="briefing_include_hazards" data-cfg-val="${d.config?.briefing_include_hazards !== false ? 'false' : 'true'}">HAZARDS</button>
+        </div>
+        <div class="doclib-controls">
+          <button class="cam-diag-btn" id="brief-now">▶ BRIEF ME NOW</button>
+        </div>
+      </div>
+
+      <!-- DOCUMENT LIBRARY (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Document Library</span>
+          <span class="side" id="doclib-status">RAG</span>
+        </div>
+        <div class="mem-sub">Drop manuals &amp; receipts (PDF, .txt, .md) into <code>/config/jarvis/documents</code> or upload below, then ingest. Ask JARVIS "what's the furnace filter size?" and it answers from your paperwork.</div>
+        <div class="doclib-controls">
+          <button class="cam-diag-btn" id="doclib-upload-btn">⬆ UPLOAD FILE</button>
+          <input type="file" id="doclib-file" accept=".pdf,.txt,.md" style="display:none;" />
+          <button class="cam-diag-btn" id="doclib-ingest">⟳ INGEST FOLDER</button>
+          <input class="log-search doclib-q" id="doclib-q" type="text" placeholder="test a search — e.g. furnace filter size" autocomplete="off" />
+        </div>
+        <div class="doclib-watch">
+          <input class="log-search doclib-watch-field" id="doclib-watch" type="text" placeholder="watch folders (one per line/comma) — e.g. /media/downloads" autocomplete="off" />
+          <button class="cam-diag-btn" id="doclib-scan">⟳ SCAN WATCH</button>
+        </div>
+        <div class="doclib-body" id="doclib-body">
+          <div class="mmwave-empty">Loading library…</div>
+        </div>
+        <div class="vecbk" id="vecbk">
+          <div class="vecbk-row">
+            <span class="vecbk-label">Search engine</span>
+            <span class="vecbk-state" id="vecbk-state">…</span>
+          </div>
+          <div class="vecbk-hint" id="vecbk-hint"></div>
+          <button class="cam-diag-btn" id="vecbk-toggle" style="display:none;">⬆ ENABLE SEMANTIC SEARCH</button>
+        </div>
+      </div>
+
+      <!-- JARVIS CHARACTER + RESEARCH (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>JARVIS Character &amp; Research</span>
+          <span class="side">PERSONA · WEB</span>
+        </div>
+        <div class="mem-sub">Banter is silenced automatically during anything urgent — a safety alert always speaks plainly. DuckDuckGo needs no setup; SearXNG needs a URL.</div>
+        <div class="home-cfg">
+          <div class="cfg-row">
+            <label>Banter level</label>
+            <select class="cfg-field" data-cfg-key="banter_level">${this._optsLabeled([['0','Plain — no wit'],['1','Dry — occasional wit (default)'],['2','Full — MCU JARVIS']], String(d.config?.banter_level ?? '1'))}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Web research backend</label>
+            <select class="cfg-field" data-cfg-key="search_backend">${this._optsLabeled([['duckduckgo','DuckDuckGo (no key, default)'],['searxng','SearXNG (self-hosted)']], d.config?.search_backend || 'duckduckgo')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>SearXNG URL</label>
+            <input class="cfg-field" type="text" data-cfg-key="searxng_url"
+                   value="${this._esc(d.config?.searxng_url || '')}" placeholder="http://searxng.local:8080" autocomplete="off" />
+          </div>
+          <div class="cfg-row">
+            <label>Escalate to LLM web search</label>
+            <button class="toggle-btn ${(d.config?.web_research_llm_fallback) ? 'on' : 'off'}" data-cfg-key="web_research_llm_fallback" data-cfg-val="${(d.config?.web_research_llm_fallback) ? 'false' : 'true'}" title="When the backend above finds nothing, let JARVIS fall back to the configured LLM's own live web search (currently Gemini only). Off by default.">${(d.config?.web_research_llm_fallback) ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Calendar tight-gap (min)</label>
+            <input class="cfg-field" type="number" min="0" max="120" data-cfg-key="calendar_tight_gap_min"
+                   value="${this._esc(String(d.config?.calendar_tight_gap_min ?? 15))}" autocomplete="off" />
+          </div>
+        </div>
+      </div>
+
+      <!-- CAMERAS (names + location designation, v7.94.0 — moved from Command Center) -->
+      <div class="panel">
+        <div class="head">
+          <span>Cameras</span>
+          <span class="side">NAMES · LOCATION</span>
+        </div>
+        <div class="mem-sub">Names are JARVIS-only (HA untouched; blank reverts). Location governs intrusion + outdoor-event filtering — AUTO shows what the heuristics resolve.</div>
+        <div class="home-cfg" style="margin-bottom:10px;">
+          <div class="cfg-row">
+            <label>Face recognition source</label>
+            <select class="cfg-field" data-cfg-key="recognition_source">${this._optsLabeled([['both','Both (Double Take + Frigate)'],['frigate','Frigate only (sub_label)'],['doubletake','Double Take only']], d.config?.recognition_source || 'both')}</select>
+          </div>
+          <div class="cfg-row">
+            <label>Recognition confidence</label>
+            <input class="cfg-field cfg-num" type="number" min="0" max="1" step="0.05" data-cfg-key="identity_min_confidence" value="${this._esc(d.config?.identity_min_confidence ?? '')}" placeholder="0.45" title="Below this face-match confidence a person is recorded as 'unknown'. Higher = stricter, fewer false names.">
+          </div>
+        </div>
+        <div class="camset-list" id="camset-body">
+          ${this._renderCameraSettings(d)}
+        </div>
+      </div>
+
+      <!-- INTRUSION / SECURITY + LOG moved to their own tab (v7.94.0) -->
+
+      <!-- VOICE CONFIRMATION (v7.94.0) -->
+      <div class="panel">
+        <div class="head">
+          <span>Voice Confirmation</span>
+          <span class="side" id="vc-status">${d.config?.voice_confirm_enabled ? '<span class="diag-ok">ON</span>' : '<span class="diag-off">OFF</span>'}</span>
+        </div>
+        <div class="mem-sub">Ask out loud before sensitive actions (unlock, garage, disarm) and listen for a spoken yes/no. Native mode uses the satellite's own audio; gated mode speaks through the room speaker (Nest) — run the test to see which your setup supports.</div>
+        <div class="home-cfg">
+          <div class="cfg-row">
+            <label>Voice confirmation</label>
+            <button class="toggle-btn ${d.config?.voice_confirm_enabled ? 'on' : 'off'}" data-cfg-key="voice_confirm_enabled" data-cfg-val="${d.config?.voice_confirm_enabled ? 'false' : 'true'}">${d.config?.voice_confirm_enabled ? 'ON' : 'OFF'}</button>
+          </div>
+          <div class="cfg-row">
+            <label>Mode</label>
+            <select class="cfg-field" data-cfg-key="voice_confirm_mode">${this._optsLabeled([['auto','Auto (try native, fall back)'],['native','Native (satellite audio)'],['gated','Gated (room speaker)']], d.config?.voice_confirm_mode || 'auto')}</select>
+          </div>
+        </div>
+        <div class="doclib-controls">
+          <button class="cam-diag-btn" id="vc-test">▶ TEST SATELLITE AUDIO</button>
+        </div>
+        <div class="vc-test-result" id="vc-test-result"></div>
+      </div>
+
+      <!-- SATELLITE ROUTING -->
+      <div class="panel">
+        <div class="head">
+          <span>Satellite → Speaker</span>
+          <span class="side">ROUTING</span>
+        </div>
+        <div class="pairing-list">
+          ${this._renderSatellitePairings(d)}
+        </div>
+      </div>
+
+      <!-- ANNOUNCEMENT SPEAKERS -->
+      <div class="panel">
+        <div class="head">
+          <span>Announcement Speakers</span>
+          <span class="side">BROADCAST</span>
+        </div>
+        <div class="rule-list">
+          ${this._renderAnnouncementSpeakers(d)}
+        </div>
+      </div>
+
+      <!-- DIAGNOSTICS (moved under announcements) -->
+      <div class="panel">
+        <div class="head">
+          <span>Diagnostics</span>
+          <span class="side">TEST</span>
+        </div>
+        <div class="diag-row">
+          <div class="label">TTS — JARVIS voice test</div>
+          <button class="btn" data-svc="jarvis.test_tts">Run</button>
+        </div>
+        <div class="diag-row">
+          <div class="label">Observer — fire status event</div>
+          <button class="btn" data-svc="jarvis.observer_status">Run</button>
+        </div>
+        <div class="diag-row">
+          <div class="label">Briefing — manual trigger</div>
+          <button class="btn" data-svc="jarvis.briefing">Run</button>
+        </div>
+        <div class="diag-row">
+          <div class="label">Doorbell — run diagnostics</div>
+          <button class="btn" data-svc="jarvis.diagnose_doorbell">Run</button>
+        </div>
+        <div class="diag-row">
+          <div class="label">Notification — test phone push</div>
+          <button class="btn" data-svc="jarvis.test_notify">Run</button>
+        </div>
+        <div class="diag-row">
+          <div class="label">Routing — dump routing state to log</div>
+          <button class="btn" data-svc="jarvis.test_routing">Run</button>
+        </div>
+        <div class="diag-row">
+          <div class="label">Camera — analyze now (vision → reasoning)</div>
+          <select class="notify-select diag-camera-select">${this._renderCameraOptions(d)}</select>
+          <button class="btn diag-camera-run">Run</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- FLOOR PLAN EDITOR — full width below settings grid; its own sub-tab -->
+    <div class="panel settings-extra-panel" data-section="floorplan" style="margin-top:16px;">
+      <div class="head">
+        <span>Floor Plan Editor</span>
+        <span class="side">LAYOUT</span>
+      </div>
+      <div class="fp-editor" id="fp-editor-wrap">
+        ${this._renderFloorPlanEditor(d)}
+      </div>
+    </div>
+
+    <!-- DOORBELL TRAINING — backlog scan + analysed-event dataset -->
+    <div class="panel settings-extra-panel" data-section="cameras" style="margin-top:16px;">
+      <div class="head">
+        <span>Doorbell Training</span>
+        <span class="side">DATASET</span>
+      </div>
+      <div class="dbt-intro">Analysed doorbell events — JARVIS's visitor training data. Each press is logged automatically; run a backlog scan to mine the Nest recorded-event history into the dataset.</div>
+      ${this._renderDoorbellTraining(d)}
+    </div>
+
+    <!-- GOVERNANCE — kernel enforcement kill-switches (owner control surface) -->
+    <div class="panel settings-extra-panel" data-section="governance" style="margin-top:16px;">
+      <div class="head">
+        <span>Governance</span>
+        <span class="side">ENFORCEMENT</span>
+      </div>
+      <div class="mem-sub">JARVIS's kernel brings each capability online along a shadow → parity → enforce ladder, each behind a kill-switch. Here you control those switches: the opt-in capabilities ship OFF (enable when you're ready), and the live safety guards ship ON (leave them on). Changes take effect immediately and survive a restart.</div>
+      <div class="gov-body" id="gov-body"><div class="mem-sub">Loading governance switches…</div></div>
+    </div>
+
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'intrusion' ? `
+  <!-- ═══ INTRUSION TAB ═══ -->
+  <div class="logs-tab">
+    <!-- INTRUSION / SECURITY -->
+    <div class="panel">
+      <div class="head">
+        <span>Intrusion</span>
+        <span class="side" id="intr-status">…</span>
+      </div>
+      <div class="mem-sub">Last intrusion snapshot and false-alarm call-off. When JARVIS confirms an intruder on camera it grabs a still; if it's not real, call it off here or say "it's a false alarm".</div>
+      <div class="intr-body" id="intr-body">
+        <div class="mmwave-empty">Loading…</div>
+      </div>
+    </div>
+
+    <!-- INTRUSION LOG + TRAINING -->
+    <div class="panel">
+      <div class="head">
+        <span>Intrusion Log</span>
+        <span class="side" id="ilog-learn">…</span>
+      </div>
+      <div class="mem-sub">Every intrusion event with its snapshot. Mark each one <b>real</b> or <b>false alarm</b> — JARVIS learns from your labels and stops firing the low-confidence alerts for patterns you keep calling false. A confirmed intrusion always alerts, no matter what it has learned.</div>
+      <div class="doclib-controls">
+        <button class="cam-diag-btn" id="ilog-refresh">⟳ REFRESH</button>
+      </div>
+      <div class="ilog-body" id="ilog-body">
+        <div class="mmwave-empty">Loading…</div>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'suggestions' ? `
+  <div class="logs-tab">
+    <div class="panel">
+      <div class="head"><span>SUGGESTIONS</span></div>
+      <div class="sug-tab-intro">Automations JARVIS has learned from watching your
+        routines. Review each — approve to create it in Home Assistant, or dismiss
+        it. Nothing runs until you approve, and you can see the exact automation
+        before deciding.</div>
+      ${this._renderSuggestions(d)}
+    </div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'logs' ? `
+  <div class="logs-tab">
+    <div class="panel">
+      <div class="head">
+        <span>System Log</span>
+        <span class="side">JARVIS INTERNAL</span>
+      </div>
+      <div class="log-filters">
+        <input id="log-search" class="log-search" type="text" placeholder="search…" autocomplete="off" value="${this._esc(this._logSearch || '')}" />
+        <button class="log-filter ${(this._logFilter || 'all') === 'all' ? 'active' : ''}" data-filter="all">ALL</button>
+        <button class="log-filter ${this._logFilter === 'CONV' ? 'active' : ''}" data-filter="CONV">CONV</button>
+        <button class="log-filter ${this._logFilter === 'LOCAL' ? 'active' : ''}" data-filter="LOCAL">LOCAL</button>
+        <button class="log-filter ${this._logFilter === 'AGENT' ? 'active' : ''}" data-filter="AGENT">AGENT</button>
+        <button class="log-filter ${this._logFilter === 'GATE' ? 'active' : ''}" data-filter="GATE">GATE</button>
+        <button class="log-filter ${this._logFilter === 'DEDUP' ? 'active' : ''}" data-filter="DEDUP">DEDUP</button>
+        <button class="log-filter ${this._logFilter === 'CLASSIFY' ? 'active' : ''}" data-filter="CLASSIFY">CLASSIFY</button>
+        <button class="log-filter ${this._logFilter === 'CAMERA' ? 'active' : ''}" data-filter="CAMERA">CAMERA</button>
+        <button class="log-filter ${this._logFilter === 'ROUTE' ? 'active' : ''}" data-filter="ROUTE">ROUTE</button>
+        <button class="log-filter ${this._logFilter === 'ERROR' ? 'active' : ''}" data-filter="ERROR">ERROR</button>
+      </div>
+      <div class="log-count" id="log-count"></div>
+      <div id="debug-log-entries" class="log-entries">
+        <div class="log-loading">Loading...</div>
+      </div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'memory' ? `
+  <!-- ═══ MEMORY TAB ═══ -->
+  <div class="mem-tab">
+    <div class="panel">
+      <div class="head">
+        <span>What JARVIS Knows</span>
+        <span class="side" id="mem-count">— FACTS</span>
+      </div>
+      <div class="mem-sub">Durable facts &amp; preferences JARVIS recalls in conversation. Teach it something, or forget anything with ✕.</div>
+      <div class="mem-teach">
+        <input id="mem-key" class="mem-input" placeholder="what  (e.g. trash day)" autocomplete="off" />
+        <input id="mem-val" class="mem-input" placeholder="is  (e.g. Tuesday)" autocomplete="off" />
+        <select id="mem-subject" class="mem-input mem-select">
+          <option value="household">Household</option>
+          <option value="primary">About me</option>
+        </select>
+        <button id="mem-add" class="mem-btn">TEACH</button>
+      </div>
+      <div id="memory-list" class="mem-list"><div class="mem-empty">Loading…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="head">
+        <span>Person Routines</span>
+        <span class="side">LEARNED</span>
+      </div>
+      <div class="mem-sub">Habits JARVIS has confidently attributed to one person, from 30 days of sole-occupant activity — separate from household-wide facts above.</div>
+      <div id="proutine-list" class="mem-list"><div class="mem-empty">Loading…</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="head">
+        <span>Recent Briefings</span>
+        <span class="side">FULL TEXT</span>
+      </div>
+      <div class="mem-sub">The full briefings JARVIS delivered — read here when a phone notification truncated a long one.</div>
+      <div id="briefings-list" class="mem-list"><div class="mem-empty">Loading…</div></div>
+    </div>
+  </div>
+  ` : ''}
+
+  ${this._currentTab === 'chat' ? `
+  <!-- ═══ CHAT TAB (issue #322) ═══ -->
+  <div class="chat-tab">
+    <div class="panel chat-panel">
+      <div class="head">
+        <span>Talk to JARVIS<button id="chat-clear" class="chat-clean" ${this._chatAsk ? 'hidden' : ''}>CLEAN</button><span id="chat-ask" class="chat-ask" ${this._chatAsk ? '' : 'hidden'}>Delete all messages on every device?<button id="chat-ask-no" class="chat-clean">CANCEL</button><button id="chat-ask-yes" class="chat-clean chat-yes">YES, DELETE ALL</button></span></span>
+        <span class="side">${this._chatAgentLabel()}</span>
+      </div>
+      <div id="chat-log" class="chat-log">${this._renderChatMessages()}</div>
+      <div class="chat-compose">
+        <textarea id="chat-input" class="chat-input" rows="1" placeholder="Type a message — Enter to send, Shift+Enter for a new line" ${this._chatBusy ? 'disabled' : ''} autocomplete="off">${this._esc(this._chatDraft)}</textarea>
+        <div class="chat-voice">
+          <button id="chat-speak" class="chat-tts ${this._chatSpeak ? 'on' : ''}" title="Spoken replies on or off" aria-label="Spoken replies">${this._ttsIcon()}</button>
+          <button id="chat-mic" class="chat-mic ${this._micStop ? 'on' : ''}" title="Hold to talk" aria-label="Hold to talk">${this._micIcon()}</button>
+          <button id="chat-wake" class="chat-wake ${this._wakeOn ? 'on' : ''}" aria-label="Hey JARVIS" aria-pressed="false">${this._wakeIcon()}</button>
+        </div>
+        <button id="chat-send" class="chat-send" ${this._chatBusy ? 'disabled' : ''} title="Send">${this._chatBusy ? '…' : 'SEND'}</button>
+      </div>
+      <!-- chat-hint-removed -->
+    </div>
+  </div>
+  ` : ''}
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <div>NODE: <span class="hl">HOMEASSISTANT.LOCAL</span></div>
+    <div class="mid">// JARVIS · v${this._esc(this._liveData?.version || '—')} · ${this._esc(this._currentTab.toUpperCase())}</div>
+    <div>STATUS: <span class="hl">NOMINAL</span></div>
+  </div>
+
+  <!-- Toast container -->
+  <div class="toast-wrap" id="toast-wrap"></div>
+
+  <!-- AREA DETAIL (drill-down) -->
+  ${this._renderAreaDetail(d)}
+
+  <!-- ROOM LIGHTS (per-light list + toggles, #234) -->
+  ${this._renderAreaLightsPopover()}
+</div>
+    `;
+  }
+
+  _renderAreaLightsPopover() {
+    const p = this._lightsPopover;
+    if (!p) return '';
+    const rows = (() => {
+      if (p.lights === null) {
+        return `<div class="alp-loading">Loading lights…</div>`;
+      }
+      if (!p.lights.length) {
+        return `<div class="alp-loading">No controllable lights in this room.</div>`;
+      }
+      return p.lights.map(l => l.manual ? `
+        <div class="alp-row alp-manual ${l.on ? 'on' : ''}" title="A manual heater: switched by hand, never from here">
+          <span class="alp-dot"></span>
+          <span class="alp-name">${this._esc(l.name)}</span>
+          <span class="alp-state">BY HAND</span>
+        </div>` : `
+        <button class="alp-row ${l.on ? 'on' : ''}" data-light-eid="${this._esc(l.entity_id)}" data-light-on="${l.on ? '1' : '0'}">
+          <span class="alp-dot"></span>
+          <span class="alp-name">${this._esc(l.name)}</span>
+          <span class="alp-state">${l.on ? 'ON' : 'OFF'}</span>
+        </button>`).join('');
+    })();
+    const anyOn = Array.isArray(p.lights) && p.lights.some(l => l.on && !l.manual);   // jh-r22-lights: manual heaters stay
+    return `
+      <div class="area-lights-overlay" id="area-lights-overlay">
+        <div class="area-lights-card">
+          <div class="alp-head">
+            <span class="alp-title">${this._esc(p.name || 'Lights')}</span>
+            <button class="alp-close" aria-label="Close">✕</button>
+          </div>
+          <div class="alp-list">${rows}</div>
+          <div class="alp-foot">
+            <button class="alp-all-off" ${anyOn ? '' : 'disabled'}>Turn all off</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  async _openAreaLights(areaId, name) {
+    if (!this._hass || !areaId) return;
+    this._lightsPopover = { areaId, name, lights: null };
+    this._render();
+    try {
+      const res = await this._hass.callWS({ type: 'jarvis/area_lights', area_id: areaId });
+      // Ignore if the user already closed it or opened a different room.
+      if (this._lightsPopover && this._lightsPopover.areaId === areaId) {
+        this._lightsPopover.lights = Array.isArray(res?.lights) ? res.lights : [];
+        if (res?.name) this._lightsPopover.name = res.name;
+        this._render();
+      }
+    } catch (err) {
+      if (this._lightsPopover && this._lightsPopover.areaId === areaId) {
+        this._lightsPopover.lights = [];
+        this._render();
+      }
+      this._toast('✗ lights — ' + (err && err.message || err), 'err');
+    }
+  }
+
+  _closeAreaLights() {
+    this._lightsPopover = null;
+    this._render();
+  }
+
+  async _toggleOneLight(entityId, isOn) {
+    if (!this._hass || !entityId) return;
+    const lp = this._lightsPopover;   // jh-r22-lights (step 164): a manual heater row is never switched from here
+    const lrow = lp && Array.isArray(lp.lights) ? lp.lights.find(l => l.entity_id === entityId) : null;
+    if (!lp || !lrow || lrow.manual) return;
+    try {
+      const res = await this._hass.callWS({ type: 'jarvis/area_lights_set', area_id: lp.areaId, entity_id: entityId, on: !isOn });
+      // jh-r23-lights (step 165, review round 23 #12): the row flips only when the backend switched that light
+      const ok = !!(res && Array.isArray(res.done) && res.done.includes(entityId));
+      if (!ok) {
+        this._toast('✗ not switched: ' + (lrow.name || entityId), 'err');
+        this._openAreaLights(lp.areaId, lp.name);   // the list again, as it really is
+        return;
+      }
+      this._jhHapticConfirm([entityId], isOn ? 'off' : 'on');   // jh-haptic: success only when the light confirms
+      // Optimistic local flip so the row updates immediately.
+      const p = this._lightsPopover;
+      if (p && Array.isArray(p.lights)) {
+        const row = p.lights.find(l => l.entity_id === entityId);
+        if (row) row.on = !isOn;
+        this._render();
+      }
+      setTimeout(() => { try { this._fetchLiveData(); } catch (e) {} }, 500);
+    } catch (err) {
+      this._toast('✗ light — ' + (err && err.message || err), 'err');
+    }
+  }
+
+  // ─── Event wiring ────────────────────────────────────────────────────────
+
+  // ── Config-flow parity cards (9.19.0) ──────────────────────────────────────
+  // Every non-secret field from the integration's Configure flow, mirrored into
+  // the main panel. Secrets (provider API keys, the IMAP password) stay in the
+  // config flow / secrets.yaml and are never entered here. Headings are mapped to
+  // sub-sections in _stampSettingsSections(); controls use the shared cfg-field /
+  // toggle wiring (bedroom areas use the dedicated chip handler, like lab areas).
+  _renderConfigParity(d) {
+    const c = (d && d.config) || {};
+    const esc = (v) => this._esc(String(v == null ? '' : v));
+    const tog = (key, on) =>
+      `<button class="toggle-btn ${on ? 'on' : 'off'}" data-cfg-key="${key}" data-cfg-val="${on ? 'false' : 'true'}">${on ? 'ON' : 'OFF'}</button>`;
+    const presets = Array.isArray(c.directive_presets) ? c.directive_presets : [];
+    const areas = (d && d.areasGrid) || [];
+    const bed = Array.isArray(c.bedroom_areas) ? c.bedroom_areas : [];
+    const bedChips = areas.length
+      ? areas.map(a => `<button class="area-chip ${bed.includes(a.id) ? 'on' : ''}" data-bedroom-area="${esc(a.id)}">${esc(a.name)}</button>`).join('')
+      : '<span class="mode-bind-empty">No rooms detected yet.</span>';
+
+    return `
+      <!-- PERSONA & CORE (config-flow parity) -->
+      <div class="panel">
+        <div class="head"><span>Persona &amp; Core</span><span class="side">IDENTITY · DIRECTIVE</span></div>
+        <div class="mem-sub">Who JARVIS is and how it addresses you. A custom directive overrides the preset when set.</div>
+        <div class="home-cfg">
+          <div class="cfg-row"><label>Form of address</label><input class="cfg-field cfg-text" type="text" data-cfg-key="honorific" value="${esc(c.honorific || '')}" placeholder="sir"></div>
+          <div class="cfg-row"><label>Directive preset</label><select class="cfg-field" data-cfg-key="directive_preset">${this._opts(presets, String(c.directive_preset || ''))}</select></div>
+          <div class="cfg-row"><label>Custom directive <span class="mode-bind-sub">overrides preset</span></label><textarea class="cfg-field cfg-text" data-cfg-key="directive" rows="3" placeholder="(optional) a custom standing directive">${esc(c.directive || '')}</textarea></div>
+          <div class="cfg-row"><label>Use Home Assistant LLM API</label>${tog('use_hass_api', c.use_hass_api !== false)}</div>
+          <div class="cfg-row"><label>LLM web-search fallback</label>${tog('web_research_llm_fallback', !!c.web_research_llm_fallback)}</div>
+          <div class="cfg-row"><label>Check that actions really ran</label>${tog('jh_strict_actions', c.jh_strict_actions !== false)}</div>
+          <div class="cfg-row"><label>Block actions after reading an email</label>${tog('jh_mail_block', c.jh_mail_block !== false)}</div>
+          <div class="cfg-row"><label>Scheduled briefings use real facts only</label>${tog('jh_facts_only_briefings', c.jh_facts_only_briefings !== false)}</div>
+          <div class="cfg-row"><label>Keep the local model loaded <span class="mode-bind-sub">holds GPU memory all the time</span></label>${tog('ollama_keep_warm', c.ollama_keep_warm === true)}</div>
+          <div class="cfg-row"><label>Search the web when a model says it cannot know <span class="mode-bind-sub">sends the question to the search service</span></label>${tog('jh_web_rescue', c.jh_web_rescue === true)}</div>
+          <div class="cfg-row"><label>JARVIS may send notifications <span class="mode-bind-sub">logged-in admins only</span></label>${tog('jh_notify_admins', c.jh_notify_admins !== false)}</div>
+          <div class="cfg-row"><label>Camera Watch opens on</label><select class="cfg-field" data-cfg-key="camera_watch_default">${this._optsLabeled([['last', 'Last camera used'], ...(Array.isArray(c.cameras) ? c.cameras : []).map(x => [x.entity_id, x.name || x.entity_id])], String(c.camera_watch_default || ''))}</select></div>
+        </div>
+      </div>
+
+      <!-- ROUTING (config-flow parity) -->
+      <div class="panel">
+        <div class="head"><span>Routing</span><span class="side">AREAS · BROADCAST</span></div>
+        <div class="mem-sub">Bedroom areas drive sleep detection during quiet hours. The broadcast group is the media_player JARVIS announces through.</div>
+        <div class="home-cfg">
+          <div class="cfg-row"><label>Bedroom areas <span class="mode-bind-sub">sleep detection</span></label><div class="area-chips" id="bedroom-area-chips">${bedChips}</div></div>
+          <div class="cfg-row"><label>Broadcast group <span class="mode-bind-sub">media_player</span></label><select class="cfg-field" data-cfg-key="broadcast_group">${this._mediaPlayerOptions(c.broadcast_group || '')}</select></div>
+        </div>
+      </div>
+
+      <!-- QUIET HOURS (config-flow parity) -->
+      <div class="panel">
+        <div class="head"><span>Quiet Hours</span><span class="side">${esc(c.observer_quiet_start || '22:00')}–${esc(c.observer_quiet_end || '07:00')}</span></div>
+        <div class="mem-sub">Between these times JARVIS stays quiet — proactive announcements, briefings and the Observer back off.</div>
+        <div class="home-cfg">
+          <div class="cfg-row">
+            <label>Quiet window <span class="cfg-hint">start → end</span></label>
+            <span style="display:flex;gap:6px;align-items:center;">
+              <input class="cfg-field" type="time" data-cfg-key="observer_quiet_start" value="${esc(c.observer_quiet_start || '22:00')}">
+              <span style="color:var(--text-dim);font-size:10px;">to</span>
+              <input class="cfg-field" type="time" data-cfg-key="observer_quiet_end" value="${esc(c.observer_quiet_end || '07:00')}">
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- IDENTITY (config-flow parity) -->
+      <div class="panel">
+        <div class="head"><span>Identity</span><span class="side">RECOGNITION</span></div>
+        <div class="mem-sub">Per-person recognition. The voice-fingerprint tier needs a GPU; the face-match confidence lives in the Cameras card.</div>
+        <div class="home-cfg">
+          <div class="cfg-row"><label>Per-person recognition</label>${tog('identity_enabled', c.identity_enabled !== false)}</div>
+          <div class="cfg-row"><label>Voice fingerprint <span class="mode-bind-sub">needs a GPU</span></label>${tog('identity_voice_fingerprint', !!c.identity_voice_fingerprint)}</div>
+          <div class="cfg-row"><label>Voice recognition source</label><input class="cfg-field cfg-text" type="text" data-cfg-key="voice_recognition_source" value="${esc(c.voice_recognition_source || '')}" placeholder="(optional)"></div>
+          <div class="cfg-row"><label>Auto-enroll new voices</label>${tog('voice_recognition_auto_enroll', c.voice_recognition_auto_enroll !== false)}</div>
+        </div>
+      </div>
+
+      <!-- EMAIL / IMAP (config-flow parity; password stays in secrets.yaml) -->
+      <div class="panel">
+        <div class="head"><span>Email (IMAP)</span><span class="side">READ-ONLY INBOX</span></div>
+        <div class="mem-sub">Read-only inbox access. The <b>password is not entered here</b> — set it in Settings → Devices &amp; Services → JARVIS → Configure → Email (it lives in Home Assistant secrets.yaml).</div>
+        <div class="home-cfg">
+          <div class="cfg-row"><label>Enabled</label>${tog('imap_enabled', !!c.imap_enabled)}</div>
+          <div class="cfg-row"><label>Host</label><input class="cfg-field cfg-text" type="text" data-cfg-key="imap_host" value="${esc(c.imap_host || '')}" placeholder="imap.example.com"></div>
+          <div class="cfg-row"><label>Port</label><input class="cfg-field cfg-num" type="number" min="1" max="65535" step="1" data-cfg-key="imap_port" value="${esc(c.imap_port ?? 993)}" placeholder="993"></div>
+          <div class="cfg-row"><label>User</label><input class="cfg-field cfg-text" type="text" data-cfg-key="imap_user" value="${esc(c.imap_user || '')}" placeholder="you@example.com"></div>
+          <div class="cfg-row"><label>Folder</label><input class="cfg-field cfg-text" type="text" data-cfg-key="imap_folder" value="${esc(c.imap_folder || 'INBOX')}" placeholder="INBOX"></div>
+          <div class="cfg-row"><label>SSL</label>${tog('imap_ssl', c.imap_ssl !== false)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  _stampSettingsSections() {
+    // Assign each Settings card to a sub-section and record it on the element as
+    // data-section. Runs while headings are still their original English text, so
+    // the mapping is stable even after _localizeDOM() translates the visible text.
+    // Matching the *displayed* text (as this used to) silently put every card in
+    // "general" on any non-English UI — leaving every other sub-tab empty.
+    const root = this.shadowRoot;
+    const grid = root && root.querySelector(".settings-grid");
+    if (!grid) return;
+    // Card heading → section. Unmapped cards fall into "general" so nothing ever
+    // disappears (a new/renamed card just shows under General until mapped).
+    const MAP = {
+      "Residence / Home": "general", "General": "general",
+      "Persona & Core": "general", "Routing": "general", "Identity": "general",
+      "Quiet Hours": "learning", "Email (IMAP)": "home",
+      "Sub-Agents & Automation": "general",
+      "Operational Mode": "general", "System Diagnostics": "general",
+      "AI Models": "voice", "Briefings": "voice", "Voice Confirmation": "voice",
+      "Satellite → Speaker": "voice", "Announcement Speakers": "voice",
+      "Anticipation & Memory": "learning", "Memory": "learning",
+      "Observer Tuning": "learning", "Routine Learning": "learning",
+      "Excluded Entities": "learning",
+      "Notifications": "safety", "Muted Announcements": "safety", "Sentinel Rules": "safety",
+      "Hazard Monitor": "safety", "Energy Management": "safety",
+      "Appliances": "safety",
+      "Cameras": "cameras", "Diagnostics": "cameras",
+      "Doorbell Training": "cameras",
+      "Floor Plan Editor": "home", "Wellbeing Context": "home",
+      "JARVIS Character & Research": "home", "Document Library": "home",
+      "Optional pages": "home", "Answer watcher": "home",   // jh-optional
+    };
+    // Inline stroke icons per sub-section (stroke:currentColor so they inherit
+    // the button's active/hover colour). floorplan/governance have no grid cards
+    // of their own — their content is a full-width extra-panel — but still get an
+    // icon + count.
+    const ICONS = {
+      general: '<svg class="subnav-ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.05 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+      voice: '<svg class="subnav-ico" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>',
+      learning: '<svg class="subnav-ico" viewBox="0 0 24 24"><path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7z"/><path d="M9 21h6"/></svg>',
+      safety: '<svg class="subnav-ico" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+      cameras: '<svg class="subnav-ico" viewBox="0 0 24 24"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>',
+      home: '<svg class="subnav-ico" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>',
+      floorplan: '<svg class="subnav-ico" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>',
+      governance: '<svg class="subnav-ico" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>',
+    };
+
+    const counts = {};
+    Array.from(grid.children).forEach(card => {
+      if (!card.classList || !card.classList.contains("panel")) return;
+      const h = card.querySelector(".head span");
+      const title = h ? h.textContent.trim() : "";
+      const sec = MAP[title] || "general";
+      card.dataset.section = sec;
+      counts[sec] = (counts[sec] || 0) + 1;
+    });
+    // Full-width panels that live OUTSIDE the grid also count toward their badge.
+    root.querySelectorAll(".settings-page .settings-extra-panel[data-section]").forEach(p => {
+      const sec = p.getAttribute("data-section");
+      if (sec) counts[sec] = (counts[sec] || 0) + 1;
+    });
+
+    // Style dependent '↳' rows as indented tree branches.
+    root.querySelectorAll(".settings-page .cfg-row > label").forEach(lbl => {
+      if (lbl.textContent.includes("↳")) {
+        lbl.closest(".cfg-row")?.classList.add("cfg-subrow");
+      }
+    });
+
+    // Decorate sub-nav buttons with icon + card-count badge (idempotent per render).
+    root.querySelectorAll(".settings-subnav-btn").forEach(btn => {
+      const sec = btn.getAttribute("data-settings-section");
+      if (sec && ICONS[sec] && !btn.querySelector(".subnav-ico")) {
+        btn.insertAdjacentHTML("afterbegin", ICONS[sec]);
+      }
+      if (sec && counts[sec] && !btn.querySelector(".subnav-count")) {
+        const badge = document.createElement("span");
+        badge.className = "subnav-count";
+        badge.textContent = counts[sec];
+        btn.appendChild(badge);
+      }
+    });
+
+    // Inject a live "filter settings cards" search box into the sub-nav dock.
+    const subnav = root.querySelector(".settings-subnav");
+    if (subnav && !subnav.querySelector("#settings-card-filter")) {
+      const input = document.createElement("input");
+      input.id = "settings-card-filter";
+      input.className = "settings-filter-input";
+      input.type = "search";
+      input.placeholder = "Filter settings cards…";
+      input.value = this._settingsFilterQuery || "";
+      input.addEventListener("input", (e) => {
+        this._settingsFilterQuery = e.currentTarget.value;
+        this._applySettingsSections();
+      });
+      subnav.appendChild(input);
+    }
+  }
+
+  _applySettingsSections() {
+    const root = this.shadowRoot;
+    const grid = root && root.querySelector(".settings-grid");
+    if (!grid) return;
+    const active = this._settingsSection || "general";
+    const query = (this._settingsFilterQuery || "").trim().toLowerCase();
+
+    // With a filter query active, matching cards show across every section and
+    // the sub-nav highlight clears; otherwise it's plain section switching.
+    root.querySelectorAll(".settings-subnav-btn").forEach(b => {
+      b.classList.toggle("active", !query && b.getAttribute("data-settings-section") === active);
+    });
+    Array.from(grid.children).forEach(card => {
+      if (!card.classList || !card.classList.contains("panel")) return;
+      // Read the section stamped at render time (localization-proof), not the
+      // possibly-translated heading text.
+      const section = card.dataset.section || "general";
+      const match = query ? card.textContent.toLowerCase().includes(query) : section === active;
+      card.style.display = match ? "" : "none";
+    });
+    // Full-width panels that live OUTSIDE the grid (Floor Plan Editor,
+    // Doorbell Training) carry their own data-section. Without this they render
+    // under every sub-tab, since the loop above only touches grid children.
+    root.querySelectorAll(".settings-page .settings-extra-panel[data-section]").forEach(p => {
+      const section = p.getAttribute("data-section");
+      const match = query ? p.textContent.toLowerCase().includes(query) : section === active;
+      p.style.display = match ? "" : "none";
+    });
+  }
+
+  _wire() {
+    // Hamburger menu → HA sidebar toggle
+    const mBtn = this.shadowRoot.querySelector("#menu-btn");
+    if (mBtn) {
+      mBtn.addEventListener("click", () => {
+        this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true }));
+      });
+    }
+
+    // Lockdown toggle
+    const ldBtn = this.shadowRoot.querySelector("#lockdown-btn");
+    if (ldBtn) {
+      ldBtn.addEventListener("click", async () => {
+        const active = !!this._liveData?.lockdown?.active;
+        ldBtn.disabled = true;
+        try {
+          const res = await this._hass.callWS({ type: "jarvis/set_lockdown", on: !active });
+          if (res && res.lockdown) {
+            if (!this._liveData) this._liveData = {};
+            this._liveData.lockdown = res.lockdown;
+            this._patchLockdown(this._liveData);   // flip the switch on the WS result, not the next poll
+          }
+          await this._fetchLiveData();
+        } catch (e) {
+          console.warn("JARVIS: lockdown toggle failed", e);
+        } finally {
+          ldBtn.disabled = false;
+        }
+      });
+    }
+
+    // Tab switching
+    this.shadowRoot.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", (e) => {
+        const newTab = e.currentTarget.getAttribute("data-tab");
+        if (newTab && newTab !== this._currentTab) {
+          this._currentTab = newTab;
+          if (newTab !== "dashboard") { try { this._jhRtcStop(); } catch (err) {} }   // jh-r16-rtc: no stream on another tab
+          this._render();
+          if (newTab === "logs") this._fetchDebugLog();
+          if (newTab === "memory") { this._fetchKnowledge(); this._fetchPersonRoutines(); this._fetchBriefings(); }
+          if (newTab === "chat") this.shadowRoot?.getElementById("chat-input")?.focus();
+        }
+      });
+    });
+
+    // Chat tab (issue #322) — send on button click or Enter (Shift+Enter = newline).
+    const chatSend = this.shadowRoot.querySelector("#chat-send");
+    if (chatSend) chatSend.addEventListener("click", () => this._sendChat());
+    const chatInput = this.shadowRoot.querySelector("#chat-input");
+    if (chatInput) {
+      chatInput.addEventListener("input", () => { this._chatDraft = chatInput.value; if (this._wakeOn) this._wakeSync(); });
+      // Hey JARVIS rests only while a message is typed, so it looks again when the box gets or loses the focus or changes
+      ["focus", "blur", "input"].forEach((n) => chatInput.addEventListener(n, () => { if (this._wakeOn) setTimeout(() => this._wakeSync(), 0); }));
+      const wakeGrace = () => { if (this._wakeRest) this._wakeGrace = Date.now() + 1000; };   // a click in the bar ends no rest yet
+      chatInput.addEventListener("blur", (e) => { if (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest(".chat-compose")) wakeGrace(); });
+      chatInput.closest(".chat-compose")?.addEventListener("pointerdown", (e) => { if (e.target.closest && e.target.closest("button")) wakeGrace(); }, true);
+      chatInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this._sendChat(); }
+      });
+      if (this._currentTab === "chat") {
+        const log = this.shadowRoot.getElementById("chat-log");
+        if (log) log.scrollTop = log.scrollHeight;
+      }
+    }
+    const chatClear = this.shadowRoot.querySelector("#chat-clear");
+    if (chatClear) chatClear.addEventListener("click", () => this._chatAskSet(true));
+    this.shadowRoot.getElementById("chat-ask-no")?.addEventListener("click", () => this._chatAskSet(false));
+    this.shadowRoot.getElementById("chat-ask-yes")?.addEventListener("click", () => { this._chatAskSet(false); this._clearChat(); });
+    const chatLogEl = this.shadowRoot.getElementById("chat-log");
+    if (chatLogEl) {
+      chatLogEl.addEventListener("click", (e) => {
+        const del = e.target.closest(".chat-del");
+        if (del) this._deleteChatMessage(Number(del.dataset.i));
+      });
+      this._loadChat();
+      this._sizeChat();
+      requestAnimationFrame(() => this._sizeChat());
+      const micBtn = this.shadowRoot.getElementById("chat-mic");
+      if (micBtn) {
+        micBtn.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          try { micBtn.setPointerCapture(e.pointerId); } catch (err) {}
+          this._micHeld = true;
+          this._micPointer = e.pointerId;
+          if (!this._micStop) this._toggleMic();
+        });
+        micBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+      }
+      this.shadowRoot.getElementById("chat-speak")?.addEventListener("click", () => this._toggleSpeak());
+      this.shadowRoot.getElementById("chat-wake")?.addEventListener("click", () => this._wakeSet(!this._wakeOn, undefined, true));
+      this._wakeShow();
+      if (!this._chatResize) {
+        this._chatResize = () => this._sizeChat();
+        window.addEventListener("resize", this._chatResize);
+      }
+      if (!this._micRelease) {   // on the window: a full render may replace the button while it is held
+        this._micRelease = (e) => {
+          if (e.pointerId !== this._micPointer) return;
+          this._micHeld = false;
+          if (this._micStop) this._micStop();
+        };
+        ["pointerup", "pointercancel"].forEach((n) => window.addEventListener(n, this._micRelease));
+      }
+    }
+
+    // Settings sub-navigation: switch section without a full re-render (cards
+    // stay in the DOM; we just show the active section's cards).
+    this.shadowRoot.querySelectorAll(".settings-subnav-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const sec = e.currentTarget.getAttribute("data-settings-section");
+        if (sec && sec !== this._settingsSection) {
+          this._settingsSection = sec;
+          this._applySettingsSections();
+          if (sec === "governance") this._fetchEnforcement();
+        }
+      });
+    });
+    // Apply the active section on every render (Settings tab only).
+    if (this._currentTab === "settings") {
+      this._applySettingsSections();
+      this._fetchEnforcement();   // populate the Governance tab's switches
+    }
+
+    // Global search (issue #209) — header box over entities + sections.
+    const gsIn = this.shadowRoot.getElementById("gsearch-input");
+    const gsBox = this.shadowRoot.getElementById("gsearch-results");
+    if (gsIn) {
+      gsIn.addEventListener("input", (e) => this._runGlobalSearch(e.currentTarget.value));
+      gsIn.addEventListener("focus", (e) => { if (e.currentTarget.value) this._runGlobalSearch(e.currentTarget.value); });
+      gsIn.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          e.currentTarget.value = "";
+          if (gsBox) { gsBox.hidden = true; gsBox.innerHTML = ""; }
+          e.currentTarget.blur();
+        }
+      });
+      // Hide the dropdown when focus leaves the box — deferred so a result
+      // click (which steals focus) still fires before we tear the list down.
+      gsIn.addEventListener("blur", () => {
+        setTimeout(() => { if (gsBox) gsBox.hidden = true; }, 150);
+      });
+    }
+    if (gsBox) {
+      // mousedown (not click) so the pick registers before the input's blur.
+      gsBox.addEventListener("mousedown", (e) => {
+        const item = e.target.closest(".gs-item");
+        if (!item) return;
+        e.preventDefault();
+        this._onGlobalSearchPick(item);
+      });
+    }
+
+    // Memory tab: teach a new fact
+    const memAdd = this.shadowRoot.querySelector("#mem-add");
+    if (memAdd) {
+      memAdd.addEventListener("click", () => this._teachKnowledge());
+      ["mem-key", "mem-val"].forEach(id => {
+        const el = this.shadowRoot.getElementById(id);
+        if (el) el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); this._teachKnowledge(); }
+        });
+      });
+      // first paint of the tab renders whatever we already have, then refresh
+      this._renderKnowledgeList();
+      this._renderPersonRoutines();
+    }
+
+    // Log filter buttons
+    this.shadowRoot.querySelectorAll(".log-filter").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const filter = e.currentTarget.getAttribute("data-filter");
+        this._logFilter = filter;
+        // Update active state
+        this.shadowRoot.querySelectorAll(".log-filter").forEach(b => b.classList.remove("active"));
+        e.currentTarget.classList.add("active");
+        this._fetchDebugLog();
+      });
+    });
+
+    // Log text search — debounced, filters client-side alongside the category buttons
+    const logSearch = this.shadowRoot.querySelector("#log-search");
+    if (logSearch) {
+      logSearch.addEventListener("input", (e) => {
+        clearTimeout(this._logSearchDebounce);
+        const val = e.currentTarget.value;
+        this._logSearchDebounce = setTimeout(() => {
+          this._logSearch = val;
+          this._fetchDebugLog();
+        }, 200);
+      });
+    }
+
+    // Activity feed search — debounced; updates only the feed rows so the
+    // input keeps focus while typing (no full re-render).
+    const actFeed = this.shadowRoot.querySelector("#activity-feed");   // jh-feed (step 149): the thin scroll bar shows while scrolling
+    if (actFeed) {
+      actFeed.addEventListener("scroll", () => {
+        actFeed.classList.add("jh-scrolling");
+        clearTimeout(actFeed._jhScrollT);
+        actFeed._jhScrollT = setTimeout(() => actFeed.classList.remove("jh-scrolling"), 900);
+      }, { passive: true });
+    }
+    const actSearch = this.shadowRoot.querySelector("#activity-search");
+    if (actSearch) {
+      actSearch.addEventListener("input", (e) => {
+        clearTimeout(this._activitySearchDebounce);
+        const val = e.currentTarget.value;
+        this._activitySearchDebounce = setTimeout(() => {
+          this._activitySearch = val;
+          this._updateActivityFeed();
+        }, 200);
+      });
+    }
+
+    // Floor plan tabs — rebuild 3D house
+    this.shadowRoot.querySelectorAll(".view-btn").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const t = e.currentTarget, scope = t.getAttribute("data-vscope"), theta = parseFloat(t.getAttribute("data-vtheta"));
+        this._setView(scope, theta);
+        t.parentElement.querySelectorAll(".view-btn").forEach(b => b.classList.remove("active"));
+        t.classList.add("active");
+      });
+    });
+    this._wireEditorPreviewDrag();
+
+    this.shadowRoot.querySelectorAll(".floor-tab").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        const floor = e.currentTarget.getAttribute("data-floor");
+        if (floor && floor !== this._currentFloor) {
+          this._currentFloor = floor;
+          this.shadowRoot.querySelectorAll(".floor-tab").forEach(b => b.classList.remove("active"));
+          e.currentTarget.classList.add("active");
+          this._build3DHouse();
+        }
+      });
+    });
+
+    // Camera Watch lives on the Command Center; the 3D house on its own tab.
+    if (this._currentTab === 'dashboard') {
+      this._setupCameras();
+      this.shadowRoot.getElementById("cam-diag-btn")
+        ?.addEventListener("click", () => this._runCamDiagnostics());
+    }
+    if (this._currentTab === 'residence') {
+      this._build3DHouse();
+      this._wire3DDrag();
+      this._wireResidenceControls();
+      this._fetchMmwave();
+    }
+    if (this._currentTab === 'settings') {
+      this._wireCameraSettings();
+      this._wireMode();
+      this._wireBio();
+      this._wireEnergy();
+      this._wireDiagnostics();
+      this._wireHazard();
+      this._wireBriefings();
+      this._wireDocLibrary();
+      this._wireMutes();
+    }
+    if (this._currentTab === 'faces') {
+      this._wireFaces();
+    }
+    if (this._currentTab === 'intrusion') {
+      this._wireIntrusion();
+      this._wireIntrusionLog();
+    }
+
+    // Service-call buttons
+    this.shadowRoot.querySelectorAll("[data-svc]").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const svcAttr = e.currentTarget.getAttribute("data-svc");
+        const dataAttr = e.currentTarget.getAttribute("data-svc-data");
+        if (!svcAttr || !this._hass) return;
+        const [domain, service] = svcAttr.split(".");
+        let serviceData = {};
+        if (dataAttr) {
+          try { serviceData = JSON.parse(dataAttr); } catch (_) { serviceData = {}; }
+        }
+        try {
+          await this._hass.callService(domain, service, serviceData);
+          this._jhHapticSvc(domain, service, serviceData);   // jh-haptic
+          this._toast(`✓ ${svcAttr}`, "ok");
+        } catch (err) {
+          this._toast(`✗ ${svcAttr} — ${err?.message || err}`, "err");
+        }
+      });
+    });
+
+    // Observer hourly call cap (0 = unlimited). Saves live to runtime_config.
+    const rl = this.shadowRoot.querySelector(".rate-limit-input");
+    if (rl) {
+      rl.addEventListener("change", async () => {
+        let v = parseInt(rl.value, 10);
+        if (isNaN(v) || v < 0) v = 0;
+        rl.value = v;
+        await this._saveConfig("classifier_rate_limit", v);
+        this._toast(v === 0 ? "✓ hourly cap → unlimited" : `✓ hourly cap → ${v}/hr`, "ok");
+      });
+    }
+
+    // Area-card light toggles (flat, always-clickable control mirroring the 3D lamp).
+    // Skipped entirely when light control is disabled — the pill stays as a pure indicator.
+    const _lightCtlOn = (this._liveData && this._liveData.config && this._liveData.config.light_control_enabled) !== false;
+    if (_lightCtlOn) {
+      this.shadowRoot.querySelectorAll('.area-light').forEach(btn => {
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const areaId = btn.getAttribute('data-light-area');
+          const name = btn.getAttribute('data-area-name') || 'Area';
+          // #234: open the per-light list instead of blindly turning them all
+          // off — the popover lists each light with its own toggle and keeps a
+          // "turn all off" action.
+          this._openAreaLights(areaId, name);
+        });
+      });
+    }
+
+    // Room lights popover (#234): per-light toggles + turn-all-off + close.
+    const lightsOverlay = this.shadowRoot.querySelector('#area-lights-overlay');
+    if (lightsOverlay) {
+      lightsOverlay.addEventListener('click', (ev) => {
+        if (ev.target === lightsOverlay) this._closeAreaLights();   // backdrop only
+      });
+      lightsOverlay.querySelector('.alp-close')?.addEventListener('click', () => this._closeAreaLights());
+      lightsOverlay.querySelectorAll('.alp-row:not(.alp-manual)').forEach(row => {   // jh-r22-lights: no manual heater
+        row.addEventListener('click', () => {
+          const eid = row.getAttribute('data-light-eid');
+          const isOn = row.getAttribute('data-light-on') === '1';
+          this._toggleOneLight(eid, isOn);
+        });
+      });
+      const allOff = lightsOverlay.querySelector('.alp-all-off');
+      if (allOff) {
+        allOff.addEventListener('click', async () => {
+          const p = this._lightsPopover;
+          if (!p) return;
+          const res = await this._toggleAreaLights(p.areaId, p.name, true);  // isOn=true → turn_off
+          // jh-r23-lights (step 165, review round 23 #12): only the lights the backend switched are shown off; with a failed
+          // one (or no answer) the list is read again and stays open, so it shows the truth
+          if (!res || res.failed.length) {
+            this._openAreaLights(p.areaId, p.name);
+            return;
+          }
+          // jh-r26-lights (step 168, review round 26 #7, #11): a light left out or not confirmed, or nothing switched: the list is
+          // read again and stays open, so it shows the truth
+          if (!(res.done || []).length || (res.unconfirmed || []).length || (res.left_out || []).length) {
+            this._openAreaLights(p.areaId, p.name);
+            return;
+          }
+          if (this._lightsPopover && Array.isArray(this._lightsPopover.lights)) {
+            this._lightsPopover.lights.forEach(l => { if (!l.manual && res.done.includes(l.entity_id)) l.on = false; });
+          }
+          this._closeAreaLights();
+        });
+      }
+    }
+
+    // Area tiles: click (or Enter/Space) opens the drill-down detail card.
+    // The light-toggle pill inside a tile already stopPropagation()s so it
+    // doesn't also trigger the expand.
+    this.shadowRoot.querySelectorAll('.area[data-area-id]').forEach(tile => {
+      const open = () => {
+        const id = tile.getAttribute('data-area-id');
+        if (!id) return;
+        this._expandedArea = id;
+        this._render();
+      };
+      tile.addEventListener('click', open);
+      tile.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); }
+      });
+    });
+
+    // Area detail overlay: close on the ✕ button or a backdrop click.
+    const detailOverlay = this.shadowRoot.querySelector('#area-detail-overlay');
+    if (detailOverlay) {
+      const close = () => { this._expandedArea = null; this._render(); };
+      detailOverlay.addEventListener('click', (ev) => {
+        if (ev.target === detailOverlay) close();   // backdrop only
+      });
+      detailOverlay.querySelector('.area-detail-close')?.addEventListener('click', close);
+    }
+
+    // Pattern-engine suggestions: approve / dismiss / YAML reveal
+    this.shadowRoot.querySelectorAll(".sug").forEach(card => {
+      const sid = parseInt(card.getAttribute("data-sug-id"), 10);
+      const act = async (action) => {
+        if (!this._hass || isNaN(sid)) return;
+        try {
+          const res = await this._hass.callWS({ type: "jarvis/suggestion_action", suggestion_id: sid, action });
+          if (action === "approve") {
+            // v7.94.0: approval now installs the automation into HA directly.
+            this._toast(res?.installed
+              ? `✓ installed — "${res.alias || 'automation'}" is now live in Home Assistant`
+              : `✓ approved — advisory only${res?.reason ? ` (${res.reason})` : ''}`, "ok");
+          } else {
+            this._toast("✓ dismissed", "ok");
+          }
+          card.style.opacity = "0.35";
+          card.querySelectorAll("button").forEach(b => b.disabled = true);
+        } catch (err) {
+          this._toast(`✗ suggestion — ${err?.message || err}`, "err");
+        }
+      };
+      card.querySelector(".sug-approve")?.addEventListener("click", () => act("approve"));
+      card.querySelector(".sug-dismiss")?.addEventListener("click", () => act("dismiss"));
+      card.querySelector(".sug-yaml-btn")?.addEventListener("click", () => {
+        const pre = card.querySelector(".sug-yaml");
+        if (pre) pre.hidden = !pre.hidden;
+      });
+    });
+
+    // NL automation composer: describe → draft (validated, not installed) →
+    // review → install. Nothing is written until Install is clicked.
+    const cInput = this.shadowRoot.getElementById("composer-input");
+    const cDraftBtn = this.shadowRoot.getElementById("composer-draft");
+    const cResult = this.shadowRoot.getElementById("composer-result");
+    const cMsg = this.shadowRoot.getElementById("composer-msg");
+    const cYaml = this.shadowRoot.getElementById("composer-yaml");
+    const cInstall = this.shadowRoot.getElementById("composer-install");
+    const cDiscard = this.shadowRoot.getElementById("composer-discard");
+    if (cDraftBtn) {
+      cDraftBtn.addEventListener("click", async () => {
+        const text = (cInput?.value || "").trim();
+        if (!text) { this._toast("Describe the automation first", "err"); return; }
+        if (!this._hass) return;
+        cDraftBtn.disabled = true; cDraftBtn.textContent = "… drafting";
+        try {
+          const res = await this._hass.callWS({
+            type: "jarvis/compose_automation", action: "draft", text });
+          if (res?.ok) {
+            this._composerDraft = res.draft;
+            if (cMsg) cMsg.textContent =
+              `Review "${res.draft?.alias || 'automation'}" before installing:`;
+            if (cYaml) { cYaml.textContent = res.draft?.yaml || ""; cYaml.hidden = false; }
+            if (cInstall) cInstall.hidden = false;
+            if (cResult) cResult.hidden = false;
+          } else {
+            this._composerDraft = null;
+            if (cMsg) cMsg.textContent = res?.error || "Couldn't draft that.";
+            const attempted = res?.draft?.args
+              ? JSON.stringify(res.draft.args, null, 2) : "";
+            if (cYaml) { cYaml.textContent = attempted; cYaml.hidden = !attempted; }
+            if (cInstall) cInstall.hidden = true;   // never offer install on an invalid draft
+            if (cResult) cResult.hidden = false;
+          }
+        } catch (err) {
+          this._toast(`✗ draft — ${err?.message || err}`, "err");
+        } finally {
+          cDraftBtn.disabled = false; cDraftBtn.textContent = "✎ Draft automation";
+        }
+      });
+    }
+    if (cInstall) {
+      cInstall.addEventListener("click", async () => {
+        if (!this._hass || !this._composerDraft) return;
+        cInstall.disabled = true;
+        try {
+          const res = await this._hass.callWS({
+            type: "jarvis/compose_automation", action: "install",
+            draft: this._composerDraft });
+          if (res?.ok) {
+            this._toast(`✓ installed — "${res.alias || 'automation'}" is now live`, "ok");
+            this._composerDraft = null;
+            if (cResult) cResult.hidden = true;
+            if (cInput) cInput.value = "";
+          } else {
+            this._toast(`✗ ${res?.error || 'install failed'}`, "err");
+          }
+        } catch (err) {
+          this._toast(`✗ install — ${err?.message || err}`, "err");
+        } finally {
+          cInstall.disabled = false;
+        }
+      });
+    }
+    if (cDiscard) {
+      cDiscard.addEventListener("click", () => {
+        this._composerDraft = null;
+        if (cResult) cResult.hidden = true;
+      });
+    }
+
+    // Goals: cancel an active goal
+    this.shadowRoot.querySelectorAll(".goal-cancel").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const card = e.currentTarget.closest(".goal");
+        const gid = parseInt(card?.getAttribute("data-goal-id"), 10);
+        if (!this._hass || isNaN(gid)) return;
+        e.currentTarget.disabled = true;
+        try {
+          await this._hass.callWS({ type: "jarvis/goal_action", goal_id: gid, action: "cancel" });
+          this._toast("✓ goal cancelled", "ok");
+          await this._fetchLiveData();
+        } catch (err) {
+          this._toast(`✗ cancel — ${err?.message || err}`, "err");
+          e.currentTarget.disabled = false;
+        }
+      });
+    });
+
+    // Goals: delete a finished/cancelled goal (tidy the list)
+    this.shadowRoot.querySelectorAll(".goal-delete").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const card = e.currentTarget.closest(".goal");
+        const gid = parseInt(card?.getAttribute("data-goal-id"), 10);
+        if (!this._hass || isNaN(gid)) return;
+        e.currentTarget.disabled = true;
+        try {
+          await this._hass.callWS({ type: "jarvis/goal_action", goal_id: gid, action: "delete" });
+          this._toast("✓ goal deleted", "ok");
+          await this._fetchLiveData();
+        } catch (err) {
+          this._toast(`✗ delete — ${err?.message || err}`, "err");
+          e.currentTarget.disabled = false;
+        }
+      });
+    });
+
+    // Goals: write in a new goal from the panel
+    const goalInput = this.shadowRoot.querySelector(".goal-new-input");
+    const goalBtn = this.shadowRoot.querySelector(".goal-new-btn");
+    const submitGoal = async () => {
+      const outcome = (goalInput?.value || "").trim();
+      if (!this._hass || !outcome) return;
+      if (goalBtn) goalBtn.disabled = true;
+      if (goalInput) goalInput.disabled = true;
+      try {
+        await this._hass.callWS({ type: "jarvis/goal_action", action: "create", outcome });
+        this._toast("✓ goal added", "ok");
+        if (goalInput) goalInput.value = "";
+        await this._fetchLiveData();
+      } catch (err) {
+        this._toast(`✗ add — ${err?.message || err}`, "err");
+        if (goalBtn) goalBtn.disabled = false;
+        if (goalInput) goalInput.disabled = false;
+      }
+    };
+    goalBtn?.addEventListener("click", submitGoal);
+    goalInput?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); submitGoal(); }
+    });
+
+    // Local LLM base URL (Ollama / GPU server endpoint)
+    const customLlmUrl = this.shadowRoot.querySelector(".custom-llm-url-input");
+    if (customLlmUrl) {
+      customLlmUrl.addEventListener("change", async () => {
+        const v = customLlmUrl.value.trim();
+        await this._saveConfig("custom_base_url", v);
+        this._toast(v ? `✓ custom endpoint → ${v}` : "✓ custom endpoint cleared", "ok");
+      });
+    }
+    const ollamaLlmUrl = this.shadowRoot.querySelector(".ollama-llm-url-input");
+    if (ollamaLlmUrl) {
+      ollamaLlmUrl.addEventListener("change", async () => {
+        const v = ollamaLlmUrl.value.trim();
+        await this._saveConfig("ollama_base_url", v);
+        this._toast(v ? `✓ ollama endpoint → ${v}` : "✓ ollama endpoint cleared", "ok");
+      });
+    }
+
+    // Doorbell backlog training scan
+    const dbtScan = this.shadowRoot.querySelector(".dbt-scan");
+    if (dbtScan) {
+      dbtScan.addEventListener("click", async () => {
+        if (!this._hass) return;
+        const limInput = this.shadowRoot.querySelector(".dbt-limit");
+        let limit = limInput ? parseInt(limInput.value, 10) : 40;
+        if (isNaN(limit) || limit < 1) limit = 40;
+        this._toast(`⏳ scanning doorbell backlog (up to ${limit})…`, "ok");
+        try {
+          await this._hass.callService("jarvis", "train_doorbell_backlog", { limit });
+          this._toast("✓ backlog scan running — dataset updates shortly (see Logs)", "ok");
+          setTimeout(() => this._fetchLiveData && this._fetchLiveData(), 4000);
+        } catch (err) {
+          this._toast(`✗ backlog — ${err?.message || err}`, "err");
+        }
+      });
+    }
+
+    // Camera diagnostic: run a full vision → reasoning → incorporate review
+    // on the selected camera. Manual call, so it always reports the result.
+    const camRun = this.shadowRoot.querySelector(".diag-camera-run");
+    if (camRun) {
+      camRun.addEventListener("click", async () => {
+        const sel = this.shadowRoot.querySelector(".diag-camera-select");
+        const entity_id = sel ? sel.value : "";
+        if (!entity_id || !this._hass) {
+          this._toast("✗ no camera selected", "err");
+          return;
+        }
+        this._toast(`⏳ analyzing ${entity_id}…`, "ok");
+        try {
+          await this._hass.callService("jarvis", "analyze_camera", {
+            entity_id, announce: true,
+          });
+          this._toast(`✓ camera review ran — check Logs for the result`, "ok");
+        } catch (err) {
+          this._toast(`✗ camera — ${err?.message || err}`, "err");
+        }
+      });
+    }
+
+    // Config toggle buttons (Settings panel). Scope to elements that carry a
+    // toggle VALUE (data-cfg-val) — i.e. the on/off buttons. Without this,
+    // the selector also matched the AI-Models provider/model <select>s (which
+    // carry data-cfg-key but no data-cfg-val), and their click fired this
+    // handler too — writing data-cfg-val (null) over the just-saved value and
+    // reverting the provider to groq.
+    // Routine learning: add/remove specific opt-in entities (v7.94.0)
+    const _plAddBtn = this.shadowRoot.querySelector('#pl-add-entity');
+    if (_plAddBtn) _plAddBtn.addEventListener('click', () => {
+      const inp = this.shadowRoot.querySelector('#pl-entity-input');
+      const eid = inp && inp.value.trim();
+      if (!eid) return;
+      if (this._hass && this._hass.states && this._hass.states[eid]) {
+        const arr = this._plList();
+        if (!arr.includes(eid)) { arr.push(eid); this._plSave(arr); }
+      } else {
+        this._toast(`"${eid}" is not a known entity id`, 'err');
+      }
+    });
+    this.shadowRoot.querySelectorAll('.pl-del').forEach(b => b.addEventListener('click', () => {
+      const arr = this._plList(); arr.splice(parseInt(b.getAttribute('data-i')), 1); this._plSave(arr);
+    }));
+
+    // Excluded entities: three chip pickers (entities / domains / labels)
+    const _exclAdd = (addId, inpId, key, validate) => {
+      const btn = this.shadowRoot.querySelector('#' + addId);
+      if (!btn) return;
+      btn.addEventListener('click', () => {
+        const inp = this.shadowRoot.querySelector('#' + inpId);
+        const val = inp && inp.value.trim();
+        if (!val) return;
+        if (validate && !validate(val)) return;
+        const arr = this._exclArr((this._data().config || {})[key]);
+        if (!arr.includes(val)) { arr.push(val); this._exclSave(key, arr); }
+      });
+    };
+    _exclAdd('excl-ent-add', 'excl-ent-input', 'excluded_entities', (v) => {
+      if (this._hass && this._hass.states && this._hass.states[v]) return true;
+      this._toast(`"${v}" is not a known entity id`, 'err'); return false;
+    });
+    _exclAdd('excl-dom-add', 'excl-dom-input', 'excluded_domains', null);
+    _exclAdd('excl-lab-add', 'excl-lab-input', 'excluded_labels', null);
+    const _exclDel = (cls, key) => this.shadowRoot.querySelectorAll('.' + cls).forEach(b =>
+      b.addEventListener('click', () => {
+        const arr = this._exclArr((this._data().config || {})[key]);
+        arr.splice(parseInt(b.getAttribute('data-i')), 1); this._exclSave(key, arr);
+      }));
+    _exclDel('excl-ent-del', 'excluded_entities');
+    _exclDel('excl-dom-del', 'excluded_domains');
+    _exclDel('excl-lab-del', 'excluded_labels');
+
+    this._wireConfigToggles(this.shadowRoot);
+    this._jhQaWire();   // Jarvis Home patch (2026-11-14): Quick Actions editor in Settings
+    this._jhPronounWire();   // Jarvis Home patch (2026-11-14): pronoun per person in Settings
+    this._jhOptWire();   // Clean Jarvis: jh-optional, Settings > Optional pages
+    this._jhWatchWire();   // jh-optional: Answer watcher log
+
+    // Voice Confirmation: announce test (v7.94.0)
+    // Manual "Analyze Now" — force a pattern-analysis pass (bypasses only the
+    // 6h throttle, not the data gate) and show the outcome. (v7.94.0)
+    const runAnaBtn = this.shadowRoot?.getElementById("qa-run-analysis");
+    if (runAnaBtn && !runAnaBtn._wired) {
+      runAnaBtn._wired = true;
+      runAnaBtn.addEventListener("click", async () => {
+        if (!this._hass) return;
+        const out = this.shadowRoot?.getElementById("qa-analysis-result");
+        runAnaBtn.disabled = true;
+        const orig = runAnaBtn.textContent;
+        runAnaBtn.textContent = "Analyzing…";
+        if (out) out.textContent = "Running pattern analysis over your history…";
+        try {
+          const res = await this._hass.callWS({ type: "jarvis/run_analysis" });
+          const bf = res.backfill || {};
+          const bfNote = bf.imported ? `<br><span class="qa-diag">Imported ${this._esc(bf.imported)} past event${bf.imported === 1 ? "" : "s"} from history for ${this._esc(bf.entities)} new entit${bf.entities === 1 ? "y" : "ies"}.</span>` : "";
+          if (out) {
+            if (res.ran) {
+              const nf = res.patterns_found ?? 0;
+              const ns = res.new_suggestions ?? 0;
+              let msg = `<span class="diag-ok">✓</span> Found ${this._esc(nf)} pattern${nf === 1 ? "" : "s"}, ${this._esc(ns)} new suggestion${ns === 1 ? "" : "s"}.`;
+              if (ns > 0) {
+                msg += ` Check Review Suggestions.`;
+              } else {
+                msg += ` Nothing cleared the confidence bar this pass.`;
+                const dg = res.diagnostic || {};
+                const cand = (dg.candidates || [])[0];
+                if (cand) {
+                  const hr = String(cand.hour).padStart(2, "0");
+                  msg += `<br><span class="qa-diag">Closest routine: <b title="${this._esc(cand.entity_id)}">${this._esc(this._jhHaName(cand.entity_id))}</b> → ${this._esc(cand.state)} ~${this._esc(hr)}:00, seen ${this._esc(cand.days)}/${this._esc(dg.total_days)} days (needs ${this._esc(dg.min_days)}).</span>`;
+                }
+                const src = (dg.top_sources || [])[0];
+                if (src) {
+                  msg += `<br><span class="qa-diag">Busiest source: ${this._esc(src.entity_id)} (${this._esc(src.changes)} changes).</span>`;
+                }
+              }
+              const nm = Array.isArray(res.near_misses) ? res.near_misses : [];
+              if (nm.length) {
+                msg += `<br><span class="qa-diag">Building toward suggestions:</span>`;
+                msg += nm.slice(0, 5).map(m => {
+                  const prog = m.needed ? ` (${m.occurrences}/${m.needed})` : ` (${m.occurrences}×)`;
+                  return `<br><span class="qa-diag">• ${this._esc(m.description || m.type)}${this._esc(prog)}</span>`;
+                }).join("");
+              }
+              out.innerHTML = msg + bfNote;
+            } else {
+              out.innerHTML = `<span class="diag-down">✕</span> ${this._esc(res.reason || res.error || "Analysis did not run.")}` + bfNote;
+            }
+          }
+          // Refresh the cognitive readout so the last-analysis line updates
+          try { await this._fetchLiveData?.(); } catch (_) {}
+        } catch (err) {
+          if (out) out.innerHTML = `<span class="diag-down">✕</span> ${this._esc(err?.message || String(err))}`;
+        } finally {
+          runAnaBtn.disabled = false;
+          runAnaBtn.textContent = orig;
+        }
+      });
+    }
+
+    const vcTestBtn = this.shadowRoot?.getElementById("vc-test");
+    if (vcTestBtn && !vcTestBtn._wired) {
+      vcTestBtn._wired = true;
+      vcTestBtn.addEventListener("click", async () => {
+        if (!this._hass) return;
+        const out = this.shadowRoot?.getElementById("vc-test-result");
+        vcTestBtn.disabled = true;
+        const orig = vcTestBtn.textContent;
+        vcTestBtn.textContent = "▶ PLAYING…";
+        if (out) out.textContent = "Firing announce to your satellite — listen for it…";
+        try {
+          const res = await this._hass.callWS({ type: "jarvis/voice_confirm_test" });
+          if (out) out.innerHTML = res.ok
+            ? `<span class="diag-ok">✓</span> ${this._esc(res.note || "Announce fired.")} <span class="vc-sat">(${this._esc(res.satellite || "")})</span>`
+            : `<span class="diag-down">✕</span> ${this._esc(res.note || res.error || "Test failed.")}`;
+        } catch (err) {
+          if (out) out.innerHTML = `<span class="diag-down">✕</span> ${this._esc(err?.message || String(err))}`;
+        } finally {
+          vcTestBtn.disabled = false;
+          vcTestBtn.textContent = orig;
+        }
+      });
+    }
+
+    // Onboarding welcome card: dismiss + settings jump (v7.94.0)
+    const obDismiss = this.shadowRoot?.getElementById("ob-dismiss");
+    obDismiss?.addEventListener("click", async () => {
+      if (this._liveData?.onboarding) this._liveData.onboarding.show = false;
+      this._render();
+      try {
+        await this._hass?.callWS({ type: "jarvis/update_config", key: "onboarding_dismissed", value: true });
+      } catch (_) {}
+    });
+    const obGo = this.shadowRoot?.querySelector(".ob-go[data-tab-jump]");
+    obGo?.addEventListener("click", () => {
+      this._currentTab = "settings";
+      this._render();
+    });
+    // Per-step jump: switch to Settings and scroll/flash the relevant card (v7.94.0)
+    this.shadowRoot?.querySelectorAll(".ob-step-go[data-ob-jump]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const title = btn.getAttribute("data-ob-jump") || "";
+        this._currentTab = "settings";
+        this._render();
+        requestAnimationFrame(() => {
+          const panels = this.shadowRoot?.querySelectorAll(".settings-grid .panel") || [];
+          for (const p of panels) {
+            const head = (p.querySelector(".head span")?.textContent || "").trim();
+            if (title && head.includes(title)) {
+              p.scrollIntoView({ behavior: "smooth", block: "start" });
+              p.classList.add("ob-flash");
+              setTimeout(() => p.classList.remove("ob-flash"), 1600);
+              break;
+            }
+          }
+        });
+      });
+    });
+
+    // Saves on change; empty number fields clear the key so the model reverts to its default.
+    this.shadowRoot.querySelectorAll("[data-lab-area]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-lab-area");
+        let cur = this._data().config?.lab_areas;
+        cur = Array.isArray(cur) ? cur.slice() : [];
+        const i = cur.indexOf(id);
+        if (i >= 0) cur.splice(i, 1); else cur.push(id);
+        try { await this._saveConfig("lab_areas", cur); } catch (_) {}
+        await this._fetchAndRender();
+      });
+    });
+
+    // Bedroom-area chips (config-flow parity) — same toggle-list pattern as lab
+    // areas; saves the full area-id list so sleep detection stays a real list.
+    this.shadowRoot.querySelectorAll("[data-bedroom-area]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-bedroom-area");
+        let cur = this._data().config?.bedroom_areas;
+        cur = Array.isArray(cur) ? cur.slice() : [];
+        const i = cur.indexOf(id);
+        if (i >= 0) cur.splice(i, 1); else cur.push(id);
+        try { await this._saveConfig("bedroom_areas", cur); } catch (_) {}
+        await this._fetchAndRender();
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("select.cfg-field[data-cfg-key], input.cfg-field[data-cfg-key], textarea.cfg-field[data-cfg-key]").forEach(el => {
+      if (el._cfgWired) return;
+      el._cfgWired = true;
+      el.addEventListener("change", async () => {
+        const key = el.getAttribute("data-cfg-key");
+        if (!key) return;
+        // ui_language is owned entirely by the dedicated handler below, which
+        // orders the string load before the save/re-render; letting the generic
+        // handler also save + re-fetch here raced it and lagged the switch by one
+        // selection (#55).
+        if (key === "ui_language") return;
+        let value = el.value;
+        if (el.type === "number") value = (value === "" ? null : Number(value));
+        await this._saveConfig(key, value);
+        await this._fetchAndRender();
+      });
+    });
+
+    // Language override: this is the SOLE handler for ui_language (the generic
+    // cfg handler skips it). It applies the chosen language deterministically —
+    // load the matching strings for the explicit choice first, then persist, then
+    // re-render — so the switch is immediate and never lags by one selection (#55).
+    const _langSel = this.shadowRoot.getElementById("ui-lang-select");
+    if (_langSel && !_langSel._langWired) {
+      _langSel._langWired = true;
+      _langSel.addEventListener("change", async () => {
+        const chosen = String(_langSel.value || "auto");
+        // Reflect the choice in local config immediately so neither the save
+        // round-trip nor the re-render can revert to the previous value.
+        try { const c = this._data && this._data(); if (c && c.config) c.config.ui_language = chosen; } catch (_) {}
+        this._uiLangLoaded = null;
+        await this._loadUiStrings(chosen);
+        try { await this._saveConfig("ui_language", chosen); } catch (_) {}
+        await this._fetchAndRender();
+      });
+    }
+
+    // AI Models: provider + live-fetched model dropdowns, with custom fallback.
+    // No _fetchAndRender on change — that would tear down the just-populated
+    // model list. The native <select> already reflects the new value, and the
+    // 5s poll leaves the settings tab untouched (see _patchLiveDom guard).
+    this.shadowRoot.querySelectorAll(".model-row").forEach(row => {
+      const provSel = row.querySelector(".prov-select");
+      const modelSel = row.querySelector(".model-select");
+      const customInput = row.querySelector(".model-custom");
+      if (!provSel || !modelSel) return;
+      // Custom input is shown only when the current model isn't a listed one;
+      // hidden by default, revealed when "Custom…" is chosen.
+      if (customInput) customInput.style.display = "none";
+      // Populate live models for the current provider.
+      this._loadModelsFor(provSel.value, modelSel);
+      // Provider change → persist + refetch this role's model list, then
+      // persist the resulting first model so provider+model stay CONSISTENT.
+      // (Without this, switching groq→gemini→groq left a gemini model under
+      // the groq provider, which fails at call time.)
+      provSel.addEventListener("change", async (e) => {
+        const provider = e.target.value;
+        const provKey = provSel.getAttribute("data-cfg-key");
+        await this._saveConfig(provKey, provider);
+        // Main Agent only: clear the shared base_url when switching to a
+        // provider that has a built-in endpoint, so a stale base_url can't
+        // misroute the call (e.g. a Groq client pointed at Google's URL →
+        // 500 INTERNAL). Ollama/custom keep their URL (they need one).
+        if (provKey === "llm_provider" &&
+            ["groq", "openai", "gemini", "anthropic"].includes(provider)) {
+          await this._saveConfig("llm_base_url", "");
+        }
+        modelSel.setAttribute("data-current", "");
+        if (customInput) customInput.style.display = "none";
+        await this._loadModelsFor(provider, modelSel);
+        const newModel = modelSel.value;
+        if (newModel && newModel !== "__custom__" && newModel !== "") {
+          await this._saveConfig(modelSel.getAttribute("data-cfg-key"), newModel);
+          modelSel.setAttribute("data-current", newModel);
+        }
+      });
+      // Model change → persist, or reveal custom input.
+      modelSel.addEventListener("change", async (e) => {
+        if (e.target.value === "__custom__") {
+          if (customInput) { customInput.style.display = ""; customInput.focus(); }
+          return;
+        }
+        if (customInput) customInput.style.display = "none";
+        await this._saveConfig(modelSel.getAttribute("data-cfg-key"), e.target.value);
+        modelSel.setAttribute("data-current", e.target.value);
+      });
+      // Custom model entry → persist on commit.
+      if (customInput) {
+        customInput.addEventListener("change", async (e) => {
+          const v = (e.target.value || "").trim();
+          if (v) {
+            await this._saveConfig(customInput.getAttribute("data-cfg-key"), v);
+            modelSel.setAttribute("data-current", v);
+          }
+        });
+      }
+    });
+
+    // Notify device dropdown
+    const notifySel = this.shadowRoot.querySelector("#notify-select");
+    if (notifySel) {
+      notifySel.addEventListener("change", async (e) => {
+        const value = e.target.value || "";
+        if (!this._hass) return;
+        try {
+          await this._hass.callWS({
+            type: "jarvis/update_config",
+            key: "notify_service",
+            value: value,
+          });
+          this._toast(`✓ notify → ${value || 'none'}`, "ok");
+        } catch (err) {
+          this._toast(`✗ notify — ${err?.message || err}`, "err");
+        }
+      });
+    }
+
+    // jh-notify-private (step 158): where private alerts go
+    const jhPriv = this.shadowRoot.querySelector("#jh-notify-private");
+    if (jhPriv) {
+      jhPriv.addEventListener("change", async (e) => {
+        if (!this._hass) return;
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "jh_notify_private", value: e.target.value });
+          this._toast(`\u2713 private alerts \u2192 ${e.target.value === "admin_phones" ? "admin phones only" : "the notify device"}`, "ok");
+        } catch (err) {
+          this._toast(`\u2717 private alerts \u2014 ${err?.message || err}`, "err");
+        }
+      });
+    }
+
+    // Appliance profile editor (Settings → Appliances)
+    const apList = this.shadowRoot.querySelector("#appliance-list");
+    const apAdd = this.shadowRoot.querySelector("#appliance-add");
+    const apSave = this.shadowRoot.querySelector("#appliance-save");
+    const apUnknown = this.shadowRoot.querySelector("#appliance-unknown-toggle");
+    if (apAdd && apList) {
+      apAdd.addEventListener("click", () => {
+        const empty = apList.querySelector(".appliance-empty");
+        if (empty) empty.remove();
+        const tmp = document.createElement("div");
+        tmp.innerHTML = this._applianceRow({ name: "", type: "appliance", entity: "", watts: "" }, 0);
+        const row = tmp.firstElementChild;
+        if (row) apList.appendChild(row);
+      });
+    }
+    if (apList) {
+      apList.addEventListener("click", (e) => {
+        const rm = e.target.closest(".appliance-remove");
+        if (rm) {
+          e.preventDefault();
+          const row = rm.closest(".appliance-row");
+          if (row) row.remove();
+        }
+      });
+    }
+    if (apSave) {
+      apSave.addEventListener("click", async () => {
+        const rows = Array.from(this.shadowRoot.querySelectorAll(".appliance-row"));
+        const out = [];
+        rows.forEach(r => {
+          const name = (r.querySelector(".appliance-name")?.value || "").trim();
+          if (!name) return;
+          out.push({
+            name,
+            type: r.querySelector(".appliance-type")?.value || "appliance",
+            entity: r.querySelector(".appliance-entity")?.value || "",
+            watts: parseFloat(r.querySelector(".appliance-watts")?.value || "0") || 0,
+          });
+        });
+        await this._saveConfig("appliance_profile", JSON.stringify(out));
+        try {
+          await this._hass.callWS({ type: "jarvis/reload_appliances" });
+          this._toast(`✓ ${out.length} appliance(s) applied`, "ok");
+        } catch (err) {
+          this._toast(`✗ reload — ${err?.message || err}`, "err");
+        }
+      });
+    }
+    if (apUnknown) {
+      apUnknown.addEventListener("change", async (e) => {
+        await this._saveConfig("appliance_announce_unknown", e.target.checked);
+        try { await this._hass.callWS({ type: "jarvis/reload_appliances" }); } catch (err) {}
+      });
+    }
+
+    // Sentinel rule toggles
+    this.shadowRoot.querySelectorAll(".rule-toggle").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const ruleId = e.currentTarget.getAttribute("data-rule-id");
+        if (!ruleId || !this._hass) return;
+        const d = this._data();
+        const current = d.config?.disabled_sentinel_rules || [];
+        const isDisabled = current.includes(ruleId);
+        const updated = isDisabled
+          ? current.filter(id => id !== ruleId)
+          : [...current, ruleId];
+        try {
+          await this._hass.callWS({
+            type: "jarvis/update_config",
+            key: "disabled_sentinel_rules",
+            value: JSON.stringify(updated),
+          });
+          this._toast(`✓ ${ruleId} → ${isDisabled ? 'ON' : 'OFF'}`, "ok");
+          await this._fetchAndRender();
+        } catch (err) {
+          this._toast(`✗ rule toggle — ${err?.message || err}`, "err");
+        }
+      });
+    });
+
+    // Satellite → Cast device pairing dropdowns
+    this.shadowRoot.querySelectorAll(".sat-pair-select").forEach(sel => {
+      sel.addEventListener("change", async (e) => {
+        const satId = e.currentTarget.getAttribute("data-sat-id");
+        const castId = e.currentTarget.value || "";
+        if (!satId || !this._hass) return;
+        const d = this._data();
+        const pairings = {...(d.config?.satellite_pairings || {})};
+        if (castId) {
+          pairings[satId] = castId;
+        } else {
+          delete pairings[satId];
+        }
+        try {
+          await this._hass.callWS({
+            type: "jarvis/update_config",
+            key: "satellite_pairings",
+            value: JSON.stringify(pairings),
+          });
+          const label = castId ? this._jhHaName(castId) : "none";   // jh-ha-names
+          this._toast(`✓ paired → ${label}`, "ok");
+        } catch (err) {
+          this._toast(`✗ pairing — ${err?.message || err}`, "err");
+        }
+      });
+    });
+
+    // Announcement speaker toggles
+    this.shadowRoot.querySelectorAll(".ann-speaker-toggle").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        const spkId = e.currentTarget.getAttribute("data-speaker-id");
+        if (!spkId || !this._hass) return;
+        const d = this._data();
+        const current = d.config?.announcement_speakers || [];
+        const isOn = current.includes(spkId);
+        const updated = isOn ? current.filter(id => id !== spkId) : [...current, spkId];
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "announcement_speakers", value: JSON.stringify(updated) });
+          this._toast(`\u2713 ${this._jhHaName(spkId)} \u2192 ${isOn ? 'OFF' : 'ON'}`, "ok");   // jh-ha-names
+          await this._fetchAndRender();
+        } catch (err) {
+          this._toast(`\u2717 speaker toggle \u2014 ${err?.message || err}`, "err");
+        }
+      });
+    });
+
+    // Arrival-greeting doors: a dropdown of door / entry / lock / cover entities
+    // + removable chips, saved as a JSON list (#60). The toggle / hours / cooldown
+    // use the generic data-cfg-key path.
+    const _greetDoorAdd = this.shadowRoot.getElementById("greet-door-add");
+    if (_greetDoorAdd) _greetDoorAdd.addEventListener("click", () => {
+      const sel = this.shadowRoot.getElementById("greet-door-select");
+      const eid = sel && sel.value.trim();
+      if (!eid) return;
+      const arr = this._greetDoorsList();
+      if (arr.includes(eid)) { this._toast(`${eid} is already added`, "ok"); return; }
+      arr.push(eid);
+      this._greetDoorsSave(arr);
+    });
+    this.shadowRoot.querySelectorAll(".greet-door-del").forEach(b => b.addEventListener("click", () => {
+      const arr = this._greetDoorsList();
+      arr.splice(parseInt(b.getAttribute("data-i")), 1);
+      this._greetDoorsSave(arr);
+    }));
+
+    // Floor plan editor controls (floor tabs, add/save/reset/units/map/image, drag)
+    this._wireFloorPlanControls();
+  }
+
+  // Re-render the floor-plan editor AND re-wire every control (not just drag), so
+  // floor switching, Add Room, delete, etc. keep working after each update (v7.94.0).
+  _rerenderFloorEditor() {
+    const edWrap = this.shadowRoot.querySelector("#fp-editor-wrap");
+    if (!edWrap) return;
+    edWrap.innerHTML = this._renderFloorPlanEditor(this._data());
+    this._wireFloorPlanControls();
+  }
+
+  _wireFloorPlanControls() {
+    // Floor tabs
+    this.shadowRoot.querySelectorAll(".fp-ed-floor").forEach(btn => {
+      btn.addEventListener("click", (e) => {
+        this._editorFloor = e.currentTarget.getAttribute("data-ed-floor");
+        this._editVB = null;   // refit the new floor
+        this._rerenderFloorEditor();
+      });
+    });
+    const fpFit = this.shadowRoot.querySelector("#fp-zoom-fit");
+    if (fpFit) fpFit.addEventListener("click", () => { this._editVB = null; this._rerenderFloorEditor(); });
+
+    // Save
+    const fpSave = this.shadowRoot.querySelector("#fp-save");
+    if (fpSave) {
+      fpSave.addEventListener("click", async () => {
+        if (!this._editingPlan && !this._editingElements && !this._editingCameras && !this._editingEntities) return;
+        const savedPlan = this._editingPlan, savedEls = this._editingElements, savedCams = this._editingCameras, savedEnts = this._editingEntities;
+        try {
+          if (savedPlan) await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_rooms", value: JSON.stringify(savedPlan) });
+          if (savedEls) await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_elements", value: JSON.stringify(savedEls) });
+          if (savedCams) await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_cameras", value: JSON.stringify(savedCams) });
+          if (savedEnts) await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_entities", value: JSON.stringify(savedEnts) });
+          if (this._editingProperty !== null && this._editingProperty !== undefined) await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_property", value: JSON.stringify({ points: this._editingProperty }) });
+          // Reflect immediately so the 3D house updates now, not on the next fetch.
+          if (this._liveData && this._liveData.config) {
+            if (savedPlan) this._liveData.config.floor_plan_rooms = savedPlan;
+            if (savedEls) this._liveData.config.floor_plan_elements = savedEls;
+            if (savedCams) this._liveData.config.floor_plan_cameras = savedCams;
+            if (savedEnts) this._liveData.config.floor_plan_entities = savedEnts;
+            if (this._editingProperty !== null && this._editingProperty !== undefined) this._liveData.config.floor_plan_property = { points: this._editingProperty };
+          }
+          this._house3dBoxKey = null;
+          this._editingPlan = null; this._editingElements = null; this._editingCameras = null; this._editingEntities = null; this._editingProperty = null;
+          this._toast("\u2713 Floor plan saved", "ok");
+        } catch (err) { this._toast("\u2717 Save failed \u2014 " + err, "err"); }
+      });
+    }
+
+    // Reset
+    const fpReset = this.shadowRoot.querySelector("#fp-reset");
+    if (fpReset) {
+      fpReset.addEventListener("click", async () => {
+        this._editingPlan = null;
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_rooms", value: "" });
+          if (this._liveData && this._liveData.config) this._liveData.config.floor_plan_rooms = {};
+          this._house3dBoxKey = null;
+          this._editingPlan = null;
+          this._toast("\u2713 Floor plan reset to default", "ok");
+          this._rerenderFloorEditor();
+        } catch (err) { this._toast("\u2717 Reset failed \u2014 " + err, "err"); }
+      });
+    }
+
+    // Add Room
+    const fpAdd = this.shadowRoot.querySelector("#fp-add-room");
+    if (fpAdd) {
+      fpAdd.addEventListener("click", () => {
+        const plan = this._getEditingPlan();
+        const floor = this._editorFloor || '1f';
+        if (!plan[floor]) return;
+        const name = prompt("Room name:");
+        if (!name) return;
+        const type = prompt("Type (room, bath, stairs, door, outdoor):", "room") || "room";
+        plan[floor].rooms = plan[floor].rooms || [];
+        plan[floor].rooms.push({ name: name, x: 50, y: 50, w: 60, h: 40, type: type });
+        this._rerenderFloorEditor();
+        this._toast("Added " + name + " \u2014 drag to position, then Save", "ok");
+      });
+    }
+    // L-shaped room: a six-corner polygon you can pull into any L/T/U by
+    // dragging corners; edge midpoints add more corners.
+    const fpLRoom = this.shadowRoot.querySelector("#fp-add-lroom");
+    if (fpLRoom) {
+      fpLRoom.addEventListener("click", () => {
+        const plan = this._getEditingPlan();
+        const floor = this._editorFloor || '1f';
+        if (!plan[floor]) return;
+        const name = prompt("Room name:");
+        if (!name) return;
+        const x = 40, y = 40;
+        const pts = [[x, y], [x + 80, y], [x + 80, y + 45], [x + 45, y + 45], [x + 45, y + 80], [x, y + 80]];
+        plan[floor].rooms = plan[floor].rooms || [];
+        plan[floor].rooms.push({ name: name, x: x, y: y, w: 80, h: 80, type: 'room', points: pts });
+        this._rerenderFloorEditor();
+        this._toast("Added L-shaped " + name + " \u2014 drag the corners to shape it, then Save", "ok");
+      });
+    }
+    // House style + attached side, settable right in the editor — saves config
+    // and re-renders the 3D preview live.
+    const fpHomeType = this.shadowRoot.querySelector("#fp-home-type");
+    if (fpHomeType) {
+      fpHomeType.addEventListener("change", async () => {
+        const val = fpHomeType.value;
+        if (this._liveData && this._liveData.config) this._liveData.config.residence_style = val;
+        this._refreshEditorPreview();
+        const rs = this._resStyles()[val];
+        this._toast("\u25c9 Home type \u2192 " + (rs ? rs.label : val), "ok");
+        try { await this._saveConfig('residence_style', val); } catch (_) {}
+      });
+    }
+    const fpHomeAttach = this.shadowRoot.querySelector("#fp-home-attached");
+    if (fpHomeAttach) {
+      fpHomeAttach.addEventListener("change", async () => {
+        const val = fpHomeAttach.value;
+        if (this._liveData && this._liveData.config) this._liveData.config.home_attached = val;
+        this._refreshEditorPreview();
+        this._toast("\u25c9 Attached \u2192 " + (val === 'none' ? 'detached' : val), "ok");
+        try { await this._saveConfig('home_attached', val); } catch (_) {}
+      });
+    }
+    const fpHomeRoof = this.shadowRoot.querySelector("#fp-home-roof");
+    if (fpHomeRoof) {
+      fpHomeRoof.addEventListener("change", async () => {
+        const val = fpHomeRoof.value;
+        if (this._liveData && this._liveData.config) this._liveData.config.home_roof = val;
+        this._refreshEditorPreview();
+        this._toast("\u25c9 Roof \u2192 " + (val || 'style default'), "ok");
+        try { await this._saveConfig('home_roof', val); } catch (_) {}
+      });
+    }
+    const fpZone = this.shadowRoot.querySelector("#fp-add-zone");
+    if (fpZone) {
+      fpZone.addEventListener("click", () => {
+        const plan = this._getEditingPlan();
+        const floor = this._editorFloor || '1f';
+        if (!plan[floor]) return;
+        const name = prompt("Outdoor zone name (e.g. Front Yard, Driveway, Backyard):");
+        if (!name) return;
+        plan[floor].rooms = plan[floor].rooms || [];
+        const _house = plan[floor].rooms.filter(r => r.type !== 'outdoor');
+        let _zx = 40, _zy = 40, _zw = 90, _zh = 70;
+        if (_house.length) {
+          let hx0 = 1e9, hx1 = -1e9, hy1 = -1e9;
+          _house.forEach(r => { hx0 = Math.min(hx0, r.x); hx1 = Math.max(hx1, r.x + r.w); hy1 = Math.max(hy1, r.y + r.h); });
+          _zx = Math.round(hx0); _zy = Math.round(hy1 + 25); _zw = Math.round(Math.max(hx1 - hx0, 90));
+        }
+        plan[floor].rooms.push({ name: name, x: _zx, y: _zy, w: _zw, h: _zh, type: 'outdoor', points: [[_zx, _zy], [_zx + _zw, _zy], [_zx + _zw, _zy + _zh], [_zx, _zy + _zh]] });
+        this._rerenderFloorEditor();
+        this._toast("Added zone " + name + " \u2014 size it over the area the camera watches, then Save", "ok");
+      });
+    }
+    const fpProp = this.shadowRoot.querySelector("#fp-add-property");
+    if (fpProp) {
+      fpProp.addEventListener("click", () => {
+        const cur = this._propertyPts();
+        if (cur.length >= 3) {
+          if (confirm("Remove the property boundary?")) { this._setProperty([]); this._rerenderFloorEditor(); this._toast("Property boundary cleared", "ok"); }
+          return;
+        }
+        const floor = this._editorFloor || '1f';
+        const rooms = ((this._getEditingPlan()[floor] || {}).rooms) || [];
+        let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+        rooms.forEach(r => { x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y); x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h); });
+        if (!isFinite(x0)) { x0 = 20; y0 = 20; x1 = 220; y1 = 170; }
+        const m = Math.max(150, Math.max(x1 - x0, y1 - y0) * 0.7);   // generous default lot — front/back/side room to place zones
+        this._setProperty([[Math.round(x0 - m), Math.round(y0 - m)], [Math.round(x1 + m), Math.round(y0 - m)], [Math.round(x1 + m), Math.round(y1 + m)], [Math.round(x0 - m), Math.round(y1 + m)]]);
+        this._rerenderFloorEditor();
+        this._toast("Property boundary added \u2014 drag the corners to your lot lines; double-click an edge to add a corner, right-click a corner to remove", "ok");
+      });
+    }
+
+    // Units toggle
+    const fpUnits = this.shadowRoot.querySelector("#fp-units");
+    if (fpUnits) {
+      fpUnits.addEventListener("click", async () => {
+        const next = this._fpUnits() === 'metric' ? 'imperial' : 'metric';
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_units", value: next });
+          if (this._liveData && this._liveData.config) this._liveData.config.floor_plan_units = next;
+          this._rerenderFloorEditor();
+          this._toast("Units: " + (next === 'metric' ? 'Metric (m)' : 'Imperial (ft)'), "ok");
+        } catch (err) { this._toast("\u2717 " + err, "err"); }
+      });
+    }
+
+    // Image import
+    const fpImg = this.shadowRoot.querySelector(".fp-import-img");
+    if (fpImg) {
+      fpImg.addEventListener("change", async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async (ev) => {
+          const base64 = ev.target.result;
+          const floor = this._editorFloor || "1f";
+          let bgs = {};
+          try {
+            const raw = this._data().config?.floor_plan_bg;
+            if (raw) bgs = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          } catch (_) {}
+          bgs[floor] = base64;
+          try {
+            await this._hass.callWS({ type: "jarvis/update_config", key: "floor_plan_bg", value: JSON.stringify(bgs) });
+            this._toast("\u2713 Background image set for " + floor, "ok");
+            this._rerenderFloorEditor();
+          } catch (err) { this._toast("\u2717 Image import failed \u2014 " + err, "err"); }
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // Import a floor plan from a vacuum-map / image entity (#405). Populate the
+    // source dropdown lazily, then import the chosen entity's current image.
+    const fpEntSel = this.shadowRoot.querySelector(".fp-import-entity");
+    if (fpEntSel && !fpEntSel._loaded) {
+      fpEntSel._loaded = true;
+      (async () => {
+        try {
+          const res = await this._hass.callWS({ type: "jarvis/floorplan_sources" });
+          const sources = (res && res.sources) || [];
+          for (const s of sources) {
+            const opt = document.createElement("option");
+            opt.value = s.entity_id;
+            opt.textContent = (s.name || s.entity_id) + " (" + s.domain + ")";
+            fpEntSel.appendChild(opt);
+          }
+          if (!sources.length) {
+            const opt = document.createElement("option");
+            opt.value = ""; opt.disabled = true;
+            opt.textContent = "no map/image entities found";
+            fpEntSel.appendChild(opt);
+          }
+        } catch (_) { /* best-effort */ }
+      })();
+    }
+    const fpEntBtn = this.shadowRoot.getElementById("fp-import-entity-btn");
+    if (fpEntBtn) {
+      fpEntBtn.addEventListener("click", async () => {
+        const sel = this.shadowRoot.querySelector(".fp-import-entity");
+        const entity_id = sel && sel.value;
+        if (!entity_id) { this._toast("Pick a map/image entity first", "err"); return; }
+        const floor = this._editorFloor || "1f";
+        try {
+          await this._hass.callWS({ type: "jarvis/import_floorplan", entity_id, floor });
+          this._toast("✓ Floor plan imported from " + entity_id + " for " + floor, "ok");
+          await this._fetchAndRender();
+          this._rerenderFloorEditor();
+        } catch (err) {
+          this._toast("✗ Import failed — " + (err?.message || err), "err");
+        }
+      });
+    }
+
+    // Detect room SHAPES from the selected vacuum/map entity (#405 follow-up):
+    // the backend segments the map into room polygons; we append them to the
+    // editing plan for the user to review/rename/position, then Save.
+    const fpDetectBtn = this.shadowRoot.getElementById("fp-detect-rooms-btn");
+    if (fpDetectBtn) {
+      fpDetectBtn.addEventListener("click", async () => {
+        const sel = this.shadowRoot.querySelector(".fp-import-entity");
+        const entity_id = sel && sel.value;
+        if (!entity_id) { this._toast("Pick a map/image entity first", "err"); return; }
+        const floor = this._editorFloor || "1f";
+        this._toast("Detecting rooms from " + entity_id + "…", "ok");
+        try {
+          const res = await this._hass.callWS({ type: "jarvis/segment_floorplan_rooms", entity_id });
+          const rooms = (res && res.rooms) || [];
+          if (!rooms.length) { this._toast("No rooms detected in that map", "err"); return; }
+          const plan = this._getEditingPlan();
+          if (!plan[floor]) return;
+          plan[floor].rooms = plan[floor].rooms || [];
+          for (const r of rooms) plan[floor].rooms.push(r);
+          this._rerenderFloorEditor();
+          this._toast("✓ Detected " + rooms.length + " room(s) — review, rename, position, then Save", "ok");
+        } catch (err) {
+          this._toast("✗ Room detection failed — " + (err?.message || err), "err");
+        }
+      });
+    }
+
+    // Export layout to a JSON file (backup / restore for home-layout upgrades)
+    const fpExport = this.shadowRoot.querySelector("#fp-export");
+    if (fpExport) {
+      fpExport.addEventListener("click", () => {
+        try {
+          const data = JSON.stringify(this._getEditingPlan(), null, 2);
+          const blob = new Blob([data], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = "jarvis-floor-plan.json";
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          this._toast("\u2713 Floor plan exported", "ok");
+        } catch (err) { this._toast("\u2717 Export failed \u2014 " + err, "err"); }
+      });
+    }
+
+    // Import a layout JSON file into the editor (review, then Save to apply)
+    const fpImportLayout = this.shadowRoot.querySelector(".fp-import-layout");
+    if (fpImportLayout) {
+      fpImportLayout.addEventListener("change", (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          try {
+            const parsed = JSON.parse(ev.target.result);
+            if (!parsed || typeof parsed !== "object" || !Object.keys(parsed).length) throw new Error("empty");
+            this._editingPlan = parsed;
+            if (!this._editingPlan[this._editorFloor]) this._editorFloor = Object.keys(parsed)[0];
+            this._rerenderFloorEditor();
+            this._toast("\u2713 Layout imported \u2014 review, then Save to apply", "ok");
+          } catch (err) { this._toast("\u2717 Invalid layout file", "err"); }
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    // Openings (windows/doors) — add / edit / remove (v7.94.0)
+    const addElem = (type, kind) => {
+      const fl = this._editorFloor || '1f';
+      this._elemsFor(fl).push({ id: 'e' + Date.now().toString(36), type: type, kind: kind, wall: 'front', pos: 0.5, w: 20, entity: '' });
+      this._rerenderFloorEditor();
+    };
+    const _oaw = this.shadowRoot.querySelector('#op-add-window'); if (_oaw) _oaw.addEventListener('click', () => addElem('window', null));
+    const _oiw = this.shadowRoot.querySelector('#op-add-intwindow'); if (_oiw) _oiw.addEventListener('click', () => addElem('window', 'interior'));
+    const _ofr = this.shadowRoot.querySelector('#op-add-frenchdoor'); if (_ofr) _ofr.addEventListener('click', () => addElem('door', 'french'));
+    const _oae = this.shadowRoot.querySelector('#op-add-extdoor'); if (_oae) _oae.addEventListener('click', () => addElem('door', 'exterior'));
+    const _oac = this.shadowRoot.querySelector('#op-add-cellar'); if (_oac) _oac.addEventListener('click', () => addElem('door', 'cellar'));
+    const _ofd = this.shadowRoot.querySelector('#op-add-fdormer'); if (_ofd) _ofd.addEventListener('click', () => { this._elemsFor(this._editorFloor || '1f').push({ id: 'e' + Date.now().toString(36), type: 'dormer', slope: 'front', pos: 0.5, entity: '' }); this._rerenderFloorEditor(); });
+    const _ord = this.shadowRoot.querySelector('#op-add-rdormer'); if (_ord) _ord.addEventListener('click', () => { this._elemsFor(this._editorFloor || '1f').push({ id: 'e' + Date.now().toString(36), type: 'dormer', slope: 'rear', pos: 0.5, entity: '' }); this._rerenderFloorEditor(); });
+    const _oai = this.shadowRoot.querySelector('#op-add-intdoor'); if (_oai) _oai.addEventListener('click', () => addElem('door', 'interior'));
+    const _ocs = this.shadowRoot.querySelector('#op-add-cased'); if (_ocs) _ocs.addEventListener('click', () => addElem('door', 'cased'));
+    // Cameras: add / configure / toggle indoor-outdoor / delete
+    const _cadd = this.shadowRoot.querySelector('#cam-add');
+    if (_cadd) _cadd.addEventListener('click', () => {
+      const fl = this._editorFloor || '1f';
+      const rms2 = ((this._getEditingPlan()[fl] || {}).rooms) || [];
+      let ccx = 100, ccy = 80;
+      if (rms2.length) { let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9; rms2.forEach(r=>{mnx=Math.min(mnx,r.x);mny=Math.min(mny,r.y);mxx=Math.max(mxx,r.x+r.w);mxy=Math.max(mxy,r.y+r.h);}); ccx=Math.round((mnx+mxx)/2); ccy=Math.round((mny+mxy)/2); }
+      this._camsFor(fl).push({ id: 'c' + Date.now().toString(36), x: ccx, y: ccy, angle: 270, fov: 90, range: 55, entity: '', indoor: true });
+      this._rerenderFloorEditor();
+    });
+    const _setCamField = (f) => {
+      const cam = this._camsFor(this._editorFloor || '1f')[parseInt(f.getAttribute('data-ci'))];
+      if (!cam) return null;
+      const k = f.getAttribute('data-cam');
+      if (k === 'range') cam.range = this._fpFromReal(parseFloat(f.value) || 10);
+      else if (k === 'angle' || k === 'fov') cam[k] = parseFloat(f.value);
+      else cam[k] = f.value;
+      return cam;
+    };
+    this.shadowRoot.querySelectorAll('.cam-field').forEach(f => {
+      // during drag: update just the cone (cheap). On commit: full re-render → coverage recomputes.
+      f.addEventListener('input', () => {
+        const cam = _setCamField(f);
+        if (!cam || f.getAttribute('data-cam') === 'entity') return;
+        const g = this.shadowRoot.querySelector('.fp-cam[data-cam-idx="' + f.getAttribute('data-ci') + '"]');
+        if (g) { const cone = g.querySelector('.fp-cam-cone'); if (cone) cone.setAttribute('d', this._clippedCone(cam, this._planGeometry(this._editorFloor || '1f'))); }
+      });
+      f.addEventListener('change', () => { _setCamField(f); this._rerenderFloorEditor(); });
+    });
+    this.shadowRoot.querySelectorAll('.cam-io').forEach(b => b.addEventListener('click', () => {
+      const cam = this._camsFor(this._editorFloor || '1f')[parseInt(b.getAttribute('data-ci'))];
+      if (!cam) return; cam.indoor = (cam.indoor === false); this._rerenderFloorEditor();
+    }));
+    this.shadowRoot.querySelectorAll('.cam-del').forEach(b => b.addEventListener('click', () => {
+      this._camsFor(this._editorFloor || '1f').splice(parseInt(b.getAttribute('data-ci')), 1);
+      this._rerenderFloorEditor();
+    }));
+
+    // Devices on plan: add / remove (positions saved with the plan) + bg opacity (saved immediately)
+    const _eadd = this.shadowRoot.querySelector('#ent-add');
+    if (_eadd) _eadd.addEventListener('click', () => {
+      const inp = this.shadowRoot.querySelector('#fp-ent-input');
+      const val = inp && inp.value.trim();
+      if (!val) return;
+      if (!(this._hass && this._hass.states && this._hass.states[val])) { this._toast('"' + val + '" is not a known entity id', 'err'); return; }
+      const fl = this._editorFloor || '1f';
+      if (this._entsFor(fl).some(x => x.e === val)) { this._toast('Already placed on this floor', 'err'); return; }
+      const rms3 = ((this._getEditingPlan()[fl] || {}).rooms) || [];
+      let ecx = 100, ecy = 80;
+      if (rms3.length) { let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9; rms3.forEach(r=>{mnx=Math.min(mnx,r.x);mny=Math.min(mny,r.y);mxx=Math.max(mxx,r.x+r.w);mxy=Math.max(mxy,r.y+r.h);}); ecx=Math.round((mnx+mxx)/2); ecy=Math.round((mny+mxy)/2); }
+      this._entsFor(fl).push({ e: val, x: ecx, y: ecy });
+      this._rerenderFloorEditor();
+    });
+    this.shadowRoot.querySelectorAll('.ent-del').forEach(b => b.addEventListener('click', () => {
+      this._entsFor(this._editorFloor || '1f').splice(parseInt(b.getAttribute('data-ei')), 1);
+      this._rerenderFloorEditor();
+    }));
+    const _bgop = this.shadowRoot.querySelector('#fp-bg-op');
+    if (_bgop) {
+      const _bgv = this.shadowRoot.querySelector('#fp-bg-op-val');
+      _bgop.addEventListener('input', () => { if (_bgv) _bgv.textContent = Math.round(parseFloat(_bgop.value) * 100) + '%'; });
+      _bgop.addEventListener('change', async () => {
+        const v = String(parseFloat(_bgop.value));
+        try {
+          await this._hass.callWS({ type: 'jarvis/update_config', key: 'floor_plan_bg_opacity', value: v });
+          if (this._liveData && this._liveData.config) this._liveData.config.floor_plan_bg_opacity = v;
+          this._rerenderFloorEditor();
+        } catch (err) { this._toast('\u2717 ' + err, 'err'); }
+      });
+    }
+
+    const _ccomp = this.shadowRoot.querySelector('#cam-compute');
+    if (_ccomp) _ccomp.addEventListener('click', async () => {
+      const fl = this._editorFloor || '1f';
+      const cams = this._camsFor(fl);
+      if (!cams.length) return;
+      _ccomp.disabled = true; const _lbl = _ccomp.textContent; _ccomp.textContent = 'Computing\u2026';
+      const geo = this._planGeometry(fl), openings = this._openingDescriptions(fl);
+      for (const cam of cams) {
+        const cand = this._computeCoverage(fl, cam, geo);
+        const ctx = { entity: cam.entity || '', room: this._roomAt(fl, cam.x, cam.y), fov: cam.fov || 90, range_ft: this._fpToReal(cam.range || 55), indoor: cam.indoor !== false, candidates: cand, openings: openings };
+        try { cam.coverage = await this._hass.callWS({ type: 'jarvis/compute_camera_coverage', camera: ctx }); } catch (err) { /* keep going */ }
+      }
+      _ccomp.disabled = false; _ccomp.textContent = _lbl;
+      this._rerenderFloorEditor();
+      this._toast('\u2713 Coverage computed \u2014 Save Layout to keep it', 'ok');
+    });
+    this.shadowRoot.querySelectorAll('.op-field').forEach(f => {
+      f.addEventListener('change', () => {
+        const arr = this._elemsFor(this._editorFloor || '1f'), e = arr[parseInt(f.getAttribute('data-i'))];
+        if (!e) return;
+        const op = f.getAttribute('data-op');
+        if (op === 'w') e.w = this._fpFromReal(parseFloat(f.value) || 4);
+        else if (op === 'pos') e.pos = parseFloat(f.value);
+        else if (op === 'edge') {
+          e.edge = parseInt(f.value, 10) || 0;
+          const a = this._openingAnchor(this._editorFloor || '1f', e);
+          if (a) e.wall = a.wall;
+        }
+        else if (op === 'room') { e.room = f.value; delete e.edge; }
+        else e[op] = f.value;
+        this._rerenderFloorEditor();
+      });
+    });
+    this.shadowRoot.querySelectorAll('.op-del').forEach(b => b.addEventListener('click', () => {
+      this._elemsFor(this._editorFloor || '1f').splice(parseInt(b.getAttribute('data-i')), 1);
+      this._rerenderFloorEditor();
+    }));
+    // Highlight an opening's marker while you hover its row or pick its sensor (v7.94.0)
+    const glowMarker = (i, on) => {
+      const m = this.shadowRoot.querySelector('.op-marker[data-op-marker="' + i + '"]');
+      if (m) m.classList.toggle('op-glow', on);
+    };
+    this.shadowRoot.querySelectorAll('.op-row').forEach(row => {
+      const i = row.getAttribute('data-i');
+      row.addEventListener('mouseenter', () => glowMarker(i, true));
+      row.addEventListener('mouseleave', () => glowMarker(i, false));
+      const ent = row.querySelector('.op-ent');
+      if (ent) {
+        ent.addEventListener('focus', () => glowMarker(i, true));
+        ent.addEventListener('blur', () => glowMarker(i, false));
+      }
+    });
+
+    // Drag / resize / select / right-click delete
+    this._wireFloorPlanDrag();
+  }
+
+  // jh-haptic (step 156): the panel's haptics. Taps: one listener on the panel (jhHapticWire). Results: "success" only when the
+  // device reached the asked state, "warning" when it was sent but not confirmed (about 4 s), "failure" for every error toast.
+  _jhHapticBoot() {
+    const root = this.shadowRoot;
+    if (!root || !window.jhHaptic || !this._hass) return;
+    window.jhHapticWire(root);
+    window.jhHapticLoad(this._hass).then(() => this._jhHapticSync());
+    if (root.__jhHapticSet) return;
+    root.__jhHapticSet = true;
+    root.addEventListener("change", (e) => {
+      const t = e.composedPath()[0];
+      if (!t || !t.matches || !t.matches("input[data-jh-haptics]")) return;
+      window.jhHapticSet(this._hass, t.checked);
+      if (t.checked) window.jhHaptic("success", t);
+    });
+  }
+
+  _jhHapticSync() {
+    const c = this.shadowRoot && this.shadowRoot.querySelector("input[data-jh-haptics]");
+    if (c && window.jhHapticOn) c.checked = window.jhHapticOn();
+  }
+
+  _jhHapticSettings() {
+    const on = window.jhHapticOn ? window.jhHapticOn() : true;
+    return `<div class="panel" id="jh-haptic-card"><div class="head"><span>Haptic feedback</span><span class="side">THIS LOGIN</span></div>
+      <div class="home-cfg"><div class="cfg-row"><label for="jh-haptic-on">Vibrate on taps and results <span class="cfg-sub">phones and tablets: the Home Assistant app, or an Android browser; kept for this login</span></label>
+      <input type="checkbox" id="jh-haptic-on" data-jh-haptics data-haptic="none"${on ? " checked" : ""}></div></div></div>`;
+  }
+
+  async _jhHapticConfirm(ids, want, ms = 4000) {
+    ids = (ids || []).filter(e => typeof e === "string" && e);
+    if (!ids.length || !window.jhHaptic) return "";
+    const t0 = Date.now();
+    const done = () => ids.every(e => { const s = this._hass && this._hass.states && this._hass.states[e]; return !!s && s.state === want; });
+    while (!done() && Date.now() - t0 < ms) await new Promise(r => setTimeout(r, 250));
+    if (done()) { window.jhHaptic("success"); return "confirmed"; }
+    window.jhHaptic("warning");   // sent, but the device has not confirmed it
+    return "unconfirmed";
+  }
+
+  _jhAreaLights(areaId) {   // the lights Home Assistant puts in that area (entity area, else its device's)
+    const ents = (this._hass && this._hass.entities) || {}, devs = (this._hass && this._hass.devices) || {};
+    return Object.keys(ents).filter(e => e.startsWith("light.") && !ents[e].hidden
+      && (ents[e].area_id || (devs[ents[e].device_id] || {}).area_id) === areaId);
+  }
+
+  _jhHapticSvc(domain, service, data) {   // a Quick Action's result
+    const ids = [].concat((data && data.entity_id) || []).filter(e => typeof e === "string");
+    if (ids.length && /^(light|switch|fan|input_boolean)$/.test(domain) && (service === "turn_on" || service === "turn_off"))
+      return this._jhHapticConfirm(ids, service === "turn_on" ? "on" : "off");
+    if (domain === "jarvis" && window.jhHaptic) window.jhHaptic("success");   // JARVIS's own action has run
+  }
+
+  _toast(msg, kind = "ok") {
+    if (kind === "err" && window.jhHaptic) window.jhHaptic("failure");   // jh-haptic: refused or failed
+    const wrap = this.shadowRoot.querySelector("#toast-wrap");
+    if (!wrap) return;
+    const el = document.createElement("div");
+    el.className = `toast ${kind}`;
+    el.textContent = msg;
+    wrap.appendChild(el);
+    setTimeout(() => el.classList.add("out"), 2600);
+    setTimeout(() => el.remove(), 3100);
+  }
+
+  _wireFloorPlanDrag() {
+    const svgEl = this.shadowRoot.querySelector("#fp-editor-svg");
+    if (!svgEl) return;
+    const self = this;
+    const plan = this._getEditingPlan(); // shared editing copy
+    const floor = this._editorFloor || '1f';
+    const rooms = plan[floor]?.rooms;
+    if (!rooms) return;
+
+    let dragging = null;
+    let panning = null;
+    let _infoIdx = -1;
+    const infoEl = this.shadowRoot.querySelector("#fp-selected-info");
+
+    function svgPoint(e) {
+      const pt = svgEl.createSVGPoint();
+      const ctm = svgEl.getScreenCTM().inverse();
+      pt.x = e.clientX; pt.y = e.clientY;
+      return pt.matrixTransform(ctm);
+    }
+    const vbFromAttr = () => { const p = (svgEl.getAttribute('viewBox') || '0 0 320 140').split(' ').map(Number); return { x: p[0], y: p[1], w: p[2], h: p[3] }; };
+
+    // Edge-snap: pull a moving/resizing room flush against another building's
+    // edges, so enclosed rooms form ONE connected footprint — one roof mass in
+    // the 3D render instead of a gable per disjoint room.
+    const SNAP_T = 4;
+    const _edgeCoords = (skipIdx) => {
+      const xs = [], ys = [];
+      rooms.forEach((r, j) => {
+        if (j === skipIdx || r.type === 'outdoor' || r.type === 'stairs' || r.type === 'door') return;
+        self._zonePoints(r).forEach(p => { xs.push(p[0]); ys.push(p[1]); });
+      });
+      return { xs, ys };
+    };
+    const _snapAxis = (edges, cands) => {
+      let best = null;
+      edges.forEach(v => cands.forEach(c => {
+        const d = c - v;
+        if (Math.abs(d) <= SNAP_T && (!best || Math.abs(d) < Math.abs(best.d))) best = { d, pos: c };
+      }));
+      return best;
+    };
+    const _snapGuide = (vx, hy) => {
+      let g = svgEl.querySelector('.fp-snap-g');
+      if (vx == null && hy == null) { if (g) g.remove(); return; }
+      if (!g) {
+        g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        g.setAttribute('class', 'fp-snap-g'); g.setAttribute('pointer-events', 'none');
+        svgEl.appendChild(g);
+      }
+      const v = vbFromAttr();
+      let h = '';
+      if (vx != null) h += '<line x1="' + this._esc(vx) + '" y1="' + this._esc(v.y) + '" x2="' + this._esc(vx) + '" y2="' + this._esc((v.y + v.h)) + '" stroke="#00f5a0" stroke-width="0.7" stroke-dasharray="3 2"/>';
+      if (hy != null) h += '<line x1="' + this._esc(v.x) + '" y1="' + this._esc(hy) + '" x2="' + this._esc((v.x + v.w)) + '" y2="' + this._esc(hy) + '" stroke="#00f5a0" stroke-width="0.7" stroke-dasharray="3 2"/>';
+      g.innerHTML = h;
+    };
+    // Floating W × H readout that tracks the shape while you resize/drag it.
+    const _showLiveDims = (g, x, y, txt) => {
+      if (!g) return;
+      let t = g.querySelector('.fp-live-dims');
+      if (!t) {
+        t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        t.setAttribute('class', 'fp-live-dims');
+        t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('pointer-events', 'none');
+        t.setAttribute('style', 'font-size:5.5px;fill:#ffb85a;letter-spacing:0.4px;');
+        g.appendChild(t);
+      }
+      t.setAttribute('x', x); t.setAttribute('y', y);
+      t.textContent = txt;
+    };
+
+    function updateInfo(rm) {
+      if (!infoEl || !rm) return;
+      const idx = rooms.indexOf(rm), uL = self._fpUnitLabel();
+      const ist = 'width:54px;background:var(--bg);border:1px solid var(--line);color:var(--cyan);border-radius:4px;padding:2px 4px;font-family:var(--font-mono);font-size:11px;';
+      if (idx !== _infoIdx) {
+        _infoIdx = idx;
+        const isPoly = !!(rm.points && rm.points.length >= 3);
+        infoEl.innerHTML = '<b>' + self._esc(rm.name.toUpperCase()) + '</b> \u00b7 ' + self._esc(rm.type) + ' \u00b7 '
+          + (isPoly
+            ? rm.points.length + ' corners \u00b7 '
+              + 'W <input class="fp-dim-in" data-dim="w" type="number" step="0.5" min="1" style="' + ist + '"> ' + uL
+              + ' \u00d7 L <input class="fp-dim-in" data-dim="h" type="number" step="0.5" min="1" style="' + ist + '"> ' + uL
+              + ' \u00b7 drag corners to reshape'
+              + ' <button class="ctrl fp-unshape-btn" style="padding:2px 8px;font-size:9px;margin-left:8px;">\u25ad Make rectangular</button>'
+            : 'W <input class="fp-dim-in" data-dim="w" type="number" step="0.5" min="1" style="' + ist + '"> ' + uL
+              + ' \u00d7 L <input class="fp-dim-in" data-dim="h" type="number" step="0.5" min="1" style="' + ist + '"> ' + uL
+              + (rm.type !== 'outdoor' ? ' <button class="ctrl fp-reshape-btn" style="padding:2px 8px;font-size:9px;margin-left:8px;">\u25c7 Reshape</button>' : ''));
+        const rshBtn = infoEl.querySelector('.fp-reshape-btn');
+        if (rshBtn) rshBtn.addEventListener('click', () => {
+          const r = rooms[_infoIdx]; if (!r) return;
+          self._ensureZonePoints(r); self._syncRoomBBox(r);
+          _infoIdx = -1;
+          self._rerenderFloorEditor();
+          self._toast('Reshape: drag the corners, click an edge midpoint to add one, right-click a corner to remove', 'ok');
+        });
+        const ushBtn = infoEl.querySelector('.fp-unshape-btn');
+        if (ushBtn) ushBtn.addEventListener('click', () => {
+          const r = rooms[_infoIdx]; if (!r) return;
+          delete r.points;
+          _infoIdx = -1;
+          self._rerenderFloorEditor();
+        });
+        // Per-building roof type — only meaningful on a disjoint building
+        // (merged masses share one roof); pick "House default" to inherit.
+        if (rm.type !== 'outdoor' && rm.type !== 'stairs' && rm.type !== 'door') {
+          infoEl.insertAdjacentHTML('beforeend', ' \u00b7 roof <select class="fp-room-roof" style="background:var(--bg);border:1px solid var(--line);color:var(--cyan);border-radius:4px;padding:1px 3px;font-family:var(--font-mono);font-size:10px;">'
+            + self._optsLabeled([['', 'House default']].concat(self._roofTypePairs().slice(1)), rm.roof || '') + '</select>');
+          infoEl.querySelector('.fp-room-roof').addEventListener('change', (ev) => {
+            const r = rooms[_infoIdx]; if (!r) return;
+            if (ev.target.value) r.roof = ev.target.value; else delete r.roof;
+            self._refreshEditorPreview();
+          });
+        }
+        infoEl.querySelectorAll('.fp-dim-in').forEach(inp => {
+          inp.addEventListener('change', () => {
+            const r = rooms[_infoIdx]; if (!r) return;
+            const v = parseFloat(inp.value); if (!(v > 0)) return;
+            const isW = inp.getAttribute('data-dim') === 'w', nu = self._fpFromReal(v);
+            if (r.points && r.points.length >= 3) {
+              // Polygon: scale the whole shape so its bounding box hits the
+              // typed dimension — proportions keep, shape stays an L.
+              let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+              r.points.forEach(p => { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); });
+              const s = isW ? nu / Math.max(1, x1 - x0) : nu / Math.max(1, y1 - y0);
+              r.points.forEach(p => { if (isW) p[0] = x0 + (p[0] - x0) * s; else p[1] = y0 + (p[1] - y0) * s; });
+              self._syncRoomBBox(r);
+            } else if (isW) r.w = nu; else r.h = nu;
+            redraw();
+          });
+        });
+      }
+      if (rm.points && rm.points.length >= 3) self._syncRoomBBox(rm);
+      const wIn = infoEl.querySelector('.fp-dim-in[data-dim="w"]');
+      const hIn = infoEl.querySelector('.fp-dim-in[data-dim="h"]');
+      const act = self.shadowRoot.activeElement;
+      if (wIn && act !== wIn) wIn.value = self._fpToReal(rm.w);
+      if (hIn && act !== hIn) hIn.value = self._fpToReal(rm.h);
+    }
+
+    function redraw() {
+      const canvas = self.shadowRoot.querySelector("#fp-editor-canvas");
+      if (canvas) {
+        canvas.innerHTML = self._renderEditableSVG(plan, floor);
+        setTimeout(() => self._wireFloorPlanDrag(), 10);
+      }
+      self._refreshEditorPreview();
+    }
+
+    // Room drag start
+    svgEl.querySelectorAll(".fp-drag-room").forEach(g => {
+      const rect = g.querySelector(".fp-drag-rect");
+      if (!rect) return;
+
+      // Left click — drag
+      rect.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const idx = parseInt(g.getAttribute("data-idx"));
+        const rm = rooms[idx];
+        if (!rm) return;
+        const pt = svgPoint(e);
+        dragging = { idx, startX: pt.x, startY: pt.y, origX: rm.x, origY: rm.y, resize: false };
+        rect.setAttribute("stroke-width", "2.5");
+        self._fpSelIdx = idx;
+        updateInfo(rm);
+      });
+
+      // Right click — delete
+      g.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const idx = parseInt(g.getAttribute("data-idx"));
+        const rm = rooms[idx];
+        if (!rm) return;
+        if (confirm("Delete '" + rm.name + "' from floor plan?")) {
+          rooms.splice(idx, 1);
+          self._fpSelIdx = null;
+          redraw();
+          self._toast("Removed " + rm.name, "ok");
+        }
+      });
+    });
+
+    // Outdoor zone polygons: drag body (move), drag corner (reshape), add/remove corners
+    svgEl.querySelectorAll(".fp-zone-path").forEach(pth => {
+      pth.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const zi = parseInt(pth.getAttribute("data-zone-idx"));
+        const rm = rooms[zi]; if (!rm) return;
+        self._ensureZonePoints(rm);
+        const pt = svgPoint(e);
+        dragging = { zoneBody: true, zi, startX: pt.x, startY: pt.y, ddx: 0, ddy: 0 };
+        self._fpSelIdx = zi;
+        updateInfo(rm);
+      });
+    });
+    svgEl.querySelectorAll(".fp-zone-vtx").forEach(v => {
+      v.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const zi = parseInt(v.getAttribute("data-zone-idx")), vi = parseInt(v.getAttribute("data-vtx"));
+        const rm = rooms[zi]; if (!rm) return;
+        const pts = self._ensureZonePoints(rm); const p = pts[vi]; if (!p) return;
+        const pt = svgPoint(e);
+        dragging = { zoneVtx: true, zi, vi, startX: pt.x, startY: pt.y, origX: p[0], origY: p[1] };
+        self._fpSelIdx = zi;
+      });
+      v.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const zi = parseInt(v.getAttribute("data-zone-idx")), vi = parseInt(v.getAttribute("data-vtx"));
+        const rm = rooms[zi]; if (!rm) return;
+        const pts = self._ensureZonePoints(rm);
+        if (pts.length <= 3) { self._toast("Needs at least 3 corners", "warn"); return; }
+        // Removing vertex vi merges edges (vi-1) and vi into one — remap anchors
+        // onto the merged edge before the splice changes indices.
+        const n = pts.length, pv = (vi - 1 + n) % n;
+        const va = pts[pv], vb = pts[vi], vc = pts[(vi + 1) % n];
+        const lenA = Math.hypot(vb[0] - va[0], vb[1] - va[1]), lenB = Math.hypot(vc[0] - vb[0], vc[1] - vb[1]), tot = lenA + lenB || 1;
+        const midx = (vi === 0) ? n - 2 : vi - 1;
+        (self._elemsFor(floor) || []).forEach(el => {
+          if (el.room !== rm.name || el.edge == null) return;
+          const p = el.pos != null ? el.pos : 0.5;
+          if (el.edge === pv) { el.edge = midx; el.pos = p * lenA / tot; }
+          else if (el.edge === vi) { el.edge = midx; el.pos = (lenA + lenB * p) / tot; }
+          else if (el.edge > vi) el.edge -= 1;
+        });
+        pts.splice(vi, 1); self._syncRoomBBox(rm); self._rerenderFloorEditor();
+      });
+    });
+    svgEl.querySelectorAll(".fp-zone-mid").forEach(m => {
+      m.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const zi = parseInt(m.getAttribute("data-zone-idx")), ei = parseInt(m.getAttribute("data-edge"));
+        const rm = rooms[zi]; if (!rm) return;
+        const pts = self._ensureZonePoints(rm);
+        const a = pts[ei], b = pts[(ei + 1) % pts.length]; if (!a || !b) return;
+        pts.splice(ei + 1, 0, [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)]);
+        // Remap opening anchors: edge ei just split in two at its midpoint.
+        (self._elemsFor(floor) || []).forEach(el => {
+          if (el.room !== rm.name || el.edge == null) return;
+          const p = el.pos != null ? el.pos : 0.5;
+          if (el.edge === ei) { if (p > 0.5) { el.edge = ei + 1; el.pos = p * 2 - 1; } else el.pos = p * 2; }
+          else if (el.edge > ei) el.edge += 1;
+        });
+        self._rerenderFloorEditor();
+      });
+    });
+
+    // Property boundary: drag a corner, add a corner (edge midpoint), remove (right-click)
+    svgEl.querySelectorAll(".fp-prop-vtx").forEach(v => {
+      v.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const pi = parseInt(v.getAttribute("data-prop-vtx"));
+        const p = (self._propertyPts() || [])[pi];
+        if (!p) return;
+        const pt = svgPoint(e);
+        dragging = { propVtx: pi, startX: pt.x, startY: pt.y, origX: p[0], origY: p[1], property: true };
+      });
+      v.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const pi = parseInt(v.getAttribute("data-prop-vtx"));
+        const pts = self._propertyPts();
+        if (pts.length <= 3) { self._toast("A boundary needs at least 3 corners", "warn"); return; }
+        pts.splice(pi, 1); self._rerenderFloorEditor();
+      });
+    });
+    svgEl.querySelectorAll(".fp-prop-mid").forEach(m => {
+      m.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const ei = parseInt(m.getAttribute("data-prop-edge"));
+        const pts = self._propertyPts();
+        const a = pts[ei], b = pts[(ei + 1) % pts.length];
+        if (!a || !b) return;
+        pts.splice(ei + 1, 0, [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)]);
+        self._rerenderFloorEditor();
+      });
+    });
+
+    // Camera drag + right-click delete
+    svgEl.querySelectorAll(".fp-cam").forEach(g => {
+      const dot = g.querySelector(".fp-cam-dot");
+      if (dot) dot.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const ci = parseInt(g.getAttribute("data-cam-idx"));
+        const cam = (self._camsFor(floor) || [])[ci];
+        if (!cam) return;
+        const pt = svgPoint(e);
+        dragging = { camIdx: ci, startX: pt.x, startY: pt.y, origX: cam.x, origY: cam.y, camera: true, geo: self._planGeometry(floor) };
+      });
+      g.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const ci = parseInt(g.getAttribute("data-cam-idx"));
+        const arr = self._camsFor(floor);
+        if (arr[ci] && confirm("Delete this camera?")) { arr.splice(ci, 1); redraw(); self._toast("Camera removed", "ok"); }
+      });
+    });
+
+    // Device pins — drag to move (saved with the plan); a tap with no drag opens
+    // the entity's controls; right-click removes it.
+    svgEl.querySelectorAll(".fp-ent").forEach(g => {
+      g.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const ei = parseInt(g.getAttribute("data-ent-idx"));
+        const ent = (self._entsFor(floor) || [])[ei];
+        if (!ent) return;
+        const pt = svgPoint(e);
+        dragging = { entIdx: ei, startX: pt.x, startY: pt.y, origX: ent.x, origY: ent.y, entity: true, moved: false, entId: g.getAttribute("data-ent-id") };
+      });
+      g.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const ei = parseInt(g.getAttribute("data-ent-idx"));
+        const arr = self._entsFor(floor);
+        if (arr[ei] && confirm("Remove this device from the plan?")) { arr.splice(ei, 1); redraw(); self._toast("Device removed", "ok"); }
+      });
+    });
+
+    // Opening markers — drag snaps onto the nearest wall edge of any room
+    // (incl. detached buildings); right-click removes the opening.
+    svgEl.querySelectorAll(".fp-op").forEach(g => {
+      g.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault(); e.stopPropagation();
+        const oi = parseInt(g.getAttribute("data-op-i"));
+        if (!(self._elemsFor(floor) || [])[oi]) return;
+        dragging = { opening: oi, snap: null };
+      });
+      g.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const oi = parseInt(g.getAttribute("data-op-i"));
+        const arr = self._elemsFor(floor);
+        if (arr[oi] && confirm("Delete this opening?")) { arr.splice(oi, 1); redraw(); self._toast("Opening removed", "ok"); }
+      });
+    });
+
+    // Resize handles
+    svgEl.querySelectorAll(".fp-resize-handle").forEach(handle => {
+      handle.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const idx = parseInt(handle.getAttribute("data-idx"));
+        const rm = rooms[idx];
+        if (!rm) return;
+        const pt = svgPoint(e);
+        dragging = { idx, startX: pt.x, startY: pt.y, origW: rm.w, origH: rm.h, resize: true };
+        updateInfo(rm);
+      });
+    });
+
+    svgEl.addEventListener("mousemove", (e) => {
+      if (panning) {
+        const rect = svgEl.getBoundingClientRect();
+        const sx = panning.w / rect.width, sy = panning.h / rect.height;
+        self._editVB = { x: panning.vbX - (e.clientX - panning.sx) * sx, y: panning.vbY - (e.clientY - panning.sy) * sy, w: panning.w, h: panning.h };
+        self._applyEditVB(svgEl);
+        return;
+      }
+      if (!dragging) return;
+      const pt = svgPoint(e);
+      if (dragging.zoneVtx) {
+        const rm = rooms[dragging.zi]; if (!rm || !rm.points) return;
+        const p = rm.points[dragging.vi]; if (!p) return;
+        p[0] = Math.round(dragging.origX + (pt.x - dragging.startX));
+        p[1] = Math.round(dragging.origY + (pt.y - dragging.startY));
+        const _oc = _edgeCoords(dragging.zi);
+        const _sx = _snapAxis([p[0]], _oc.xs), _sy = _snapAxis([p[1]], _oc.ys);
+        if (_sx) p[0] += _sx.d;
+        if (_sy) p[1] += _sy.d;
+        _snapGuide(_sx ? _sx.pos : null, _sy ? _sy.pos : null);
+        const g = svgEl.querySelector('.fp-zone[data-zone-idx="' + dragging.zi + '"]');
+        if (g) {
+          const path = g.querySelector('.fp-zone-path'); if (path) path.setAttribute('d', self._propPathD(rm.points));
+          const dot = g.querySelector('.fp-zone-vtx[data-vtx="' + dragging.vi + '"]'); if (dot) { dot.setAttribute('cx', p[0]); dot.setAttribute('cy', p[1]); }
+          let _bx0 = 1e9, _by0 = 1e9, _bx1 = -1e9, _by1 = -1e9;
+          rm.points.forEach(q => { _bx0 = Math.min(_bx0, q[0]); _by0 = Math.min(_by0, q[1]); _bx1 = Math.max(_bx1, q[0]); _by1 = Math.max(_by1, q[1]); });
+          _showLiveDims(g, (_bx0 + _bx1) / 2, _by0 - 4, self._fpToReal(_bx1 - _bx0) + ' × ' + self._fpToReal(_by1 - _by0) + ' ' + self._fpUnitLabel());
+        }
+        return;
+      }
+      if (dragging.zoneBody) {
+        dragging.ddx = Math.round(pt.x - dragging.startX); dragging.ddy = Math.round(pt.y - dragging.startY);
+        const _zr = rooms[dragging.zi];
+        if (_zr && _zr.points) {
+          let _bx0 = 1e9, _by0 = 1e9, _bx1 = -1e9, _by1 = -1e9;
+          _zr.points.forEach(p => { _bx0 = Math.min(_bx0, p[0]); _by0 = Math.min(_by0, p[1]); _bx1 = Math.max(_bx1, p[0]); _by1 = Math.max(_by1, p[1]); });
+          const _oc = _edgeCoords(dragging.zi);
+          const _sx = _snapAxis([_bx0 + dragging.ddx, _bx1 + dragging.ddx], _oc.xs);
+          const _sy = _snapAxis([_by0 + dragging.ddy, _by1 + dragging.ddy], _oc.ys);
+          if (_sx) dragging.ddx += _sx.d;
+          if (_sy) dragging.ddy += _sy.d;
+          _snapGuide(_sx ? _sx.pos : null, _sy ? _sy.pos : null);
+        }
+        const g = svgEl.querySelector('.fp-zone[data-zone-idx="' + dragging.zi + '"]');
+        if (g) g.setAttribute('transform', 'translate(' + dragging.ddx + ',' + dragging.ddy + ')');
+        return;
+      }
+      if (dragging.property) {
+        const p = (self._propertyPts() || [])[dragging.propVtx];
+        if (!p) return;
+        p[0] = Math.round(dragging.origX + (pt.x - dragging.startX));
+        p[1] = Math.round(dragging.origY + (pt.y - dragging.startY));
+        const dot = svgEl.querySelector('.fp-prop-vtx[data-prop-vtx="' + dragging.propVtx + '"]');
+        if (dot) { dot.setAttribute('cx', p[0]); dot.setAttribute('cy', p[1]); }
+        const path = svgEl.querySelector('.fp-prop-path');
+        if (path) path.setAttribute('d', self._propPathD(self._propertyPts()));
+        return;
+      }
+      if (dragging.camera) {
+        const cam = (self._camsFor(floor) || [])[dragging.camIdx];
+        if (!cam) return;
+        cam.x = Math.round(dragging.origX + (pt.x - dragging.startX));
+        cam.y = Math.round(dragging.origY + (pt.y - dragging.startY));
+        const gc = svgEl.querySelector('.fp-cam[data-cam-idx="' + dragging.camIdx + '"]');
+        if (gc) {
+          const dot = gc.querySelector('.fp-cam-dot'); if (dot) { dot.setAttribute('cx', cam.x); dot.setAttribute('cy', cam.y); }
+          const cone = gc.querySelector('.fp-cam-cone'); if (cone) cone.setAttribute('d', self._clippedCone(cam, dragging.geo));
+          const tx = gc.querySelector('text'); if (tx) { tx.setAttribute('x', cam.x); tx.setAttribute('y', cam.y - 5); }
+        }
+        return;
+      }
+      if (dragging.entity) {
+        const ent = (self._entsFor(floor) || [])[dragging.entIdx];
+        if (!ent) return;
+        const nx = Math.round(dragging.origX + (pt.x - dragging.startX));
+        const ny = Math.round(dragging.origY + (pt.y - dragging.startY));
+        if (Math.abs(nx - dragging.origX) > 1 || Math.abs(ny - dragging.origY) > 1) dragging.moved = true;
+        ent.x = nx; ent.y = ny;
+        const ge = svgEl.querySelector('.fp-ent[data-ent-idx="' + dragging.entIdx + '"]');
+        if (ge) {
+          const dot = ge.querySelector('.fp-ent-dot'); if (dot) { dot.setAttribute('cx', nx); dot.setAttribute('cy', ny); }
+          const nm = ge.querySelector('.fp-ent-nm'); if (nm) { nm.setAttribute('x', nx); nm.setAttribute('y', ny - 4); }
+          const vl = ge.querySelector('.fp-ent-val'); if (vl) { vl.setAttribute('x', nx); vl.setAttribute('y', ny + 6.5); }
+        }
+        return;
+      }
+      if (dragging.opening != null) {
+        const s = self._snapToWall(floor, pt.x, pt.y);
+        if (s) {
+          dragging.snap = s;
+          const g = svgEl.querySelector('.fp-op[data-op-i="' + dragging.opening + '"]');
+          if (g) g.setAttribute('transform', 'translate(' + s.x.toFixed(1) + ' ' + s.y.toFixed(1) + ') rotate(' + s.deg.toFixed(1) + ')');
+        }
+        return;
+      }
+      const rm = rooms[dragging.idx];
+      if (!rm) return;
+
+      const _oc = _edgeCoords(dragging.idx);
+      let _gx = null, _gy = null;
+      if (dragging.resize) {
+        rm.w = Math.max(15, Math.round(dragging.origW + (pt.x - dragging.startX)));
+        rm.h = Math.max(10, Math.round(dragging.origH + (pt.y - dragging.startY)));
+        const _sx = _snapAxis([rm.x + rm.w], _oc.xs); if (_sx) { rm.w += _sx.d; _gx = _sx.pos; }
+        const _sy = _snapAxis([rm.y + rm.h], _oc.ys); if (_sy) { rm.h += _sy.d; _gy = _sy.pos; }
+      } else {
+        // No positive clamp — objects place anywhere in the field, including left of
+        // the garage (x<0) and in front of the home (y<0). (v7.94.0)
+        rm.x = Math.round(dragging.origX + (pt.x - dragging.startX));
+        rm.y = Math.round(dragging.origY + (pt.y - dragging.startY));
+        // ...but pull flush to a neighbour's edge so rooms read as one building.
+        const _sx = _snapAxis([rm.x, rm.x + rm.w], _oc.xs); if (_sx) { rm.x += _sx.d; _gx = _sx.pos; }
+        const _sy = _snapAxis([rm.y, rm.y + rm.h], _oc.ys); if (_sy) { rm.y += _sy.d; _gy = _sy.pos; }
+      }
+      _snapGuide(_gx, _gy);
+      updateInfo(rm);
+
+      // Live update SVG elements
+      const g = svgEl.querySelector('.fp-drag-room[data-idx="' + dragging.idx + '"]');
+      if (g) {
+        const r = g.querySelector(".fp-drag-rect");
+        if (r) { r.setAttribute("x", rm.x); r.setAttribute("y", rm.y); r.setAttribute("width", rm.w); r.setAttribute("height", rm.h); }
+        const t = g.querySelector("text");
+        if (t) { t.setAttribute("x", rm.x + rm.w/2); t.setAttribute("y", rm.y + rm.h/2 + 2); }
+        const rh = g.querySelector(".fp-resize-handle");
+        if (rh) { rh.setAttribute("x", rm.x + rm.w - 8); rh.setAttribute("y", rm.y + rm.h - 8); }
+        _showLiveDims(g, rm.x + rm.w / 2, rm.y - 4, self._fpToReal(rm.w) + ' × ' + self._fpToReal(rm.h) + ' ' + self._fpUnitLabel());
+      }
+    });
+
+    const endDrag = () => {
+      if (panning) { panning = null; return; }
+      if (!dragging) return;
+      if (dragging.zoneBody) {
+        const rm = rooms[dragging.zi];
+        if (rm && rm.points && (dragging.ddx || dragging.ddy)) rm.points.forEach(p => { p[0] += dragging.ddx; p[1] += dragging.ddy; });
+      }
+      if ((dragging.zoneVtx || dragging.zoneBody) && rooms[dragging.zi]) self._syncRoomBBox(rooms[dragging.zi]);
+      // A device pin clicked without dragging → open its HA more-info controls.
+      if (dragging.entity && !dragging.moved && dragging.entId) {
+        self.dispatchEvent(new CustomEvent('hass-more-info', { detail: { entityId: dragging.entId }, bubbles: true, composed: true }));
+      }
+      // Commit an opening drag: anchor it to the room whose edge it snapped to.
+      if (dragging.opening != null) {
+        const el = (self._elemsFor(floor) || [])[dragging.opening], s = dragging.snap;
+        if (el && s) {
+          const rr = rooms[s.zi];
+          if (rr) {
+            el.room = rr.name;
+            el.edge = s.edge;
+            el.pos = Math.round(s.t * 100) / 100;
+            el.wall = self._wallFromNormal(s.nx, s.ny);
+          }
+        }
+      }
+      const heavy = dragging.camera || dragging.property || dragging.zoneVtx || dragging.zoneBody || dragging.opening != null;
+      dragging = null;
+      const _sg = svgEl.querySelector('.fp-snap-g'); if (_sg) _sg.remove();
+      svgEl.querySelectorAll('.fp-live-dims').forEach(t => t.remove());
+      if (heavy) self._rerenderFloorEditor(); else redraw();
+    };
+    svgEl.addEventListener("mouseup", endDrag);
+    svgEl.addEventListener("mouseleave", endDrag);
+    // Restore the selected-room info bar after a heavy re-render (endDrag
+    // rebuilds the editor DOM for zone drags, which used to wipe it).
+    if (self._fpSelIdx != null && rooms[self._fpSelIdx]) updateInfo(rooms[self._fpSelIdx]);
+    // Zoom (wheel, cursor-centered) + pan (middle-drag, or left-drag on empty space)
+    svgEl.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const v = self._editVB || vbFromAttr();
+      const p = svgPoint(e);
+      const f = e.deltaY < 0 ? 0.85 : 1.18;
+      const nw = Math.max(60, Math.min(8000, v.w * f)), nh = Math.max(42, Math.min(8000, v.h * f));
+      const fx = nw / v.w, fy = nh / v.h;
+      self._editVB = { x: p.x - (p.x - v.x) * fx, y: p.y - (p.y - v.y) * fy, w: nw, h: nh };
+      self._applyEditVB(svgEl);
+    }, { passive: false });
+    svgEl.addEventListener("mousedown", (e) => {
+      if (dragging) return;   // an object drag started first (its handler ran)
+      const mid = e.button === 1;
+      const bg = e.button === 0 && !e.target.closest('.fp-drag-room, .fp-cam, .fp-zone, .fp-prop-vtx, .fp-prop-mid, .fp-zone-vtx, .fp-zone-mid, .fp-zone-path, .fp-resize-handle, .fp-op, .fp-ent');
+      if (!mid && !bg) return;
+      e.preventDefault();
+      const v = self._editVB || vbFromAttr();
+      self._editVB = { x: v.x, y: v.y, w: v.w, h: v.h };
+      panning = { sx: e.clientX, sy: e.clientY, vbX: v.x, vbY: v.y, w: v.w, h: v.h };
+    });
+  }
+
+  // ─── Styles (ported from HTML mockup; pared for panel) ──────────────────
+
+  // ─── Camera Watch: live, selectable, event auto-focus ──────────────────
+  _setupCameras() {
+    // jh-zoom-on-setup (review round 3): a rebuild of the same camera keeps its zoom; another camera starts unzoomed
+    // (_renderCameraFeed) and a double-click resets
+    const d = this._liveData;
+    const cams = ((d && d.config && d.config.cameras) || []).filter(c => c.enabled !== false);
+    this._cams = Array.isArray(cams) ? cams : [];
+    if (!this._activeCam && this._cams.length) {
+      // Persist the chosen camera across tab navigation / panel re-creation
+      // (#231): restore the stored pick if it's still an enabled camera,
+      // otherwise fall back to the first.
+      let stored = null;
+      stored = this._jhPrefGet("jarvis_active_cam") || null;   // jh-user-prefs: follows the login
+      const remembered = stored && this._cams.some(c => c.entity_id === stored);
+      // Jarvis Home patch (2026-11-04c): every page open starts on the camera chosen in Core settings.
+      // With no camera chosen there, the remembered one stays, as in the original.
+      const _jhCam = this._liveData?.config?.camera_watch_default;
+      this._activeCam = this._cams.some(c => c.entity_id === _jhCam) ? _jhCam : (remembered ? stored : this._cams[0].entity_id);
+      this._manualCam = this._activeCam;
+    }
+    this._lastCamKey = "";  // a full render replaced the feed node — force re-attach
+    this._renderCamSelector();
+    this._renderCameraFeed();
+    if (this._jhZ && this._jhCamZoomApply) { try { this._jhCamZoomApply(); } catch (e) {} }   // jh-zoom-keep-on-rebuild: the kept zoom on the new picture
+  }
+
+  _renderCamSelector() {
+    const sel = this.shadowRoot?.getElementById("cam-sel");
+    if (!sel) return;
+    if (!this._cams.length) { sel.innerHTML = '<span class="camchip">— no cameras —</span>'; return; }
+    sel.innerHTML = this._cams.map(c => {
+      const on = c.entity_id === this._activeCam;
+      const evt = this._camFocus && this._camFocus.entity === c.entity_id;
+      const short = this._camName(c.entity_id).toUpperCase();   // jh-ha-names: Home Assistant's name (ellipsis in the chip)
+      return `<span class="camchip ${on ? 'on' : ''} ${evt ? 'evt' : ''}" data-cam="${this._esc(c.entity_id)}" title="${this._esc(c.entity_id)}">${this._esc(short)}</span>`;
+    }).join("");
+    sel.querySelectorAll(".camchip[data-cam]").forEach(chip =>
+      chip.addEventListener("click", () => this._selectCam(chip.getAttribute("data-cam"))));
+  }
+
+  _camToken(entity) {
+    const st = this._hass && this._hass.states && this._hass.states[entity];
+    return st && st.attributes ? st.attributes.access_token : null;
+  }
+
+  _camSource(entity) {
+    // Mirrors server-side resolve_camera_source: camera_overrides maps a
+    // camera to its frame source (e.g. a go2rtc/Frigate restream of a Nest
+    // cam). Chip identity stays the original; pixels come from the source.
+    const ov = (this._liveData && this._liveData.config && this._liveData.config.camera_overrides) || {};
+    return ov[entity] || entity;
+  }
+
+  _camName(entity) {
+    // JARVIS-only display name (v7.94.0): camera_names map → picker name →
+    // entity tail. Mirrors server-side camera.display_name.
+    const cfg = (this._liveData && this._liveData.config) || {};
+    // jh-ha-names (step 157, the owner): Home Assistant's own name is the one name shown; JARVIS's old camera_names override
+    // no longer wins over it
+    const cam = (this._cams || []).find(c => c.entity_id === entity);
+    const st = this._hass && this._hass.states && this._hass.states[entity];
+    if (!(st && st.attributes && st.attributes.friendly_name) && cam && cam.raw_name && cam.raw_name !== entity) return cam.raw_name;
+    return this._jhHaName(entity);
+  }
+
+  _jhHaName(eid) {   // jh-ha-names: an entity's name as Home Assistant shows it (friendly_name); never the bare entity id
+    const st = this._hass && this._hass.states && this._hass.states[eid];
+    const fn = st && st.attributes && st.attributes.friendly_name;
+    if (fn && String(fn).trim()) return String(fn).trim();
+    const tail = String(eid || "").split(".").pop().replace(/_/g, " ").trim();
+    return tail ? tail.charAt(0).toUpperCase() + tail.slice(1) : String(eid || "");
+  }
+
+  _jhNamesHtml(text) {   // jh-ha-names: text (escaped) with every entity id Home Assistant knows shown by its name, the id as a tooltip
+    const states = (this._hass && this._hass.states) || {};
+    return this._esc(String(text == null ? "" : text)).replace(/\b[a-z_]+\.[a-z0-9_]+\b/g,
+      (m) => states[m] ? `<span title="${this._esc(m)}">${this._esc(this._jhHaName(m))}</span>` : m);
+  }
+
+  _renderCameraFeed() {
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    if (!feed) return;
+    const entity = this._activeCam;
+    try { this._jhPtzRefresh(); } catch (e) { /* the pad is optional */ }   // jh-ptz (step 145)
+    if (this._jhZoomFor !== entity) {   // jh-zoom-on-camera-change: another camera (an event, the timer back) starts unzoomed
+      this._jhZoomFor = entity;
+      if (this._jhZ && this._jhCamZoomReset) { try { this._jhCamZoomReset(); } catch (e) {} }
+    }
+    const stateEl = this.shadowRoot.getElementById("cam-state");
+    const tagEl = this.shadowRoot.getElementById("cam-tag");
+    const stripEl = this.shadowRoot.getElementById("cam-strip");
+
+    if (!entity) {
+      feed.querySelector("img")?.remove();
+      if (!feed.querySelector(".cam-none")) {
+        const n = document.createElement("div"); n.className = "cam-none"; n.textContent = "NO CAMERA SELECTED"; feed.prepend(n);
+      }
+      if (stripEl) stripEl.innerHTML = "";
+      return;
+    }
+    const cam = this._cams.find(c => c.entity_id === entity);
+    if (tagEl) { tagEl.textContent = "◱ " + this._camName(entity); tagEl.title = entity; }   // jh-ha-names
+
+    // event-focus banner
+    let foc = feed.querySelector(".cam-focus");
+    if (this._camFocus && this._camFocus.entity === entity) {
+      if (!foc) { foc = document.createElement("div"); foc.className = "cam-focus"; feed.appendChild(foc); }
+      const cf = this._camFocus.conf != null ? ` ${this._camFocus.conf}%` : "";
+      foc.innerHTML = `<i></i>EVENT · ${this._esc((this._camFocus.label || "").toUpperCase())}${this._esc(cf)}`;
+      if (stateEl) { stateEl.textContent = "◉ EVENT"; stateEl.style.color = "var(--red)"; }
+    } else {
+      foc?.remove();
+      if (stateEl) { stateEl.textContent = "◉ LIVE"; stateEl.style.color = "var(--green)"; }
+    }
+
+    // live MJPEG via HA's camera proxy; only (re)attach when entity, source,
+    // or token changes. src = the frame source (override-aware, v7.94.0).
+    const src = this._camSource(entity);
+    const tok = this._camToken(src);
+    const key = entity + "|" + src + "|" + (tok || "");
+    if (key !== this._lastCamKey) {
+      this._lastCamKey = key;
+      this._camMode = "stream";
+      this._camWalk = (this._camWalk || 0) + 1;   // Jarvis Home: a new walk down the chain (round 4)
+      if (this._camWsTimer) { clearInterval(this._camWsTimer); this._camWsTimer = null; }
+      feed.querySelectorAll(".cam-dark").forEach((b) => { if (b.dataset.cam !== entity) b.remove(); });   // Jarvis Home: it was about another camera
+      feed.querySelector(".cam-none")?.remove();
+      let img = feed.querySelector("img");
+      if (!img) {
+        img = document.createElement("img");
+        feed.prepend(img);
+        // Escalating fallback chain (v7.94.0): MJPEG stream → proxy stills →
+        // JARVIS backend snapshot. WebRTC-only Nest cams fail BOTH proxy
+        // tiers (no MJPEG; no stills while idle), which used to leave the
+        // tile blank in an error loop.
+        img.addEventListener("error", () => {
+          if (this._camMode === "stream") this._camFallback(entity);
+          else if (this._camMode === "still" && !this._camStillDarkRecent(img)) this._camJarvisFallback(entity);   // Jarvis Home (round 5)
+        });
+        // v7.94.0: a decoded frame proves the tier works only if it isn't
+        // BLACK — Nest MJPEG happily decodes an all-black stream.
+        img.addEventListener("load", () => {
+          if (img.naturalWidth > 0 && this._camWatchdog) {
+            const luma = this._frameLuma(img);
+            if (luma === null || luma > 10) {
+              clearTimeout(this._camWatchdog); this._camWatchdog = null;
+            }
+          }
+        });
+      }
+      img.src = tok
+        ? `/api/camera_proxy_stream/${src}?token=${encodeURIComponent(tok)}`
+        : `/api/camera_proxy_stream/${src}`;
+      // A camera that already escalated to the JARVIS tier will fail both
+      // proxy tiers again — skip the blank-flash and go straight there.
+      if (this._camModeByEntity[entity] === "jarvis") {
+        this._camJarvisFallback(entity);
+      } else {
+        // v7.94.0: no-frame watchdog. Nest WebRTC proxies typically HANG
+        // (HTTP 200, zero frames) instead of erroring, so the error-driven
+        // chain never fired. No decoded pixels within the window ⇒ escalate.
+        this._armCamWatchdog(entity, img, "stream", 6000);
+      }
+      this._jhRtcTry(entity, src, img);   // jh-rtc (step 155): WebRTC when Home Assistant offers it
+    }
+    if (stripEl && this._camMode !== "jarvis") {
+      const tgt = this._camFocus && this._camFocus.entity === entity && this._camFocus.conf != null
+        ? `${(this._camFocus.label || 'OBJECT').toUpperCase()} [${this._camFocus.conf}%]` : "STREAMING";
+      const srcLbl = src !== entity
+        ? `${this._esc(this._camName(entity))} → <b title="${this._esc(src)}">${this._esc(this._camName(src))}</b>`   // jh-ha-names
+        : `<b>${this._esc(this._camName(entity))}</b>`;
+      stripEl.innerHTML = `<span>SRC ${srcLbl}</span><span>${this._camMode === "webrtc" ? "WEBRTC" : "MJPEG"}</span><span>TARGET <b>${this._esc(tgt)}</b></span>`;
+    }
+  }
+
+  _renderCameraSettings(d) {
+    const cams = (d.config && d.config.cameras) || [];
+    if (!cams.length) return `<div class="mem-empty">No camera entities in Home Assistant.</div>`;
+    const names = (d.config && d.config.camera_names) || {};
+    const overrides = (d.config && d.config.camera_overrides) || {};
+    const nOn = cams.filter(c => c.enabled !== false).length;
+    const head = `<div class="camset-head">
+      <span id="camset-count">${nOn} of ${cams.length} cameras in use</span>
+      <span class="camset-bulk">
+        <button class="cam-diag-btn" id="cam-enable-all">Enable all</button>
+        <button class="cam-diag-btn" id="cam-disable-all">Disable all</button>
+      </span>
+    </div>`;
+    return head + cams.map(c => {
+      const enabled = c.enabled !== false;
+      const custom = names[c.entity_id] || "";
+      const mode = c.location_mode || "auto";
+      const resolved = c.outdoor ? "outdoor" : "indoor";
+      const chip = (m, label) =>
+        `<button class="cam-diag-btn cam-loc-chip ${mode === m ? 'active' : ''}" data-loc="${m}" data-cam="${this._esc(c.entity_id)}">${label}</button>`;
+      const ov = overrides[c.entity_id];
+      return `<div class="camset-row ${enabled ? '' : 'cam-off'}" data-cam="${this._esc(c.entity_id)}">
+        <div class="camset-id">
+          <button class="cam-enable-toggle ${enabled ? 'on' : 'off'}" data-cam="${this._esc(c.entity_id)}" title="${enabled ? 'In use \u2014 click to disable' : 'Disabled \u2014 click to enable'}">${enabled ? 'ON' : 'OFF'}</button>
+          <span class="camset-ent">${this._esc(c.entity_id)}${ov ? ` <span class="camset-ov">\u2192 ${this._esc(ov)}</span>` : ''}</span>
+        </div>
+        <div class="camset-controls">
+          <span class="camset-haname" title="The name comes from Home Assistant (rename the camera there)">${this._esc(this._camName(c.entity_id))}</span>
+          <div class="camset-chips">
+            ${chip("auto", `AUTO (${resolved})`)}
+            ${chip("indoor", "⌂ INDOOR")}
+            ${chip("outdoor", "▲ OUTDOOR")}
+          </div>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  // ── Wellbeing Context (v7.94.0) ──
+  async _fetchBio() {
+    if (!this._hass) return;
+    try {
+      this._bio = await this._hass.callWS({ type: "jarvis/biometrics", action: "status" });
+    } catch (_) {
+      this._bio = { error: true };
+    }
+    this._renderBio();
+  }
+
+  _renderBio() {
+    const body = this.shadowRoot?.getElementById("bio-body");
+    const statusEl = this.shadowRoot?.getElementById("bio-status");
+    const btn = this.shadowRoot?.getElementById("bio-toggle");
+    if (!body) return;
+    const b = this._bio || {};
+    if (b.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't load — restart Home Assistant after updating.</div>`;
+      if (statusEl) statusEl.textContent = "—";
+      return;
+    }
+    if (statusEl) statusEl.innerHTML = b.enabled
+      ? `<span class="diag-ok">ON · ${this._esc(b.found || 0)} sensor${b.found === 1 ? "" : "s"}</span>`
+      : `<span class="diag-off">OFF</span>`;
+    if (btn) btn.textContent = b.enabled ? "✕ DISABLE" : "◉ ENABLE";
+    const ents = b.entities || [];
+    if (!b.enabled) {
+      body.innerHTML = `<div class="mmwave-empty">Off — enable to let JARVIS use wearable context. Health readings are never diagnosed or alarmed on.</div>`;
+      return;
+    }
+    if (!ents.length) {
+      body.innerHTML = `<div class="mmwave-empty">No wearable entities found. Connect a wearable integration (Withings, Google Fit, Oura, etc.) to Home Assistant.</div>`;
+      return;
+    }
+    body.innerHTML = `<div class="bio-list">` + ents.map(e =>
+      `<div class="bio-row"><span class="bio-kind">${this._esc((e.kind || "").replace(/_/g, " "))}</span><span class="bio-val">${this._esc(e.value)}${e.unit ? " " + this._esc(e.unit) : ""}</span></div>`
+    ).join("") + `</div>`;
+  }
+
+  _wireBio() {
+    this._fetchBio();
+    const btn = this.shadowRoot?.getElementById("bio-toggle");
+    btn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      const enabling = !(this._bio && this._bio.enabled);
+      btn.disabled = true;
+      try {
+        await this._hass.callWS({ type: "jarvis/biometrics", action: enabling ? "enable" : "disable" });
+        this._toast(enabling ? "✓ wellbeing context on" : "✓ wellbeing context off", "ok");
+        await this._fetchBio();
+      } catch (err) {
+        this._toast(`✗ ${err?.message || err}`, "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // ── Energy Management (v7.94.0) ──
+  async _fetchEnergy() {
+    if (!this._hass) return;
+    try {
+      this._energy = await this._hass.callWS({ type: "jarvis/energy", action: "status" });
+    } catch (_) {
+      this._energy = { error: true };
+    }
+    this._renderEnergy();
+  }
+
+  _renderEnergy() {
+    const body = this.shadowRoot?.getElementById("energy-body");
+    const drawEl = this.shadowRoot?.getElementById("energy-draw");
+    const agencyBox = this.shadowRoot?.getElementById("energy-agency");
+    if (!body) return;
+    const e = this._energy || {};
+    if (e.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't load energy data — restart Home Assistant after updating.</div>`;
+      if (drawEl) drawEl.textContent = "—";
+      return;
+    }
+    if (drawEl) {
+      if (e.kw == null) { drawEl.innerHTML = `<span class="diag-off">NO METER</span>`; }
+      else {
+        const cls = e.over_peak ? "diag-warn" : "diag-ok";
+        drawEl.innerHTML = `<span class="${cls}">${this._esc(e.kw)} kW${e.over_peak ? " · OVER PEAK" : ""}</span>`;
+      }
+    }
+    // highlight the active agency chip (configured, not effective)
+    if (agencyBox) {
+      agencyBox.querySelectorAll(".mode-chip").forEach(b => {
+        b.classList.toggle("mode-chip-on", b.dataset.agency === e.configured_agency);
+      });
+    }
+    const advice = (e.advice || []).map(a => `<div class="energy-advice">${this._esc(a)}</div>`).join("");
+    const running = (e.running || []);
+    const runHtml = running.length
+      ? `<div class="energy-run-head">Running now</div>` + running.map(r =>
+          `<div class="energy-run-row"><span class="energy-run-name">${this._esc(r.name || r.entity)}</span><span class="energy-run-w ${r.shed_ok ? "" : "energy-locked"}">${this._esc(r.watts)} W${r.shed_ok ? "" : " · protected"}</span></div>`
+        ).join("")
+      : "";
+
+    // Whole-home power sensor selector + peak threshold (#476). Pick the meter
+    // explicitly so JARVIS doesn't auto-latch onto the wrong sensor (e.g. a
+    // Powerwall max-discharge entity) and cry "over peak". Live reading shown so
+    // the choice is verifiable; export is labelled and never counts as import.
+    const cands = e.candidates || [];
+    const cur = e.configured_meter || "";
+    const opts = [`<option value=""${cur ? "" : " selected"}>(auto-detect)</option>`]
+      .concat(cands.map(c => {
+        const w = c.watts == null ? "" : ` — ${(c.watts / 1000).toFixed(2)} kW`;
+        const sel = (c.entity === cur) ? " selected" : "";
+        return `<option value="${this._esc(c.entity)}"${sel}>${this._esc(c.name || c.entity)}${this._esc(w)}</option>`;
+      }));
+    // if a configured meter isn't among the candidates (unavailable), keep it visible
+    if (cur && !cands.some(c => c.entity === cur)) {
+      opts.push(`<option value="${this._esc(cur)}" selected>${this._esc(cur)} — unavailable</option>`);
+    }
+    const peakKw = (e.peak_watts != null) ? (e.peak_watts / 1000) : "";
+    let reading = "";
+    if (e.kw != null) {
+      const src = e.configured_meter || e.meter || "auto";
+      reading = e.exporting
+        ? `<div class="energy-meter-live"><span class="diag-ok">Exporting ${(Math.abs(e.signed_watts) / 1000).toFixed(2)} kW</span> · ${this._esc(src)}</div>`
+        : `<div class="energy-meter-live">Import ${this._esc(e.kw)} kW · ${this._esc(src)}</div>`;
+    }
+    const cfgHtml =
+      `<div class="energy-cfg">
+         <label class="energy-cfg-label">Whole-home power sensor</label>
+         <select class="cfg-field" id="energy-meter-select">${opts.join("")}</select>
+         ${reading}
+         <label class="energy-cfg-label" style="margin-top:8px">Peak threshold (kW)</label>
+         <input class="cfg-field cfg-num" id="energy-peak-input" type="number" min="0" step="0.5" value="${peakKw}" placeholder="8" />
+       </div>`;
+
+    body.innerHTML = cfgHtml + advice + runHtml;
+
+    // Wire the dynamically-rendered controls (re-rendered on every fetch).
+    const sel = this.shadowRoot?.getElementById("energy-meter-select");
+    sel?.addEventListener("change", async () => {
+      try {
+        await this._hass.callWS({ type: "jarvis/update_config", key: "energy_power_sensor", value: sel.value || "" });
+        this._toast(sel.value ? "✓ power sensor set" : "✓ power sensor → auto-detect", "ok");
+        await this._fetchEnergy();
+      } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+    });
+    const peakInput = this.shadowRoot?.getElementById("energy-peak-input");
+    peakInput?.addEventListener("change", async () => {
+      const kw = parseFloat(peakInput.value);
+      if (isNaN(kw) || kw < 0) { this._toast("✗ enter a peak in kW", "err"); return; }
+      try {
+        await this._hass.callWS({ type: "jarvis/update_config", key: "energy_peak_watts", value: Math.round(kw * 1000) });
+        this._toast(`✓ peak → ${kw} kW`, "ok");
+        await this._fetchEnergy();
+      } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+    });
+  }
+
+  _wireEnergy() {
+    this._fetchEnergy();
+    const agencyBox = this.shadowRoot?.getElementById("energy-agency");
+    agencyBox?.querySelectorAll(".mode-chip").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!this._hass) return;
+        const agency = btn.dataset.agency;
+        agencyBox.querySelectorAll(".mode-chip").forEach(b => b.disabled = true);
+        try {
+          await this._hass.callWS({ type: "jarvis/energy", action: "set_agency", agency });
+          this._toast(`✓ energy agency: ${agency}`, "ok");
+          await this._fetchEnergy();
+        } catch (err) {
+          this._toast(`✗ ${err?.message || err}`, "err");
+        } finally {
+          agencyBox.querySelectorAll(".mode-chip").forEach(b => b.disabled = false);
+        }
+      });
+    });
+  }
+
+  // ── Operational Mode (Directive Layer, v7.94.0) ──
+  // ── Intrusion / Security (v7.94.0) ──
+  async _fetchIntrusion() {
+    if (!this._hass) return;
+    // pull the configured response timeout so the select reflects the saved value
+    try {
+      const cfg = this._liveData?.config || {};
+      if (cfg.intrusion_response_timeout != null) this._intrTimeout = cfg.intrusion_response_timeout;
+    } catch (_) {}
+    try {
+      this._intr = await this._hass.callWS({ type: "jarvis/intrusion", action: "status" });
+    } catch (_) {
+      this._intr = { error: true };
+    }
+    this._renderIntrusion();
+  }
+
+  _renderIntrusion() {
+    const body = this.shadowRoot?.getElementById("intr-body");
+    const statusEl = this.shadowRoot?.getElementById("intr-status");
+    if (!body) return;
+    const s = this._intr || {};
+    if (s.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't load — restart Home Assistant after updating.</div>`;
+      if (statusEl) statusEl.textContent = "—";
+      return;
+    }
+    if (statusEl) {
+      statusEl.innerHTML = s.called_off
+        ? `<span class="diag-warn">CALLED OFF · ${this._esc(s.suppressed_for)}s</span>`
+        : `<span class="diag-ok">ARMED</span>`;
+    }
+    const snap = s.last_snapshot;
+    let html = "";
+    if (snap && snap.url) {
+      const when = snap.ts ? new Date(snap.ts * 1000).toLocaleString() : "";
+      html += `<div class="intr-snap">
+        <img src="${this._esc(snap.url)}" alt="intrusion snapshot" class="intr-img" />
+        <div class="intr-snap-meta">${this._esc(snap.camera ? this._camName(snap.camera) : "")} · ${this._esc(when)}</div>
+      </div>`;
+    } else {
+      html += `<div class="mmwave-empty">No intrusion snapshots captured. This stays empty unless JARVIS confirms an intruder on camera.</div>`;
+    }
+    if (s.false_alarms_24h) {
+      html += `<div class="intr-fa">${this._esc(s.false_alarms_24h)} false alarm${s.false_alarms_24h === 1 ? "" : "s"} called off in the last 24h</div>`;
+    }
+    if (s.acknowledged) {
+      html += `<div class="intr-ack">✓ Acknowledged — automatic escalation held (you're handling it)</div>`;
+    }
+    html += `<div class="intr-timeout-row">
+      <label>Auto-escalate if no response after</label>
+      <select class="cfg-field intr-timeout" data-cfg-key="intrusion_response_timeout">${this._optsLabeled([['60','1 min'],['120','2 min'],['180','3 min'],['300','5 min'],['600','10 min']], String(this._intrTimeout || 120))}</select>
+    </div>`;
+    html += `<div class="intr-timeout-row">
+      <label>Confirm Frigate person with JARVIS vision before alarming</label>
+      <button class="toggle-btn ${this._liveData?.config?.intrusion_vision_confirm !== false ? 'on' : 'off'}" data-cfg-key="intrusion_vision_confirm" data-cfg-val="${this._liveData?.config?.intrusion_vision_confirm !== false ? 'false' : 'true'}">${this._liveData?.config?.intrusion_vision_confirm !== false ? 'ON' : 'OFF'}</button>
+    </div>`;
+    html += `<div class="intr-timeout-row">
+      <label>Stay silent when JARVIS's own cameras clearly show no one (recommended) — turn OFF to stay ever-vigilant and alert on any unanswered activity</label>
+      <button class="toggle-btn ${this._liveData?.config?.intrusion_vision_veto !== false ? 'on' : 'off'}" data-cfg-key="intrusion_vision_veto" data-cfg-val="${this._liveData?.config?.intrusion_vision_veto !== false ? 'false' : 'true'}">${this._liveData?.config?.intrusion_vision_veto !== false ? 'ON' : 'OFF'}</button>
+    </div>`;
+    html += `<div class="intr-timeout-row">
+      <label>Require confinement (Lockdown or armed alarm) for intrusion monitoring</label>
+      <button class="toggle-btn ${this._liveData?.config?.intrusion_requires_confinement === true ? 'on' : 'off'}" data-cfg-key="intrusion_requires_confinement" data-cfg-val="${this._liveData?.config?.intrusion_requires_confinement === true ? 'false' : 'true'}">${this._liveData?.config?.intrusion_requires_confinement === true ? 'ON' : 'OFF'}</button>
+    </div>`;
+    html += `<div class="doclib-controls">
+      <button class="cam-diag-btn intr-ack-btn">✓ I'M LOOKING (HOLD)</button>
+      <button class="cam-diag-btn intr-dismiss">✕ CALL OFF (FALSE ALARM)</button>
+    </div>`;
+    body.innerHTML = html;
+    // This card is rendered after the main wiring pass, so its on/off toggles
+    // (vision-confirm, require-confinement) need wiring here or they do nothing
+    // when clicked (issue #111).
+    this._wireConfigToggles(body);
+    const btn = body.querySelector(".intr-dismiss");
+    btn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      btn.disabled = true;
+      try {
+        await this._hass.callWS({ type: "jarvis/intrusion", action: "dismiss", reason: "panel" });
+        this._toast("✓ intrusion called off", "ok");
+        await this._fetchIntrusion();
+      } catch (err) {
+        this._toast(`✗ ${err?.message || err}`, "err");
+        btn.disabled = false;
+      }
+    });
+    const ackBtn = body.querySelector(".intr-ack-btn");
+    ackBtn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      ackBtn.disabled = true;
+      try {
+        await this._hass.callWS({ type: "jarvis/intrusion", action: "acknowledge", reason: "panel" });
+        this._toast("✓ acknowledged — holding escalation", "ok");
+        await this._fetchIntrusion();
+      } catch (err) {
+        this._toast(`✗ ${err?.message || err}`, "err");
+        ackBtn.disabled = false;
+      }
+    });
+  }
+
+  // ── Intrusion Log + training (v7.94.0) ──
+  async _wireIntrusionLog() {
+    await this._fetchIntrusionLog();
+    const btn = this.shadowRoot?.getElementById("ilog-refresh");
+    btn?.addEventListener("click", async () => {
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "\u27f3 LOADING\u2026";
+      try { await this._fetchIntrusionLog(); }
+      finally { btn.disabled = false; btn.textContent = orig; }
+    });
+  }
+
+  async _fetchIntrusionLog() {
+    const body = this.shadowRoot?.getElementById("ilog-body");
+    const side = this.shadowRoot?.getElementById("ilog-learn");
+    if (!this._hass || !body) return;
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/intrusion", action: "log", limit: 40 });
+      this._ilog = res;
+      const L = res?.learning || {};
+      if (side) side.textContent = `${L.labeled || 0}/${L.events || 0} LABELLED`;
+      body.innerHTML = this._renderIntrusionLog(res);
+      this._wireIntrusionLabels();
+    } catch (err) {
+      body.innerHTML = `<div class="mmwave-empty">Could not load the log.</div>`;
+    }
+  }
+
+  _renderIntrusionLog(res) {
+    const evs = (res && res.events) || [];
+    if (!evs.length) {
+      return `<div class="mmwave-empty">No intrusion events recorded yet.</div>`;
+    }
+    const damped = ((res.learning || {}).damped_patterns || []).length;
+    let html = "";
+    if (damped) {
+      html += `<div class="ilog-learned">JARVIS has learned ${damped} benign pattern${damped === 1 ? "" : "s"} — low-confidence alerts for these stay quiet.</div>`;
+    }
+    for (const e of evs) {
+      const when = new Date((e.ts || 0) * 1000).toLocaleString();
+      const kindCls = { confirmed: "ilog-confirmed", unresolved: "ilog-unresolved",
+                        investigating: "ilog-investigating" }[e.kind] || "ilog-investigating";
+      const label = e.label || "";
+      html += `<div class="ilog-item" data-ev="${this._esc(e.id)}">
+        <div class="ilog-row">
+          <span class="ilog-kind ${kindCls}">${this._esc((e.kind || "").toUpperCase())}</span>
+          <span class="ilog-when">${this._esc(when)}</span>
+        </div>
+        <div class="ilog-what">${this._esc(e.breach || e.camera || "activity")}${e.reason ? " — " + this._esc(e.reason) : ""}</div>
+        ${e.snapshot_url ? `<img class="ilog-snap" src="${this._esc(e.snapshot_url)}" alt="snapshot">` : ""}
+        <div class="ilog-actions">
+          <button class="ilog-btn ilog-real ${label === "real" ? "ilog-on" : ""}" data-label="real">REAL</button>
+          <button class="ilog-btn ilog-false ${label === "false" ? "ilog-on" : ""}" data-label="false">FALSE ALARM</button>
+          ${label ? `<button class="ilog-btn ilog-clear" data-label="">CLEAR</button>` : ""}
+        </div>
+      </div>`;
+    }
+    return html;
+  }
+
+  _wireIntrusionLabels() {
+    const body = this.shadowRoot?.getElementById("ilog-body");
+    body?.querySelectorAll(".ilog-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const item = btn.closest(".ilog-item");
+        const id = item?.getAttribute("data-ev");
+        if (!id || !this._hass) return;
+        try {
+          await this._hass.callWS({ type: "jarvis/intrusion", action: "label",
+                                    event_id: id, label: btn.getAttribute("data-label") });
+          await this._fetchIntrusionLog();
+        } catch (_) {}
+      });
+    });
+  }
+
+  _wireIntrusion() {
+    this._fetchIntrusion();
+  }
+
+  // ── Household Faces / resident whitelist (#140) ──
+  // ── Muted announcements (#181) ──
+  _wireMutes() {
+    const addBtn = this.shadowRoot?.getElementById("mutes-add-btn");
+    const input = this.shadowRoot?.getElementById("mutes-add-entity");
+    const refresh = this.shadowRoot?.getElementById("mutes-refresh");
+    const add = async () => {
+      const eid = (input?.value || "").trim();
+      if (!eid) return;
+      await this._mutesAction("mute", { entity_id: eid });
+      if (input) input.value = "";
+    };
+    addBtn?.addEventListener("click", add);
+    input?.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+    refresh?.addEventListener("click", () => this._fetchMutes());
+    this._fetchMutes();
+  }
+
+  async _mutesAction(action, extra) {
+    if (!this._hass) return;
+    try {
+      this._mutes = await this._hass.callWS({ type: "jarvis/mutes", action, ...(extra || {}) });
+      this._renderMutes();
+    } catch (err) {
+      this._toast(`✗ ${err?.message || err}`, "err");
+    }
+  }
+
+  async _fetchMutes() {
+    if (!this._hass) return;
+    try {
+      this._mutes = await this._hass.callWS({ type: "jarvis/mutes", action: "list" });
+    } catch (_) {
+      this._mutes = { error: true };
+    }
+    this._renderMutes();
+  }
+
+  _renderMutes() {
+    const body = this.shadowRoot?.getElementById("mutes-body");
+    if (!body) return;
+    const m = this._mutes || {};
+    if (m.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't load — restart Home Assistant after updating.</div>`;
+      return;
+    }
+    const ents = Array.isArray(m.entities) ? m.entities : [];
+    const cats = Array.isArray(m.categories) ? m.categories : [];
+    let html = "";
+    if (m.all) {
+      html += `<div class="intr-fa">Blanket mute is ON — <b>all</b> announcements are suppressed. <button class="btn mutes-x" data-unmute-all="1">Turn off</button></div>`;
+    }
+    if (ents.length || cats.length) {
+      html += `<div class="mutes-chips">`;
+      html += ents.map(e =>
+        `<span class="mutes-chip">${this._esc(e)}<button class="mutes-x" data-unmute-entity="${this._esc(e)}" title="Unmute">✕</button></span>`).join("");
+      html += cats.map(c =>
+        `<span class="mutes-chip cat">${this._esc(c)} <span class="mutes-tag">category</span><button class="mutes-x" data-unmute-category="${this._esc(c)}" title="Unmute">✕</button></span>`).join("");
+      html += `</div>`;
+    } else if (!m.all) {
+      html += `<div class="mmwave-empty">Nothing muted. JARVIS announces about everything it observes. Mute an entity above (or say/run <code>jarvis.shush</code>) to silence announcements about it without excluding it.</div>`;
+    }
+    body.innerHTML = html;
+    body.querySelectorAll("[data-unmute-entity]").forEach(el =>
+      el.addEventListener("click", () => this._mutesAction("unmute", { entity_id: el.getAttribute("data-unmute-entity") })));
+    body.querySelectorAll("[data-unmute-category]").forEach(el =>
+      el.addEventListener("click", () => this._mutesAction("unmute", { category: el.getAttribute("data-unmute-category") })));
+    body.querySelectorAll("[data-unmute-all]").forEach(el =>
+      el.addEventListener("click", () => this._mutesAction("clear", {})));
+  }
+
+  _wireFaces() {
+    const addBtn = this.shadowRoot?.getElementById("faces-add-btn");
+    const input = this.shadowRoot?.getElementById("faces-add-name");
+    const refresh = this.shadowRoot?.getElementById("faces-refresh");
+    const add = async () => {
+      const name = (input?.value || "").trim();
+      if (!name) return;
+      await this._facesAction("add_resident", name);
+      if (input) input.value = "";
+    };
+    addBtn?.addEventListener("click", add);
+    input?.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+    refresh?.addEventListener("click", () => { this._fetchFaces(); this._fetchVoices(); });
+    this._fetchFaces();
+    this._fetchVoices();
+  }
+
+  async _facesAction(action, name) {
+    if (!this._hass) return;
+    try {
+      await this._hass.callWS({ type: "jarvis/faces", action, name });
+      this._toast(action === "remove_resident" ? "✓ removed resident" : "✓ added resident", "ok");
+      await this._fetchFaces();
+    } catch (err) {
+      this._toast(`✗ ${err?.message || err}`, "err");
+    }
+  }
+
+  async _fetchFaces() {
+    if (!this._hass) return;
+    try {
+      this._faces = await this._hass.callWS({ type: "jarvis/faces", action: "list", limit: 24 });
+    } catch (_) {
+      this._faces = { error: true };
+    }
+    this._renderFaces();
+  }
+
+  // ── Voices (vocal biometrics, Path B; #397) ──────────────────────────────
+  async _fetchVoices() {
+    if (!this._hass) return;
+    try {
+      this._voices = await this._hass.callWS({ type: "jarvis/voices", action: "list" });
+    } catch (_) {
+      this._voices = { error: true };
+    }
+    this._renderVoices();
+  }
+
+  _renderVoices() {
+    const body = this.shadowRoot?.getElementById("voices-body");
+    if (!body) return;
+    const v = this._voices || {};
+    if (v.error) { body.innerHTML = ""; return; }   // stay quiet on older backends
+    const esc = (s) => this._esc(String(s ?? ""));
+    const profiles = Array.isArray(v.profiles) ? v.profiles : [];
+    const cur = v.current;
+    const backend = !!v.backend_available;
+    const statusLine = backend
+      ? `<span class="voices-ok">● speaker-ID backend ready</span>`
+      : `<span class="voices-off">○ backend not installed — add onnxruntime + a model to enable</span>`;
+    const curLine = cur && cur.name
+      ? `Speaking now: <b>${esc(cur.name)}</b> ${cur.trusted ? "" : "<span class='voices-guess'>(guess)</span>"} · ${esc(Math.round(cur.score || 0))}%`
+      : "Speaking now: —";
+    const rows = profiles.length
+      ? profiles.map(p =>
+          `<div class="voices-row"><span class="voices-name">${esc(p.name)}</span>`
+          + `<span class="voices-meta">${esc(p.count)} sample${p.count === 1 ? "" : "s"}</span>`
+          + `<button class="btn voices-forget" data-voice-forget="${esc(p.name)}" title="Forget this voiceprint">✕</button></div>`
+        ).join("")
+      : `<div class="mmwave-empty">No enrolled voices yet. Record a short sample below to teach JARVIS a voice.</div>`;
+    const localOn = !!v.local_enabled;
+    body.innerHTML = `
+      <div class="faces-section voices-section">
+        <div class="faces-section-head"><span>Voices</span><span class="faces-exp">EXPERIMENTAL</span></div>
+        <div class="faces-llm-row">
+          <label>Identify speakers in-process</label>
+          <button class="toggle-btn ${localOn ? 'on' : 'off'}" data-voice-toggle="${localOn ? 'false' : 'true'}">${localOn ? 'ON' : 'OFF'}</button>
+        </div>
+        ${localOn ? `<div class="voices-cfg">
+          <input class="cfg-field voices-delegate" type="text" placeholder="Delegate STT entity (e.g. stt.whisper)" value="${esc(v.delegate_stt || '')}"/>
+          <input class="cfg-field voices-model" type="text" placeholder="Model path (…/jarvis/models/speaker.onnx)" value="${esc(v.model_path || '')}"/>
+        </div>` : ''}
+        <div class="voices-status">${statusLine} · ${curLine}</div>
+        <div class="voices-list">${rows}</div>
+        <div class="voices-enroll">
+          <input class="cfg-field voices-name-input" type="text" placeholder="Name this voice…" list="faces-names-dl"/>
+          <button class="btn voices-rec" data-voice-rec="enroll" ${backend ? "" : "disabled"} title="Record ~4s and enroll">🎤 Record &amp; enroll</button>
+          <button class="btn voices-rec" data-voice-rec="identify" ${backend ? "" : "disabled"} title="Record ~4s and identify">🎤 Identify</button>
+        </div>
+        <div class="mem-sub">Voiceprints are stored as embeddings, never audio. A match only identifies a resident above a confidence threshold; weaker matches are shown as a guess and never stand security alerts down.</div>
+      </div>`;
+    body.querySelectorAll("[data-voice-forget]").forEach(el =>
+      el.addEventListener("click", () => this._voicesForget(el.getAttribute("data-voice-forget"))));
+    body.querySelectorAll("[data-voice-rec]").forEach(el =>
+      el.addEventListener("click", () => this._voicesRecord(el.getAttribute("data-voice-rec"))));
+    const toggle = body.querySelector("[data-voice-toggle]");
+    if (toggle) toggle.addEventListener("click", () =>
+      this._voicesSetCfg("voice_recognition_local", toggle.getAttribute("data-voice-toggle")));
+    const saveField = (sel, key) => {
+      const el = body.querySelector(sel);
+      if (!el) return;
+      el.dataset.saved = el.value;
+      const save = () => { if (el.value !== el.dataset.saved) { el.dataset.saved = el.value; this._voicesSetCfg(key, el.value); } };
+      el.addEventListener("blur", save);
+      el.addEventListener("keydown", (e) => { if (e.key === "Enter") el.blur(); });
+    };
+    saveField(".voices-delegate", "voice_recognition_delegate_stt");
+    saveField(".voices-model", "voice_embedding_model_path");
+  }
+
+  async _voicesSetCfg(key, value) {
+    if (!this._hass) return;
+    try {
+      await this._hass.callWS({ type: "jarvis/update_config", key, value });
+      this._toast("✓ saved", "ok");
+      await this._fetchVoices();
+    } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+  }
+
+  async _voicesForget(name) {
+    if (!name || !this._hass) return;
+    try {
+      await this._hass.callWS({ type: "jarvis/voices", action: "forget", name });
+      this._toast(`✓ forgot voiceprint for ${name}`, "ok");
+      await this._fetchVoices();
+    } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+  }
+
+  async _voicesRecord(mode) {
+    const body = this.shadowRoot?.getElementById("voices-body");
+    const nameInput = body?.querySelector(".voices-name-input");
+    const name = (nameInput?.value || "").trim();
+    if (mode === "enroll" && !name) { this._toast("✗ name the voice first", "err"); return; }
+    let wavB64;
+    try {
+      wavB64 = await this._recordWavBase64(4);
+    } catch (err) {
+      this._toast(`✗ mic unavailable — ${err?.message || err}`, "err");
+      return;
+    }
+    if (!wavB64) { this._toast("✗ no audio captured", "err"); return; }
+    try {
+      if (mode === "enroll") {
+        await this._hass.callWS({ type: "jarvis/voices", action: "enroll", name, audio: wavB64 });
+        if (nameInput) nameInput.value = "";
+        this._toast(`✓ enrolled ${name}`, "ok");
+        await this._fetchVoices();
+      } else {
+        const res = await this._hass.callWS({ type: "jarvis/voices", action: "identify", audio: wavB64 });
+        const m = res?.match;
+        this._toast(m && m.name
+          ? `Heard: ${m.name} (${Math.round(m.score || 0)}%${m.trusted ? "" : ", guess"})`
+          : "No confident match", m && m.trusted ? "ok" : "");
+      }
+    } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+  }
+
+  // Record `seconds` from the mic and return a base64 16 kHz mono 16-bit WAV.
+  // All browser-only APIs live here (never at render), feature-detected.
+  async _recordWavBase64(seconds) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!navigator.mediaDevices?.getUserMedia || !AC) {
+      throw new Error("recording not supported in this browser");
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ctx = new AC();
+    try {
+      const source = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const chunks = [];
+      source.connect(proc);
+      proc.connect(ctx.destination);
+      await new Promise((resolve) => {
+        proc.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+        setTimeout(resolve, Math.max(1, seconds) * 1000);
+      });
+      proc.disconnect(); source.disconnect();
+      return this._encodeWavBase64(chunks, ctx.sampleRate);
+    } finally {
+      try { stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+      try { await ctx.close(); } catch (_) {}
+    }
+  }
+
+  _encodeWavBase64(chunks, sampleRate) {
+    // Flatten, downsample to 16 kHz, encode 16-bit PCM mono WAV.
+    let total = 0; chunks.forEach(c => total += c.length);
+    const flat = new Float32Array(total);
+    let o = 0; chunks.forEach(c => { flat.set(c, o); o += c.length; });
+    const target = 16000;
+    const ratio = sampleRate / target;
+    const outLen = Math.floor(flat.length / ratio);
+    const pcm = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const s = Math.max(-1, Math.min(1, flat[Math.floor(i * ratio)] || 0));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    const buf = new ArrayBuffer(44 + pcm.length * 2);
+    const dv = new DataView(buf);
+    const wr = (off, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(off + i, str.charCodeAt(i)); };
+    wr(0, "RIFF"); dv.setUint32(4, 36 + pcm.length * 2, true); wr(8, "WAVE");
+    wr(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true); dv.setUint32(24, target, true);
+    dv.setUint32(28, target * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    wr(36, "data"); dv.setUint32(40, pcm.length * 2, true);
+    for (let i = 0; i < pcm.length; i++) dv.setInt16(44 + i * 2, pcm[i], true);
+    let bin = ""; const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return "data:audio/wav;base64," + btoa(bin);
+  }
+
+  _renderFaces() {
+    const body = this.shadowRoot?.getElementById("faces-body");
+    if (!body) return;
+    const f = this._faces || {};
+    if (f.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't load — restart Home Assistant after updating.</div>`;
+      return;
+    }
+    const residents = Array.isArray(f.residents) ? f.residents : [];
+    const recent = Array.isArray(f.recent) ? f.recent : [];
+    const refSet = new Set((Array.isArray(f.references) ? f.references : []).map(x => String(x).toLowerCase()));
+    const autoRefSet = new Set((Array.isArray(f.auto_references) ? f.auto_references : []).map(x => String(x).toLowerCase()));
+    const profileRefSet = new Set((Array.isArray(f.profile_references) ? f.profile_references : []).map(x => String(x).toLowerCase()));   // jh_faces_from_profile
+    const llmOn = !!f.llm_face_recognition;
+    const countEl = this.shadowRoot?.getElementById("faces-count");
+    if (countEl) countEl.textContent = `◉ ${residents.length} RESIDENT${residents.length === 1 ? "" : "S"}`;
+
+    // Freshest sighting per normalized name, so a resident's card can show the
+    // snapshot from the camera that last saw them.
+    const seenByName = {};
+    for (const r of recent) {
+      const k = (r.name || "").trim().toLowerCase();
+      if (!k) continue;
+      if (!seenByName[k] || (r.age_seconds || 0) < (seenByName[k].age_seconds || 0)) seenByName[k] = r;
+    }
+
+    // ── Section 1: Household (residents) ──
+    let html = `<div class="faces-section">
+      <div class="faces-section-head"><span>Household</span><span class="faces-section-sub">people who live here</span></div>`;
+    if (residents.length) {
+      html += `<div class="faces-gallery">` + residents.map(n => {
+        const seen = seenByName[(n || "").trim().toLowerCase()];
+        return this._faceCard({
+          name: n,
+          camera_entity: seen?.camera_entity,
+          camera: seen?.camera,
+          confidence: seen?.confidence,
+          age_seconds: seen ? seen.age_seconds : null,
+          snapshot_url: seen?.snapshot_url,
+          relation: "resident",
+          source: seen?.source,
+          actions: [{ label: "Remove", kind: "remove", name: n }],
+          ref_name: n,
+          has_ref: refSet.has(this._faceNorm(n)),
+          auto_ref: autoRefSet.has(this._faceNorm(n)),
+          profile_ref: profileRefSet.has(this._faceNorm(n)),
+          ref_hint: llmOn,
+          // Enroll straight from the camera that last saw them (#140).
+          can_capture: !!(seen && seen.camera_entity),
+        });
+      }).join("") + `</div>`;
+    } else {
+      html += `<div class="mmwave-empty">No residents yet. Add the people who live here (or mark a recognized face below); recognized residents then won't trigger intrusion alerts.</div>`;
+    }
+    html += `</div>`;
+
+    // ── Section 2: Recently seen (non-residents: guests + unknown) ──
+    // A recognized face that isn't a resident is a GUEST (issue #388); an
+    // unidentified face is UNKNOWN. Promoting a guest to resident = "+ Resident";
+    // removing a resident (Section 1) drops them back to a guest.
+    const others = recent.filter(r => !r.is_resident);
+    html += `<div class="faces-section">
+      <div class="faces-section-head"><span>Recently Seen</span><span class="faces-section-sub">guests &amp; unknown faces</span></div>`;
+    if (others.length) {
+      html += `<div class="faces-gallery">` + others.map(r => this._faceCard({
+        name: r.name,
+        camera_entity: r.camera_entity,
+        camera: r.camera,
+        confidence: r.confidence,
+        age_seconds: r.age_seconds,
+        snapshot_url: r.snapshot_url,
+        relation: r.relationship || (r.is_unknown ? "unknown" : "guest"),
+        low_conf: !!r.is_low_confidence,
+        source: r.source,
+        actions: r.is_unknown ? [] : [{ label: "+ Resident", kind: "add", name: r.name }],
+        // Free-text "Name this face" field (residents offered as suggestions).
+        labelable: true,
+      })).join("") + `</div>`;
+    } else {
+      html += `<div class="mmwave-empty">No guests or unknown faces seen recently. When your backend names a face that isn't a resident, it appears here as a guest.</div>`;
+    }
+    html += `</div>`;
+
+    if (f.recognition_source) {
+      html += `<div class="faces-src">Reading identities from: <b>${this._esc(String(f.recognition_source))}</b> · each snapshot is the frame captured when JARVIS recognized the face (falls back to the live camera view until the next sighting).</div>`;
+    }
+
+    // Shared suggestions for the "Name this face" fields: existing residents, so
+    // you can pick one quickly or type a brand-new name.
+    html += `<datalist id="faces-names-dl">`
+      + residents.map(n => `<option value="${this._esc(n)}"></option>`).join("")
+      + `</datalist>`;
+
+    body.innerHTML = html;
+    body.querySelectorAll("[data-faces-add]").forEach(el =>
+      el.addEventListener("click", () => this._facesAction("add_resident", el.getAttribute("data-faces-add"))));
+    body.querySelectorAll("[data-faces-remove]").forEach(el =>
+      el.addEventListener("click", () => this._facesAction("remove_resident", el.getAttribute("data-faces-remove"))));
+    // Fill each card's snapshot from the camera that saw the subject.
+    body.querySelectorAll("img[data-faces-cam]").forEach(img =>
+      this._loadFaceSnap(img.getAttribute("data-faces-cam"), img));
+    // …and show the enrolled reference photo on residents with no live sighting
+    // (#394: the uploaded snapshot must actually appear on the card).
+    body.querySelectorAll("img[data-faces-refimg]").forEach(img =>
+      this._loadFaceReference(img.getAttribute("data-faces-refimg"), img));
+    // Reference-photo upload (Phase 3): a resident card's file input enrolls a
+    // reference image the best-effort LLM matcher compares camera frames against.
+    body.querySelectorAll("input[type=file][data-faces-ref]").forEach(inp =>
+      inp.addEventListener("change", (e) => this._uploadFaceReference(
+        inp.getAttribute("data-faces-ref"), e.target.files && e.target.files[0])));
+    // On-the-fly labeling (#140 / #388 follow-up): enroll a Recently-Seen frame
+    // under a typed name (a new person, or an existing resident from the
+    // suggestions) as that name's reference photo.
+    const labelFromCard = (el) => {
+      const card = el.closest(".faces-card");
+      const inp = card && card.querySelector(".faces-label-input");
+      const name = inp && inp.value.trim();
+      if (card && name) { inp.value = ""; this._labelFaceAs(card, name); }
+    };
+    body.querySelectorAll("button[data-faces-label]").forEach(btn =>
+      btn.addEventListener("click", () => labelFromCard(btn)));
+    body.querySelectorAll(".faces-label-input").forEach(inp =>
+      inp.addEventListener("keydown", (e) => { if (e.key === "Enter") labelFromCard(inp); }));
+    // Click any snapshot to enlarge it for identification (#388 follow-up).
+    body.querySelectorAll(".faces-thumb").forEach(th =>
+      th.addEventListener("click", () => {
+        const card = th.closest(".faces-card");
+        const cap = card && card.querySelector(".faces-card-name")
+          ? card.querySelector(".faces-card-name").textContent : "";
+        this._openFaceLightbox(card, cap);
+      }));
+    // …or enroll a resident's reference straight from their last sighting.
+    body.querySelectorAll("button[data-faces-capture]").forEach(el =>
+      el.addEventListener("click", () => {
+        const card = el.closest(".faces-card");
+        if (card) this._labelFaceAs(card, el.getAttribute("data-faces-capture"));
+      }));
+    // Remember the chosen snapshot camera per-browser so it persists across the
+    // panel's re-renders / reopen instead of resetting each time (#394).
+    body.querySelectorAll("select.faces-snap-cam").forEach(sel =>
+      sel.addEventListener("change", () => this._setFacesSnapCam(sel.value, sel.dataset.resident)));   // jh-r13-snapcam: per resident too
+    // …or snapshot a fresh frame from a chosen camera right now (#140).
+    body.querySelectorAll("button[data-faces-snapshot]").forEach(el =>
+      el.addEventListener("click", () => {
+        const wrap = el.closest(".faces-card-snap");
+        const sel = wrap && wrap.querySelector("select.faces-snap-cam");
+        this._snapshotReferenceNow(el.getAttribute("data-faces-snapshot"), sel && sel.value);
+      }));
+  }
+
+  // Normalized name key, mirroring recognition._face_norm, so the panel can tell
+  // whether a resident already has an enrolled reference photo.
+  _faceNorm(name) {
+    return String(name || "").trim().toLowerCase().split(/\s+/).join("_")
+      .replace(/[^a-z0-9_-]/g, "").slice(0, 80);
+  }
+
+  async _uploadFaceReference(name, file) {
+    if (!name || !file || !this._hass) return;
+    try {
+      const b64 = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result || ""));
+        fr.onerror = reject;
+        fr.readAsDataURL(file);
+      });
+      await this._hass.callWS({ type: "jarvis/faces", action: "set_reference", name, image: b64 });
+      if (this._faceRefs) delete this._faceRefs[name];   // show the new photo, not a cached one
+      this._toast(`✓ reference photo set for ${name}`, "ok");
+      await this._fetchFaces();
+    } catch (err) {
+      this._toast(`✗ ${err?.message || err}`, "err");
+    }
+  }
+
+  // On-the-fly labeling (#140): grab the image a face card is showing and enroll
+  // it as a resident's reference photo, so the dataset can be built straight from
+  // real-world detections instead of manual file uploads. Prefers the exact frame
+  // on the card (a loaded live frame or the pinned recognition-time snapshot);
+  // falls back to a fresh frame from the card's camera.
+  async _captureFaceImage(cardEl) {
+    if (!cardEl) return null;
+    const img = cardEl.querySelector("img.faces-thumb-img");
+    const src = img && img.getAttribute("src");
+    // A live frame already loaded into the card is a base64 data URL — use as-is.
+    if (src && src.startsWith("data:")) return src;
+    // A pinned snapshot is a same-origin URL (served by HA) — read its bytes.
+    if (src) {
+      try {
+        const blob = await (await fetch(src)).blob();
+        return await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(String(fr.result || ""));
+          fr.onerror = reject;
+          fr.readAsDataURL(blob);
+        });
+      } catch (_) { /* fall through to a fresh camera frame */ }
+    }
+    // Only a placeholder was shown → pull a fresh frame from the card's camera.
+    const cam = cardEl.dataset ? cardEl.dataset.cam : "";
+    if (cam && this._hass) {
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/camera_snapshot", entity_id: cam });
+        if (res?.image) return `data:image/jpeg;base64,${res.image}`;
+      } catch (_) { /* nothing to assign */ }
+    }
+    return null;
+  }
+
+  async _labelFaceAs(cardEl, name) {
+    if (!name || !this._hass) return;
+    try {
+      const image = await this._captureFaceImage(cardEl);
+      if (!image) { this._toast("✗ no snapshot available to assign", "err"); return; }
+      await this._hass.callWS({ type: "jarvis/faces", action: "set_reference", name, image });
+      if (this._faceRefs) delete this._faceRefs[name];
+      this._toast(`✓ reference photo set for ${name} from this sighting`, "ok");
+      await this._fetchFaces();
+    } catch (err) {
+      this._toast(`✗ ${err?.message || err}`, "err");
+    }
+  }
+
+  // Snapshot-from-camera-now (#140): grab a fresh frame off the chosen camera
+  // and enroll it as a resident's reference photo. Unlike "From sighting" (which
+  // reuses the frame that last saw them), this works for a resident who has
+  // never been detected yet — so the matcher's dataset can be bootstrapped from
+  // a live camera, no prior sighting and no file upload required.
+  async _snapshotReferenceNow(name, cameraEntity) {
+    if (!name || !this._hass) return;
+    if (!cameraEntity) { this._toast("✗ pick a camera first", "err"); return; }
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/camera_snapshot", entity_id: cameraEntity });
+      if (!res?.image) { this._toast("✗ no frame from that camera", "err"); return; }
+      const image = `data:image/jpeg;base64,${res.image}`;
+      await this._hass.callWS({ type: "jarvis/faces", action: "set_reference", name, image });
+      if (this._faceRefs) delete this._faceRefs[name];
+      this._toast(`✓ reference photo set for ${name} from ${String(cameraEntity).replace(/^camera\./, "")}`, "ok");
+      await this._fetchFaces();
+    } catch (err) {
+      this._toast(`✗ ${err?.message || err}`, "err");
+    }
+  }
+
+  // Enlarge a face snapshot in a lightbox for identification (#388 follow-up).
+  // Prefers the frame already shown on the card; falls back to pulling one from
+  // the card's camera. Click anywhere (or Esc) to close.
+  async _openFaceLightbox(cardEl, caption) {
+    if (!cardEl || !this.shadowRoot) return;
+    const imgEl = cardEl.querySelector("img.faces-thumb-img");
+    const shown = imgEl && imgEl.getAttribute("src") && imgEl.style.display !== "none";
+    const src = shown ? imgEl.getAttribute("src") : await this._captureFaceImage(cardEl);
+    if (!src) { this._toast("✗ no snapshot to enlarge", "err"); return; }
+    let ov = this.shadowRoot.getElementById("faces-lightbox");
+    if (!ov) {
+      ov = document.createElement("div");
+      ov.id = "faces-lightbox";
+      ov.className = "faces-lightbox";
+      // Stable close + key handler stored on the node so any close path (click
+      // or Esc) detaches the document listener — no accumulation across opens.
+      ov._close = () => {
+        ov.style.display = "none";
+        ov.innerHTML = "";
+        document.removeEventListener("keydown", ov._onKey);
+      };
+      ov._onKey = (e) => { if (e.key === "Escape") ov._close(); };
+      ov.addEventListener("click", () => ov._close());
+      this.shadowRoot.appendChild(ov);
+    }
+    const cap = caption ? `<div class="faces-lightbox-cap">${this._esc(caption)}</div>` : "";
+    ov.innerHTML = `<div class="faces-lightbox-inner"><img src="${this._esc(src)}" alt="enlarged face"/>${cap}</div>`;
+    ov.style.display = "flex";
+    document.addEventListener("keydown", ov._onKey);
+  }
+
+  // Map a recognition source to a short provenance label for a face card.
+  // LLM guesses carry their own "LLM GUESS" badge, so they get no source chip.
+  _faceSourceLabel(source) {
+    switch (String(source || "")) {
+      case "frigate":
+      case "frigate_sensor":
+      case "frigate_tracked_object": return "FRIGATE";
+      case "doubletake":             return "DOUBLE TAKE";
+      case "recent_cache":           return "RECOGNIZED";
+      default:                       return "";
+    }
+  }
+
+  // One face card: snapshot (or an initial placeholder) with the name under it.
+  _faceCard({ name, camera_entity, camera, confidence, age_seconds, relation, actions,
+              snapshot_url, low_conf, source, ref_name, has_ref, auto_ref, profile_ref, ref_hint,
+              labelable, can_capture }) {
+    const safe = this._esc(name || "Unknown");
+    const initial = this._esc((name || "?").trim().charAt(0).toUpperCase() || "?");
+    let badge = relation === "resident" ? `<span class="faces-badge resident">RESIDENT</span>`
+      : relation === "unknown" ? `<span class="faces-badge unknown">UNKNOWN</span>`
+      : relation === "guest" ? `<span class="faces-badge guest">GUEST</span>` : "";
+    // A best-effort LLM guess is flagged distinctly and never looks authoritative.
+    if (low_conf) badge = `<span class="faces-badge guess">LLM GUESS</span>`;
+    // Which backend named this face (Frigate / Double Take / generic). Not shown
+    // for an LLM guess (its badge already says so) or an unlabelled unknown.
+    const srcLabel = low_conf ? "" : this._faceSourceLabel(source);
+    const srcChip = srcLabel ? `<span class="faces-srcchip">${srcLabel}</span>` : "";
+    // Prefer the pinned recognition-time snapshot; else lazily pull a live frame
+    // from the camera that saw them; else an initial-letter avatar.
+    // Thumbnail priority: a pinned recognition-time sighting → the enrolled
+    // reference photo the user uploaded (#394: it must actually show up) → a
+    // live frame from the camera that saw them → an initial-letter avatar.
+    const thumb = snapshot_url
+      ? `<img class="faces-thumb-img" src="${this._esc(snapshot_url)}" alt="${safe}"/>`
+      : (has_ref && ref_name)
+        ? `<img class="faces-thumb-img" data-faces-refimg="${this._esc(ref_name)}" alt="${safe}" style="display:none"/><div class="faces-thumb-ph">${initial}</div>`
+        : camera_entity
+          ? `<img class="faces-thumb-img" data-faces-cam="${this._esc(camera_entity)}" alt="${safe}" style="display:none"/><div class="faces-thumb-ph">${initial}</div>`
+          : `<div class="faces-thumb-ph">${initial}</div>`;
+    const meta = [];
+    if (camera) meta.push(this._esc(String(camera).replace(/_/g, " ")));
+    if (relation !== "unknown" && !low_conf && confidence) meta.push(`${Math.round(confidence)}%`);
+    const age = this._facesAge(age_seconds);
+    if (age) meta.push(age);
+    else if (relation === "resident" && !camera_entity) meta.push("not seen recently");
+    const acts = (actions || []).map(a =>
+      `<button class="btn faces-mark" data-faces-${a.kind === "remove" ? "remove" : "add"}="${this._esc(a.name)}">${this._esc(a.label)}</button>`
+    ).join("");
+    // Reference-photo control for resident cards (enrollment for the LLM matcher).
+    let refCtl = "";
+    if (ref_name) {
+      const lbl = has_ref ? "📷 Change photo" : "📷 Set photo";
+      refCtl = `<label class="faces-ref ${has_ref ? "set" : ""}"${ref_hint && !has_ref ? ' title="Add a reference photo to let best-effort recognition match this resident"' : ""}>${lbl}`
+        + `<input type="file" accept="image/*" data-faces-ref="${this._esc(ref_name)}" style="display:none"/></label>`;
+      // An auto-enrolled reference (captured from a confident backend recognition)
+      // is marked so the user can tell it from one they set — and knows a manual
+      // "Change photo" will make it sticky.
+      if (has_ref && profile_ref && !auto_ref) {
+        refCtl += `<span class="faces-ref-auto" title="Copied from their Home Assistant profile picture. Set your own photo to override.">profile</span>`;
+      }
+      if (has_ref && auto_ref) {
+        refCtl += `<span class="faces-ref-auto" title="Auto-saved from a confident Frigate / Double Take recognition. Set your own photo to override.">auto</span>`;
+      }
+      // On-the-fly: enroll this resident's reference straight from the frame that
+      // last saw them, no file upload needed (#140).
+      if (can_capture) {
+        refCtl += `<button class="faces-ref faces-cap" data-faces-capture="${this._esc(ref_name)}" title="Use this sighting as the reference photo">📷 From sighting</button>`;
+      }
+    }
+    // Snapshot-from-camera-now (#140): enroll a reference from a live frame off
+    // any chosen camera, right now — works even for a resident never seen yet,
+    // so the dataset can be bootstrapped without waiting for a sighting or a
+    // file upload. Only offered when at least one camera entity exists.
+    let snapCtl = "";
+    if (ref_name) {
+      // Preselect the camera the user last chose here, so the choice survives a
+      // panel re-render / reopen instead of resetting every time (#394).
+      const camOpts = this._facesCamOptions(this._facesSnapCamFor(ref_name));   // jh-r13-snapcam
+      if (camOpts.includes('value="camera.')) {
+        snapCtl = `<div class="faces-card-snap">`
+          + `<select class="faces-assign-sel faces-snap-cam" data-resident="${this._esc(ref_name)}" aria-label="Camera to snapshot ${safe} from">${camOpts}</select>`
+          + `<button class="faces-ref faces-cap faces-snapnow" data-faces-snapshot="${this._esc(ref_name)}" title="Grab a frame from the selected camera now and use it as the reference photo">📷 Snapshot now</button>`
+          + `</div>`;
+      }
+    }
+    // On-the-fly labeling for Recently-Seen cards (#140; extended per the #388
+    // follow-up): a free-text name field — with existing residents offered as
+    // suggestions via a shared datalist — enrolls the shown frame as that name's
+    // reference photo. Unlike the old residents-only dropdown, you can name a NEW
+    // person, and it sits right under the snapshot for quick identification.
+    let labelCtl = "";
+    if (labelable) {
+      labelCtl = `<div class="faces-card-label">`
+        + `<input class="faces-label-input" type="text" list="faces-names-dl" placeholder="Name this face…" aria-label="Name this face"/>`
+        + `<button class="btn faces-mark faces-label-btn" data-faces-label="1">Label</button>`
+        + `</div>`;
+    }
+    return `<div class="faces-card" data-cam="${this._esc(camera_entity || "")}">
+      <div class="faces-thumb" title="Click to enlarge">${thumb}${badge}${srcChip}</div>
+      ${labelCtl}
+      <div class="faces-card-name">${safe}</div>
+      <div class="faces-card-meta">${meta.join(" · ")}</div>
+      ${acts ? `<div class="faces-card-act">${acts}</div>` : ""}
+      ${refCtl ? `<div class="faces-card-ref">${refCtl}</div>` : ""}
+      ${snapCtl}
+    </div>`;
+  }
+
+  // Lazily fetch a camera frame for a face card, caching per camera so multiple
+  // cards sharing a camera don't each hit the backend. Leaves the initial
+  // placeholder in place when no frame is available.
+  // The camera last chosen in a Faces "Snapshot now" dropdown, remembered
+  // per-browser so it survives the panel's periodic re-render and reopen (#394).
+  _facesSnapCam() {
+    return String(this._jhPrefGet("jarvis_faces_snap_cam") || "");   // jh-user-prefs: follows the login
+  }
+
+  // jh-r13-snapcam (2026-11-18): the camera for a resident's "Snapshot now". The user's own choice (this resident's, else the
+  // last one) wins while that camera exists and is available; otherwise the best default: a camera in a room where someone is
+  // now (an occupancy or presence sensor that is on, or a person's room), else an indoor camera (its area and floor are not
+  // outdoors), else the first available camera. Everything is read from Home Assistant, so new rooms and cameras just work.
+  _facesCamOk(eid) {
+    const s = this._hass && this._hass.states ? this._hass.states[eid] : null;
+    return !!(s && String(eid).startsWith("camera.") && s.state !== "unavailable");
+  }
+
+  _facesSnapCamFor(resident) {
+    const s = this._facesCamStore();
+    const own = resident ? s.by[this._faceNorm(resident)] : "";
+    for (const c of [own, s.last]) if (c && this._facesCamOk(c)) return c;
+    return this._facesBestCam();
+  }
+
+  _facesSnapCamShown() { return this._facesSnapCamFor(""); }
+
+  _jhCamArea(eid) {
+    const h = this._hass || {};
+    const ent = (h.entities || {})[eid];
+    if (ent && ent.area_id) return ent.area_id;
+    const dev = ent && ent.device_id ? (h.devices || {})[ent.device_id] : null;
+    return (dev && dev.area_id) || "";
+  }
+
+  _jhAreaOutdoor(aid) {
+    const h = this._hass || {};
+    const a = (h.areas || {})[aid];
+    if (!a) return false;
+    const fl = a.floor_id ? (h.floors || {})[a.floor_id] : null;
+    const out = /(?:^|[^a-z])(?:balcon(?:y|ies)|garden|terrace|patio|yard|backyard|porch|deck|driveway|outdoors?|outside|exterior|veranda|carport|balkon|tuin|terras|oprit|buiten|garten|terrasse|einfahrt|aussen|außen|jardin|jardín|terraza|exterieur|extérieur)(?![a-z])/i;
+    return out.test(String(a.name || "") + " " + aid) || !!(fl && out.test(String(fl.name || "") + " " + String(fl.floor_id || "")));
+  }
+
+  _jhOccupiedAreas() {
+    const h = this._hass || {}, st = h.states || {}, out = new Set(), byName = {};
+    for (const [id, a] of Object.entries(h.areas || {})) { byName[String((a && a.name) || "").toLowerCase()] = id; byName[id.toLowerCase()] = id; }
+    delete byName[""];
+    for (const [eid, s] of Object.entries(st)) {
+      if (!s) continue;
+      const dc = s.attributes && s.attributes.device_class;
+      if (eid.startsWith("binary_sensor.") && (dc === "occupancy" || dc === "presence") && s.state === "on") {
+        const a = this._jhCamArea(eid);
+        if (a) out.add(a);
+      } else if (/^(?:person|sensor|device_tracker)\./.test(eid)) {   // a person's room (room-presence integrations)
+        const v = String(s.state || "").toLowerCase();
+        if (v && !["home", "not_home", "away", "unknown", "unavailable", "on", "off"].includes(v) && byName[v]) out.add(byName[v]);
+      }
+    }
+    return out;
+  }
+
+  _facesBestCam() {
+    const st = (this._hass && this._hass.states) || {};
+    const cams = Object.keys(st).filter(e => this._facesCamOk(e)).sort();
+    if (!cams.length) return "";
+    const occ = this._jhOccupiedAreas();
+    return cams.find(c => occ.has(this._jhCamArea(c)))
+      || cams.find(c => { const a = this._jhCamArea(c); return a && !this._jhAreaOutdoor(a); })
+      || cams[0];
+  }
+
+  // Only cameras that exist; one that went unavailable is shown greyed out as "(offline)" and cannot be chosen.
+  _facesCamOptions(selected) {
+    const st = (this._hass && this._hass.states) || {};
+    const opts = Object.keys(st).filter(e => e.startsWith("camera.")).sort().map(e => {
+      const s = st[e], fn = (s && s.attributes && s.attributes.friendly_name) || e, off = !s || s.state === "unavailable";
+      return '<option value="' + this._esc(e) + '"' + (off ? ' disabled class="faces-cam-off"' : (e === selected ? " selected" : ""))
+        + ">" + this._esc(fn) + (off ? " (offline)" : "") + "</option>";
+    }).join("");
+    return '<option value="">— camera —</option>' + opts;
+  }
+
+  _facesCamStore() {
+    const by = this._jhPrefGet("jarvis_faces_snap_cams");
+    return { last: this._facesSnapCam(), by: (by && typeof by === "object" && !Array.isArray(by)) ? by : {} };
+  }
+
+  _setFacesSnapCam(entity, resident) {
+    try {
+      if (!entity) return;
+      this._jhPrefSet("jarvis_faces_snap_cam", entity);   // jh-user-prefs: follows the login
+      if (resident) {   // jh-r13-snapcam: and this resident's own camera
+        const k = this._faceNorm(resident), all = Object.assign({}, this._facesCamStore().by);
+        all[k] = entity;
+        (this._jhSnapTouched = this._jhSnapTouched || new Set()).add(k);
+        this._jhPrefSet("jarvis_faces_snap_cams", all);
+      }
+    } catch (_) { /* a convenience; safe to ignore */ }
+  }
+
+  // Lazily pull an enrolled reference photo (served inline over the
+  // authenticated websocket — it is NOT a public /local URL) and show it as the
+  // card thumbnail. Cached per name for the panel's lifetime (#394).
+  async _loadFaceReference(name, img) {
+    if (!name || !img || !this._hass) return;
+    this._faceRefs = this._faceRefs || {};
+    const key = String(name);
+    const cached = this._faceRefs[key];
+    const show = (dataUrl) => {
+      if (!dataUrl || !img.isConnected) return;
+      img.src = dataUrl;
+      img.style.display = "";
+      const ph = img.parentElement?.querySelector(".faces-thumb-ph");
+      if (ph) ph.style.display = "none";
+    };
+    if (cached === null) return;            // known-empty, don't refetch
+    if (typeof cached === "string") { show(cached); return; }
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/face_reference", name: key });
+      if (res?.image) {
+        this._faceRefs[key] = res.image;
+        show(res.image);
+      } else {
+        this._faceRefs[key] = null;
+      }
+    } catch (_) {
+      this._faceRefs[key] = null;            // leave the placeholder
+    }
+  }
+
+  async _loadFaceSnap(cameraEntity, img) {
+    if (!cameraEntity || !img || !this._hass) return;
+    this._faceSnaps = this._faceSnaps || {};
+    const cached = this._faceSnaps[cameraEntity];
+    const show = (dataUrl) => {
+      if (!dataUrl || !img.isConnected) return;
+      img.src = dataUrl;
+      img.style.display = "";
+      const ph = img.parentElement?.querySelector(".faces-thumb-ph");
+      if (ph) ph.style.display = "none";
+    };
+    if (cached === null) return;            // known-empty, don't refetch
+    if (typeof cached === "string") { show(cached); return; }
+    try {
+      const res = await this._hass.callWS({ type: "jarvis/camera_snapshot", entity_id: cameraEntity });
+      if (res?.image) {
+        const url = `data:image/jpeg;base64,${res.image}`;
+        this._faceSnaps[cameraEntity] = url;
+        show(url);
+      } else {
+        this._faceSnaps[cameraEntity] = null;
+      }
+    } catch (_) {
+      this._faceSnaps[cameraEntity] = null;  // leave the placeholder
+    }
+  }
+
+  _facesAge(secs) {
+    const s = Number(secs);
+    if (!isFinite(s) || s < 0 || s >= 1e8) return "";
+    if (s < 60) return `${Math.round(s)}s ago`;
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    return `${Math.round(s / 3600)}h ago`;
+  }
+
+  async _fetchMode() {
+    if (!this._hass) return;
+    try {
+      this._mode = await this._hass.callWS({ type: "jarvis/mode", action: "status" });
+    } catch (_) {
+      this._mode = { error: true };
+    }
+    this._renderMode();
+  }
+
+  _renderMode() {
+    const grid = this.shadowRoot?.getElementById("mode-grid");
+    const activeEl = this.shadowRoot?.getElementById("mode-active");
+    const descEl = this.shadowRoot?.getElementById("mode-desc");
+    if (!grid) return;
+    const m = this._mode || {};
+    if (m.error) {
+      grid.innerHTML = `<div class="mmwave-empty">Couldn't load modes — restart Home Assistant after updating.</div>`;
+      if (activeEl) activeEl.textContent = "—";
+      return;
+    }
+    const active = m.active || "normal";
+    if (activeEl) activeEl.innerHTML = `<span class="mode-active-tag">${this._esc(active.toUpperCase())}</span>`;
+    if (descEl && m.description) descEl.textContent = m.description;
+    const avail = m.available || [];
+    grid.innerHTML = avail.map(mo =>
+      `<button class="mode-chip ${mo.name === active ? "mode-chip-on" : ""}" data-mode="${this._esc(mo.name)}" title="${this._esc(mo.description || "")}">${this._esc(mo.name)}</button>`
+    ).join("");
+    grid.querySelectorAll(".mode-chip").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const mode = btn.dataset.mode;
+        if (!this._hass || mode === active) return;
+        grid.querySelectorAll(".mode-chip").forEach(b => b.disabled = true);
+        try {
+          await this._hass.callWS({ type: "jarvis/mode", action: "set", mode });
+          this._toast(`✓ ${mode} mode`, "ok");
+          await this._fetchMode();
+        } catch (err) {
+          this._toast(`✗ ${err?.message || err}`, "err");
+          grid.querySelectorAll(".mode-chip").forEach(b => b.disabled = false);
+        }
+      });
+    });
+  }
+
+  _wireMode() {
+    this._fetchMode();
+  }
+
+  // ── System Diagnostics — core service health (v7.94.0) ──
+  async _fetchDiagnostics() {
+    if (!this._hass) return;
+    try {
+      this._diag = await this._hass.callWS({ type: "jarvis/diagnostics" });
+    } catch (_) {
+      this._diag = { error: true };
+    }
+    try {
+      this._calib = await this._hass.callWS({ type: "jarvis/get_calibration" });
+    } catch (_) {
+      this._calib = null;
+    }
+    this._renderDiagnostics();
+  }
+
+  _renderDiagnostics() {
+    const body = this.shadowRoot?.getElementById("diag-body");
+    const overallEl = this.shadowRoot?.getElementById("diag-overall");
+    if (!body) return;
+    const d = this._diag || {};
+    if (d.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't run diagnostics — restart Home Assistant after updating.</div>`;
+      if (overallEl) overallEl.textContent = "—";
+      return;
+    }
+    const cls = (st) => ({ ok: "diag-ok", warn: "diag-warn", idle: "diag-idle", down: "diag-down", off: "diag-off" }[st] || "diag-off");
+    const label = (st) => ({ ok: "OK", warn: "WARN", idle: "IDLE", down: "DOWN", off: "OFF" }[st] || "?");
+    const dot = (st) => `<span class="diag-dot ${cls(st)}">◉</span><span class="diag-st ${cls(st)}">${label(st)}</span>`;
+    if (overallEl) {
+      const ov = d.overall || "off";
+      overallEl.innerHTML = `<span class="${cls(ov)}">${this._esc((d.summary || ov).toUpperCase())}</span>`;
+    }
+    const svcs = d.services || [];
+    body.innerHTML = `<div class="diag-list">` + svcs.map(s =>
+      `<div class="diag-row">
+         <div class="diag-row-head"><span class="diag-name">${this._esc(s.name)}</span>${dot(s.status)}</div>
+         <div class="diag-detail">${this._esc(s.detail || "")}</div>
+       </div>`
+    ).join("") + `</div>` + this._renderCalibration();
+  }
+
+  _renderCalibration() {
+    const c = this._calib || {};
+    const cal = c.calibration || {};
+    const ib = c.interruption_budget || {};
+    const top = `margin-top:14px;padding-top:12px;border-top:1px solid rgba(120,160,220,0.15)`;
+    if (!cal.n) {
+      return `<div style="${top}">
+        <div style="font-weight:600;margin-bottom:6px">Judgment calibration</div>
+        <div class="diag-detail">No judged decisions yet — this appears once JARVIS's decisions accrue outcomes.</div></div>`;
+    }
+    const pct = (v) => v == null ? "—" : Math.round(v * 100) + "%";
+    const bars = (cal.bins || []).filter(b => b.count > 0).map(b => {
+      const w = Math.round((b.good_rate ?? 0) * 100);
+      return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:12px">
+        <span style="width:74px;color:#9fb3d0">${pct(b.lo)}–${pct(b.hi)}</span>
+        <span style="flex:1;height:8px;background:rgba(120,160,220,0.15);border-radius:4px;overflow:hidden">
+          <span style="display:block;height:100%;width:${w}%;background:#5aa0ff"></span></span>
+        <span style="width:104px;text-align:right;color:#c8d6ea">${pct(b.good_rate)} good · n=${this._esc(b.count)}</span>
+      </div>`;
+    }).join("");
+    const budgetLine = ib.judged
+      ? `Interruption budget: <b>${this._esc(ib.assessment || "")}</b> — ${pct(ib.unwelcome_rate)} of ${this._esc(ib.judged)} recent decisions dismissed (cap ×${this._esc(ib.multiplier ?? 1)}).`
+      : `Interruption budget: no recent judged decisions.`;
+    const st = c.suggestion_threshold;
+    let suggestLine = "";
+    if (st && Math.abs(st.learned_delta || 0) > 0.001) {
+      const dir = st.learned_delta > 0 ? "raised" : "lowered";
+      suggestLine = `<div class="diag-detail" style="margin-top:4px">Suggestion bar ${dir} to ${pct(st.effective)} (from ${pct(st.base)}) based on recent usefulness.</div>`;
+    }
+    return `<div style="${top}">
+      <div style="font-weight:600;margin-bottom:6px">Judgment calibration
+        <span style="font-weight:400;color:#8496b0;font-size:11px">Brier ${this._esc(cal.brier ?? "—")} · ECE ${this._esc(cal.ece ?? "—")} · n=${this._esc(cal.n)}</span></div>
+      ${bars}
+      <div class="diag-detail" style="margin-top:8px">${budgetLine}</div>
+      ${suggestLine}
+    </div>`;
+  }
+
+  _wireDiagnostics() {
+    this._fetchDiagnostics();
+    const btn = this.shadowRoot?.getElementById("diag-refresh");
+    btn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "⟳ CHECKING…";
+      try { await this._fetchDiagnostics(); }
+      finally { btn.disabled = false; btn.textContent = orig; }
+    });
+
+    // Download the full diagnostics dump straight from the panel. This goes over
+    // the authenticated websocket and builds the file in the browser, so it never
+    // depends on HA's own "Download diagnostics" endpoint (which can choke on a
+    // value its JSON serializer rejects). The backend payload is already
+    // credential-redacted and JSON-safe. (v9.78.0)
+    const dl = this.shadowRoot?.getElementById("diag-download");
+    dl?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      dl.disabled = true;
+      const orig = dl.textContent;
+      dl.textContent = "⬇ BUILDING…";
+      try {
+        const data = await this._hass.callWS({ type: "jarvis/download_diagnostics" });
+        const text = JSON.stringify(data, null, 2);
+        const blob = new Blob([text], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+        a.href = url;
+        a.download = `jarvis-diagnostics-${stamp}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        this._toast("✓ Diagnostics downloaded", "ok");
+      } catch (err) {
+        this._toast(`✗ Diagnostics download failed — ${err?.message || err}`, "err");
+      } finally {
+        dl.disabled = false; dl.textContent = orig;
+      }
+    });
+  }
+
+  // ── Multi-Hazard Monitor — v7.94.0 ──
+  // ── Scheduled briefings — v7.94.0 ──
+  _wireBriefings() {
+    const btn = this.shadowRoot?.getElementById("brief-now");
+    btn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      // Silent-until-configured: a briefing with no announcement speakers set
+      // won't play, so tell the user where to set them instead of firing quietly.
+      const cfg = this._liveData?.config || {};
+      const spk = cfg.announcement_speakers;
+      const hasTargets = (Array.isArray(spk) && spk.length > 0) || !!cfg.broadcast_group;
+      if (!hasTargets) {
+        this._toast("No announcement speakers set \u2014 choose them in Settings \u2192 Announcement Speakers", "err");
+        return;
+      }
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "\u25b6 BRIEFING\u2026";
+      try {
+        await this._hass.callService("jarvis", "briefing", { announce: true });
+        this._toast("\u2713 briefing requested", "ok");
+      } catch (err) {
+        this._toast(`\u2717 ${err?.message || err}`, "err");
+      } finally {
+        btn.disabled = false; btn.textContent = orig;
+      }
+    });
+  }
+
+  async _wireHazard() {
+    const loc = this.shadowRoot?.getElementById("haz-loc");
+    const overall = this.shadowRoot?.getElementById("hazard-overall");
+    try {
+      const st = await this._hass?.callWS({ type: "jarvis/hazard", action: "status" });
+      if (st) {
+        if (overall) overall.textContent = st.enabled ? "ON" : "OFF";
+        if (loc) {
+          if (st.center) {
+            loc.textContent = st.using_override
+              ? `Location: override ${st.center[0]}, ${st.center[1]}.`
+              : `Location: home ${st.center[0]}, ${st.center[1]}.`;
+          } else {
+            loc.textContent = "Location: no home coordinates set in Home Assistant.";
+          }
+        }
+      }
+    } catch (_) {}
+
+    const btn = this.shadowRoot?.getElementById("haz-scan");
+    const body = this.shadowRoot?.getElementById("haz-body");
+    btn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "⟳ SCANNING…";
+      if (body) body.innerHTML = `<div class="mmwave-empty">Checking USGS, NWS, and NASA EONET…</div>`;
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/hazard", action: "scan" });
+        if (body) body.innerHTML = this._renderHazardScan(res);
+      } catch (err) {
+        if (body) body.innerHTML = `<div class="mmwave-empty">Scan failed: ${this._esc(err?.message || String(err))}</div>`;
+      } finally {
+        btn.disabled = false; btn.textContent = orig;
+      }
+    });
+  }
+
+  _renderHazardScan(res) {
+    if (!res || res.ok === false) {
+      return `<div class="mmwave-empty">${this._esc(res?.error || "No location configured.")}</div>`;
+    }
+    const q = res.earthquakes || [], w = res.weather || [], d = res.disasters || [];
+    if (!q.length && !w.length && !d.length) {
+      return `<div class="haz-clear">✓ All clear near ${this._esc(res.center ? res.center[0] + ", " + res.center[1] : "home")} — no active earthquakes, severe weather, or disasters.</div>`;
+    }
+    let html = "";
+    for (const e of q) {
+      const mag = (typeof e.mag === "number") ? `M${e.mag.toFixed(1)}` : "M?";
+      html += `<div class="haz-item"><span class="haz-badge haz-quake">${mag}</span> ${this._esc(e.place)} — ${this._esc(e.dist_km)} km away</div>`;
+    }
+    for (const e of w) {
+      html += `<div class="haz-item"><span class="haz-badge haz-wx">${this._esc(e.severity)}</span> ${this._esc(e.event)}${e.area ? " — " + this._esc(e.area) : ""}</div>`;
+    }
+    for (const e of d) {
+      html += `<div class="haz-item"><span class="haz-badge haz-dis">${this._esc(e.category)}</span> ${this._esc(e.title)} — ${this._esc(e.dist_km)} km away</div>`;
+    }
+    return html;
+  }
+
+  // ── Document Library (RAG) — v7.94.0 ──
+  async _fetchDocLibrary() {
+    if (!this._hass) return;
+    try {
+      this._docLib = await this._hass.callWS({ type: "jarvis/documents", action: "status" });
+    } catch (_) {
+      this._docLib = { error: true };
+    }
+    this._renderDocLibrary();
+  }
+
+  _renderDocLibrary() {
+    const body = this.shadowRoot?.getElementById("doclib-body");
+    const statusEl = this.shadowRoot?.getElementById("doclib-status");
+    if (!body) return;
+    const d = this._docLib || {};
+    if (d.error) {
+      body.innerHTML = `<div class="mmwave-empty">Couldn't reach the library — restart Home Assistant after updating, then reopen.</div>`;
+      if (statusEl) statusEl.textContent = "—";
+      return;
+    }
+    const backend = d.chroma ? "VECTOR" : d.fts ? "KEYWORD" : "NONE";
+    if (statusEl) statusEl.textContent = `${backend} · ${d.chunk_count || 0} chunks`;
+    const sources = d.sources || [];
+    if (!sources.length) {
+      body.innerHTML = `<div class="mmwave-empty">No documents ingested yet. Add PDF/.txt/.md files to <code>/config/jarvis/documents</code> and press Ingest.${d.chroma ? "" : " (Vector search needs ChromaDB; keyword fallback is active.)"}</div>`;
+      return;
+    }
+    body.innerHTML = `<div class="doclib-list">` + sources.map(s =>
+      `<div class="doclib-row"><span class="doclib-name">${this._esc(s.source)}</span><span class="doclib-row-r"><span class="doclib-chunks">${this._esc(s.chunks)} chunks</span><button class="doclib-del" data-src="${this._esc(s.source)}" title="Remove document">✕</button></span></div>`
+    ).join("") + `</div>`;
+    // wire delete buttons
+    body.querySelectorAll(".doclib-del").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const src = btn.getAttribute("data-src");
+        if (!src || !this._hass) return;
+        if (!window.confirm(`Remove "${src}" from the library? This deletes the file and its indexed chunks.`)) return;
+        try {
+          await this._hass.callWS({ type: "jarvis/documents", action: "delete", filename: src });
+          this._toast(`✓ removed ${src}`, "ok");
+          await this._fetchDocLibrary();
+        } catch (err) {
+          this._toast(`✗ delete — ${err?.message || err}`, "err");
+        }
+      });
+    });
+  }
+
+  _renderDocSearch(hits) {
+    const body = this.shadowRoot?.getElementById("doclib-body");
+    if (!body) return;
+    if (!hits || !hits.length) {
+      body.innerHTML = `<div class="mmwave-empty">No matches. Try different words, or ingest more documents.</div>`;
+      return;
+    }
+    body.innerHTML = `<div class="doclib-list">` + hits.map(h => {
+      const score = (h.score != null) ? ` · ${Math.round(h.score * 100)}%` : "";
+      const excerpt = (h.text || "").slice(0, 220);
+      return `<div class="doclib-hit"><div class="doclib-hit-src">${this._esc(h.source || "?")}${score}</div><div class="doclib-hit-txt">${this._esc(excerpt)}${h.text && h.text.length > 220 ? "…" : ""}</div></div>`;
+    }).join("") + `</div>`;
+  }
+
+  _wireDocLibrary() {
+    this._fetchDocLibrary();
+    this._fetchVectorBackend();
+    this._wireVectorBackend();
+    const ingestBtn = this.shadowRoot?.getElementById("doclib-ingest");
+    ingestBtn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      ingestBtn.disabled = true;
+      const orig = ingestBtn.textContent;
+      ingestBtn.textContent = "⟳ INGESTING…";
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/documents", action: "ingest" });
+        this._toast(`✓ ingested ${res.files_ingested || 0} file(s), ${res.total_chunks || 0} chunks`, "ok");
+        await this._fetchDocLibrary();
+      } catch (err) {
+        this._toast(`✗ ingest — ${err?.message || err}`, "err");
+      } finally {
+        ingestBtn.disabled = false;
+        ingestBtn.textContent = orig;
+      }
+    });
+    const q = this.shadowRoot?.getElementById("doclib-q");
+    q?.addEventListener("keydown", async (ev) => {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      const query = q.value.trim();
+      if (!query || !this._hass) { this._fetchDocLibrary(); return; }
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/documents", action: "search", query });
+        this._renderDocSearch(res?.results || []);
+      } catch (err) {
+        this._toast(`✗ search — ${err?.message || err}`, "err");
+      }
+    });
+
+    // ── upload (file → base64 → WS) ──
+    const upBtn = this.shadowRoot?.getElementById("doclib-upload-btn");
+    const fileInput = this.shadowRoot?.getElementById("doclib-file");
+    upBtn?.addEventListener("click", () => fileInput?.click());
+    fileInput?.addEventListener("change", async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file || !this._hass) return;
+      if (file.size > 25 * 1024 * 1024) {
+        this._toast("✗ file exceeds 25MB", "err");
+        fileInput.value = ""; return;
+      }
+      upBtn.disabled = true;
+      const orig = upBtn.textContent;
+      upBtn.textContent = "⬆ UPLOADING…";
+      try {
+        const b64 = await new Promise((resolve, reject) => {
+          const r = new FileReader();
+          r.onload = () => resolve(String(r.result).split(",")[1] || "");
+          r.onerror = () => reject(new Error("read failed"));
+          r.readAsDataURL(file);
+        });
+        const res = await this._hass.callWS({ type: "jarvis/documents", action: "upload", filename: file.name, content: b64 });
+        if (res.ok) {
+          this._toast(`✓ uploaded ${res.filename} — ${res.chunks || 0} chunks${res.embedded ? `, ${res.embedded} embedded` : ""}`, "ok");
+          await this._fetchDocLibrary();
+        } else {
+          this._toast(`✗ upload — ${res.error || "failed"}`, "err");
+        }
+      } catch (err) {
+        this._toast(`✗ upload — ${err?.message || err}`, "err");
+      } finally {
+        upBtn.disabled = false;
+        upBtn.textContent = orig;
+        fileInput.value = "";
+      }
+    });
+
+    // ── watch folders (config field + scan button) ──
+    const watchField = this.shadowRoot?.getElementById("doclib-watch");
+    if (watchField && this._hass) {
+      // prefill from config
+      this._hass.callWS({ type: "jarvis/get_panel_data" }).then(pd => {
+        const wf = pd?.config?.document_watch_folders;
+        if (wf && !watchField.value) watchField.value = Array.isArray(wf) ? wf.join("\n") : wf;
+      }).catch(() => {});
+      const saveWatch = async () => {
+        try {
+          await this._hass.callWS({ type: "jarvis/update_config", key: "document_watch_folders", value: watchField.value.trim() });
+        } catch (_) {}
+      };
+      watchField.addEventListener("blur", saveWatch);
+    }
+    const scanBtn = this.shadowRoot?.getElementById("doclib-scan");
+    scanBtn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      // persist the field first so the scan sees current folders
+      if (watchField) {
+        try { await this._hass.callWS({ type: "jarvis/update_config", key: "document_watch_folders", value: watchField.value.trim() }); } catch (_) {}
+      }
+      scanBtn.disabled = true;
+      const orig = scanBtn.textContent;
+      scanBtn.textContent = "⟳ SCANNING…";
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/documents", action: "scan_watch" });
+        if (res.watched === 0) {
+          this._toast("no watch folders configured", "err");
+        } else {
+          this._toast(`✓ scanned ${res.watched} folder(s) — ${res.new_files || 0} new document(s)`, "ok");
+          await this._fetchDocLibrary();
+        }
+      } catch (err) {
+        this._toast(`✗ scan — ${err?.message || err}`, "err");
+      } finally {
+        scanBtn.disabled = false;
+        scanBtn.textContent = orig;
+      }
+    });
+  }
+
+  // ── Optional ChromaDB vector backend — v7.94.0 ──
+  async _fetchVectorBackend() {
+    if (!this._hass) return;
+    try {
+      this._vecbk = await this._hass.callWS({ type: "jarvis/semantic_search", action: "status" });
+    } catch (_) {
+      this._vecbk = { error: true };
+    }
+    this._renderVectorBackend();
+  }
+
+  _renderVectorBackend() {
+    const stateEl = this.shadowRoot?.getElementById("vecbk-state");
+    const hintEl = this.shadowRoot?.getElementById("vecbk-hint");
+    const btn = this.shadowRoot?.getElementById("vecbk-toggle");
+    if (!stateEl) return;
+    const v = this._vecbk || {};
+    if (v.error) { stateEl.textContent = "—"; if (btn) btn.style.display = "none"; return; }
+
+    if (v.enabled) {
+      stateEl.innerHTML = `<span class="vecbk-on">◉ SEMANTIC (Ollama)</span>`;
+      if (hintEl) hintEl.textContent =
+        `Meaning-based matching via Ollama ${v.model || "nomic-embed-text"}${v.vector_count ? ` · ${v.vector_count} vectors` : " · re-ingest to embed your documents"}.`;
+      if (btn) { btn.style.display = ""; btn.textContent = "✕ DISABLE SEMANTIC SEARCH"; btn.dataset.mode = "disable"; }
+    } else if (!v.ollama_configured) {
+      stateEl.innerHTML = `<span class="vecbk-off">KEYWORD (FTS)</span>`;
+      if (hintEl) hintEl.textContent =
+        "Works everywhere with no setup. Semantic search needs an Ollama host — set the LLM base URL (llm_base_url) to your Ollama server and pull an embed model (ollama pull nomic-embed-text).";
+      if (btn) btn.style.display = "none";
+    } else {
+      stateEl.innerHTML = `<span class="vecbk-off">KEYWORD (FTS)</span>`;
+      if (hintEl) hintEl.textContent =
+        `Enable semantic search to match on meaning, using your Ollama server (${v.model || "nomic-embed-text"}). No install, no ChromaDB — embeddings run on Ollama. Re-ingest afterward to embed existing docs.`;
+      if (btn) { btn.style.display = ""; btn.textContent = "⬆ ENABLE SEMANTIC SEARCH"; btn.dataset.mode = "enable"; }
+    }
+  }
+
+  _wireVectorBackend() {
+    const btn = this.shadowRoot?.getElementById("vecbk-toggle");
+    btn?.addEventListener("click", async () => {
+      if (!this._hass) return;
+      const mode = btn.dataset.mode || "enable";
+      if (mode === "disable") {
+        try {
+          await this._hass.callWS({ type: "jarvis/semantic_search", action: "disable" });
+          this._toast("✓ semantic search disabled — keyword active", "ok");
+          await this._fetchVectorBackend();
+        } catch (err) { this._toast(`✗ ${err?.message || err}`, "err"); }
+        return;
+      }
+      btn.disabled = true;
+      const orig = btn.textContent;
+      btn.textContent = "⬆ CHECKING OLLAMA…";
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/semantic_search", action: "enable" });
+        if (res.ok) {
+          this._toast(`✓ semantic search on (Ollama ${res.model}, ${res.dim}-dim) — re-ingest to embed docs`, "ok");
+        } else {
+          this._toast(`⚠ enabled, but Ollama isn't ready: ${res.error || "unreachable"}`, "err");
+        }
+        await this._fetchVectorBackend();
+        this._fetchDocLibrary();
+      } catch (err) {
+        this._toast(`✗ ${err?.message || err}`, "err");
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === "⬆ CHECKING OLLAMA…") btn.textContent = orig;
+      }
+    });
+  }
+
+  _rerenderCameraSettings() {
+    const host = this.shadowRoot?.querySelector("#camset-body");
+    if (!host) return;
+    host.innerHTML = this._renderCameraSettings(this._data());
+    this._wireCameraSettings();
+  }
+
+  _wireCameraSettings() {
+    // Camera on/off toggles — choose which cameras JARVIS uses (v7.94.0).
+    const applyDisabled = async (next, msg) => {
+      try {
+        await this._hass.callWS({ type: "jarvis/update_config", key: "disabled_cameras", value: JSON.stringify(next) });
+        if (this._liveData && this._liveData.config) {
+          this._liveData.config.disabled_cameras = next;
+          const off = new Set(next);
+          (this._liveData.config.cameras || []).forEach(c => { c.enabled = !off.has(c.entity_id); });
+        }
+        this._rerenderCameraSettings();
+        this._toast(msg, "ok");
+      } catch (err) { this._toast("\u2717 " + (err?.message || err), "err"); }
+    };
+    const curDisabled = () => {
+      const v = (this._data().config || {}).disabled_cameras;
+      return Array.isArray(v) ? v.slice() : [];
+    };
+    this.shadowRoot.querySelectorAll(".cam-enable-toggle[data-cam]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const cam = btn.getAttribute("data-cam"), cur = curDisabled(), isOff = cur.includes(cam);
+        applyDisabled(isOff ? cur.filter(c => c !== cam) : [...cur, cam], isOff ? "Camera enabled" : "Camera disabled");
+      });
+    });
+    const enAll = this.shadowRoot.querySelector("#cam-enable-all");
+    if (enAll) enAll.addEventListener("click", () => applyDisabled([], "All cameras enabled"));
+    const disAll = this.shadowRoot.querySelector("#cam-disable-all");
+    if (disAll) disAll.addEventListener("click", () =>
+      applyDisabled(((this._data().config || {}).cameras || []).map(c => c.entity_id), "All cameras disabled"));
+
+    // Name inputs: save on Enter or blur, only when changed. The settings
+    // tab skips poll re-renders, so typing is never wiped mid-edit.
+    this.shadowRoot.querySelectorAll(".camset-name").forEach(input => {
+      input.dataset.saved = input.value;
+      const save = async () => {
+        const entity = input.getAttribute("data-cam");
+        const name = input.value;
+        if (name === input.dataset.saved) return;      // unchanged — no call
+        try {
+          const res = await this._hass.callWS({
+            type: "jarvis/rename_camera", entity_id: entity, name,
+          });
+          input.dataset.saved = name;
+          if (this._liveData?.config) {
+            this._liveData.config.camera_names = res?.camera_names || {};
+            if (Array.isArray(res?.cameras)) {
+              this._liveData.config.cameras = res.cameras;
+              this._cams = res.cameras;
+            }
+          }
+          this._toast(`✓ ${name.trim() ? `renamed to "${name.trim()}"` : "name reverted"}`, "ok");
+        } catch (err) {
+          this._toast(`✗ rename — ${err?.message || err}`, "err");
+        }
+      };
+      input.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); input.blur(); }
+      });
+      input.addEventListener("blur", save);
+    });
+
+    // Location chips: instant save, row-local refresh.
+    this.shadowRoot.querySelectorAll(".camset-row .cam-loc-chip").forEach(chipEl => {
+      chipEl.addEventListener("click", async () => {
+        const entity = chipEl.getAttribute("data-cam");
+        const m = chipEl.getAttribute("data-loc");
+        chipEl.disabled = true;
+        try {
+          const res = await this._hass.callWS({
+            type: "jarvis/camera_location", entity_id: entity, mode: m,
+          });
+          if (Array.isArray(res?.cameras) && this._liveData?.config) {
+            this._liveData.config.cameras = res.cameras;
+            this._cams = res.cameras;
+          }
+          const fresh = (this._cams || []).find(c => c.entity_id === entity);
+          const resolved = fresh && fresh.outdoor ? "outdoor" : "indoor";
+          // entity_ids are [a-z0-9._] — safe raw inside a quoted attribute
+          // selector; CSS.escape isn't guaranteed in every embedding.
+          const row = this.shadowRoot.querySelector(`.camset-row[data-cam="${entity}"]`);
+          row?.querySelectorAll(".cam-loc-chip").forEach(c => {
+            c.classList.toggle("active", c.getAttribute("data-loc") === m);
+            if (c.getAttribute("data-loc") === "auto") c.textContent = `AUTO (${resolved})`;
+            c.disabled = false;
+          });
+          this._toast(`✓ ${this._camName(entity)} → ${m === "auto" ? `auto (${resolved})` : m}`, "ok");
+        } catch (err) {
+          this._toast(`✗ location — ${err?.message || err}`, "err");
+          chipEl.disabled = false;
+        }
+      });
+    });
+  }
+
+  async _runCamDiagnostics() {
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const btn = this.shadowRoot?.getElementById("cam-diag-btn");
+    if (!feed || !this._hass) return;
+    const existing = feed.querySelector(".cam-diag");
+    if (existing) { existing.remove(); return; }   // toggle off
+    const box = document.createElement("div");
+    box.className = "cam-diag";
+    box.innerHTML = `<div class="cam-diag-line">PROBING ${this._esc(this._activeCam || "—")} … may take up to ~30s (stream wake)</div>`;
+    feed.appendChild(box);
+    if (btn) btn.disabled = true;
+    try {
+      const res = await this._hass.callWS({
+        type: "jarvis/camera_diagnostics", entity_id: this._activeCam || undefined,
+      });
+      const esc = (s) => this._esc(String(s == null ? "" : s));
+      // What the TILE itself is showing right now — the client half of the story.
+      const tileImg = feed.querySelector("img");
+      let tileLine = `<b>TILE</b> mode=${esc(this._camMode)}`;
+      if (tileImg && tileImg.naturalWidth > 0) {
+        const luma = this._frameLuma(tileImg);
+        tileLine += `  decoded ${tileImg.naturalWidth}×${tileImg.naturalHeight}`;
+        if (luma !== null) {
+          tileLine += luma <= 10 && this._camLook(tileImg) === "dark"
+            ? `  <span class="cam-diag-bad" style="color:#ffd166">lum ${luma.toFixed(1)} — very dark picture (too little light to see)</span>`
+            : luma <= 10
+            ? `  <span class="cam-diag-bad">lum ${luma.toFixed(1)} — BLACK STREAM (decodes fine, shows nothing)</span>`
+            : `  <span class="cam-diag-ok">lum ${luma.toFixed(1)}</span>`;
+        }
+      } else {
+        tileLine += `  <span class="cam-diag-bad">no decoded pixels</span>`;
+      }
+      const plats = Object.entries(res?.platforms || {})
+        .map(([p, n]) => `${esc(p)}×${esc(n)}`).join("  ") || "none";   // jh-r19-xss
+      const lines = [];
+      lines.push(`<div class="cam-diag-line">${tileLine}</div>`);
+      lines.push(`<div class="cam-diag-line"><b>HA CAMERAS</b> ${plats}${plats === "none" ? "  <span class='cam-diag-bad'>— Home Assistant has no camera entities: add a camera integration first; JARVIS can only use the cameras Home Assistant has.</span>" : ""}</div>`);
+      const p = res?.probe;
+      if (p) {
+        lines.push(`<div class="cam-diag-line"><b>${esc(p.entity_id)}</b>  state=${esc(p.state)}  platform=${esc(p.platform || "?")}${p.attrs?.frontend_stream_type ? "  stream=" + esc(p.attrs.frontend_stream_type) : ""}</div>`);
+        (p.tiers || []).forEach(([tier, detail]) => {
+          const ok = /^OK/.test(String(detail));
+          lines.push(`<div class="cam-diag-line">  ${esc(tier)}: <span class="${ok ? "cam-diag-ok" : "cam-diag-bad"}">${esc(detail)}</span></div>`);
+        });
+        lines.push(`<div class="cam-diag-line cam-diag-verdict">${esc(p.verdict || "")}${esc(p.elapsed_ms != null ? `  (${p.elapsed_ms}ms)` : "")}</div>`);
+      }
+      lines.push(`<div class="cam-diag-line cam-diag-hint">tap DIAG again to close · verdict also logged to the Logs tab</div>`);
+      box.innerHTML = lines.join("");
+    } catch (err) {
+      box.innerHTML = `<div class="cam-diag-line cam-diag-bad">DIAG failed — ${this._esc(String(err?.message || err))}. If this says unknown command, restart Home Assistant after updating.</div>`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  _frameLuma(img) {
+    // Mean luminance of the img's CURRENT frame via a small canvas, or null
+    // if it can't be sampled (no pixels yet, no 2d context in the harness,
+    // tainted canvas). Same-origin proxy URLs and data: URLs sample fine.
+    try {
+      if (!img || !img.naturalWidth) return null;
+      const c = document.createElement("canvas");
+      c.width = 32; c.height = 32;
+      const ctx = c.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, 32, 32);
+      const d = ctx.getImageData(0, 0, 32, 32).data;
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+      return sum / (d.length / 4);
+    } catch (_) { return null; }
+  }
+
+  // jh-rtc (step 155): Camera Watch plays a camera over WebRTC when Home Assistant itself offers WebRTC for it (the camera's own
+  // capabilities list "web_rtc", for example through Home Assistant's go2rtc integration or a camera that streams from go2rtc):
+  // near real time instead of the MJPEG proxy. Signalling goes over Home Assistant's own websocket (so also over the remote
+  // https address); the ICE servers are Home Assistant's own client config. The MJPEG picture stays until the first WebRTC frame
+  // plays, and comes back when WebRTC fails (no answer or no picture within 8 s, an error, or the connection drops); a camera
+  // whose WebRTC failed is not tried again during this visit. Nothing is hard-coded: no address, no camera, no stream name.
+  _jhRtcStop(reattach) {   // jh-r16-rtc: reattach = the picture dropped while it played, so the MJPEG picture comes back at once
+    const r = this._jhRtc;
+    this._jhRtc = null;
+    if (!r) return;
+    clearTimeout(r.timer);
+    clearInterval(r.stall);
+    try { if (r.unsub) r.unsub(); } catch (e) {}
+    try { if (r.pc) r.pc.close(); } catch (e) {}
+    try { if (r.mo) r.mo.disconnect(); } catch (e) {}
+    try { if (r.video) r.video.remove(); } catch (e) {}
+    const img = this.shadowRoot && this.shadowRoot.querySelector("#cam-feed > img");
+    if (img) img.style.display = "";
+    const was = this._camMode === "webrtc";
+    if (was) { this._camMode = "stream"; this._lastCamKey = ""; }   // the MJPEG picture comes back next pass
+    if (was && reattach && this.isConnected && this._currentTab === "dashboard") {   // jh-r16-rtc: now, not at the next full render
+      try { this._renderCameraFeed(); } catch (e) {}
+    }
+  }
+
+  _jhRtcStallWatch(r) {   // jh-r16-rtc: a WebRTC picture that stops moving for 8 s is a drop (the MJPEG picture comes back)
+    let last = -1, since = Date.now();
+    return setInterval(() => {
+      if (this._jhRtc !== r || !r.video) return;
+      const t = r.video.currentTime;
+      if (t !== last || document.hidden) { last = t; since = Date.now(); return; }
+      if (Date.now() - since >= 8000 && typeof r.fail === "function") r.fail();
+    }, 2000);
+  }
+
+  _jhRtcShow(img) {   // WebRTC plays: the MJPEG stream stops (no double download) and the strip says WEBRTC
+    const r = this._jhRtc;
+    this._camMode = "webrtc";
+    if (this._camWatchdog) { clearTimeout(this._camWatchdog); this._camWatchdog = null; }
+    // jh-r16-rtc (review round 16): while WebRTC plays the MJPEG chain stops completely (no still or snapshot downloads next to
+    // the video, no retry) and its leftover "NO FRAME" / dark-room notes are taken off the live picture
+    if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
+    if (this._camWsTimer) { clearInterval(this._camWsTimer); this._camWsTimer = null; }
+    if (this._camRetryTimer) { clearTimeout(this._camRetryTimer); this._camRetryTimer = null; }
+    if (this._camDarkTimer) { clearInterval(this._camDarkTimer); this._camDarkTimer = null; }
+    const _jhFeed = this.shadowRoot && this.shadowRoot.getElementById("cam-feed");
+    if (_jhFeed) _jhFeed.querySelectorAll(".cam-none, .cam-dark").forEach((n) => n.remove());
+    if (r && !r.stall) r.stall = this._jhRtcStallWatch(r);
+    if (r && r.video) r.video.style.display = "block";
+    if (img) { img.style.display = "none"; img.removeAttribute("src"); }
+    const strip = this.shadowRoot && this.shadowRoot.getElementById("cam-strip");
+    const tag = strip && strip.children[1];
+    if (tag) tag.textContent = "WEBRTC";
+  }
+
+  async _jhRtcTry(entity, src, img) {
+    if (typeof RTCPeerConnection === "undefined" || !this._hass || !this._hass.connection
+        || typeof this._hass.connection.subscribeMessage !== "function") return;
+    const key = entity + "|" + src;
+    const feed = this.shadowRoot && this.shadowRoot.getElementById("cam-feed");
+    if (this._jhRtc && this._jhRtc.key === key) {   // a new stream token or a re-render: the running session is kept
+      const r = this._jhRtc;
+      if (r.video && feed && !r.video.isConnected) feed.prepend(r.video);
+      if (r.video && img && r.moImg !== img) {   // jh-r21-rtczoom (step 163): the zoom follows the new picture element
+        try { if (r.mo) r.mo.disconnect(); } catch (e) {}
+        r.mo = new MutationObserver(() => { r.video.style.transform = img.style.transform || ""; });
+        r.mo.observe(img, { attributes: true, attributeFilter: ["style"] });
+        r.moImg = img;
+        r.video.style.transform = img.style.transform || "";
+      }
+      if (r.playing) this._jhRtcShow(img);
+      return;
+    }
+    this._jhRtcStop();
+    const failed = this._jhRtcFailed || (this._jhRtcFailed = {});
+    if (failed[key]) return;
+    const r = { key, playing: false, session: null, pending: [] };
+    this._jhRtc = r;
+    const fail = () => { if (this._jhRtc === r) { failed[key] = true; this._jhRtcStop(true); } };   // jh-r16-rtc: MJPEG at once
+    r.fail = fail;
+    try {
+      const cache = this._camCaps || (this._camCaps = {});   // the same per-camera answer the picture chain asks for (asked once)
+      if (!(src in cache)) {
+        cache[src] = null;
+        cache[src] = (await this._hass.callWS({ type: "camera/capabilities", entity_id: src }).catch(() => ({}))) || {};
+      }
+      for (let i = 0; i < 30 && cache[src] === null; i++) await new Promise(res => setTimeout(res, 100));   // asked already
+      const caps = cache[src];
+      if (this._jhRtc !== r) return;
+      if (!caps || !(caps.frontend_stream_types || []).includes("web_rtc")) { this._jhRtc = null; return; }   // MJPEG as before
+      let cfg = {};
+      try { cfg = (await this._hass.callWS({ type: "camera/webrtc/get_client_config", entity_id: src })) || {}; } catch (e) { cfg = {}; }
+      if (this._jhRtc !== r) return;
+      r.pc = new RTCPeerConnection(cfg.configuration || {});
+      r.pc.addTransceiver("video", { direction: "recvonly" });
+      r.video = document.createElement("video");
+      r.video.className = "jh-rtc";
+      r.video.autoplay = true; r.video.muted = true; r.video.playsInline = true;
+      r.video.setAttribute("playsinline", "");
+      r.video.style.display = "none";
+      r.pc.ontrack = (ev) => { r.video.srcObject = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]); };
+      r.video.addEventListener("playing", () => {
+        if (this._jhRtc !== r) return;
+        r.playing = true;
+        clearTimeout(r.timer);
+        this._jhRtcShow(this.shadowRoot && this.shadowRoot.querySelector("#cam-feed > img"));
+      });
+      r.pc.onconnectionstatechange = () => {
+        const s = r.pc.connectionState;
+        if (s === "failed" || s === "closed" || (r.playing && s === "disconnected")) fail();
+      };
+      const send = (c) => this._hass.callWS({ type: "camera/webrtc/candidate", entity_id: src, session_id: r.session, candidate: c })
+        .catch(() => {});
+      r.pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        const c = ev.candidate.toJSON ? ev.candidate.toJSON() : { candidate: ev.candidate.candidate, sdpMid: ev.candidate.sdpMid,
+                                                                  sdpMLineIndex: ev.candidate.sdpMLineIndex };
+        if (r.session) send(c); else r.pending.push(c);
+      };
+      if (img) {   // the zoom of the picture applies to the WebRTC picture too
+        r.mo = new MutationObserver(() => { r.video.style.transform = img.style.transform || ""; });
+        r.mo.observe(img, { attributes: true, attributeFilter: ["style"] });
+        r.video.style.transform = img.style.transform || "";
+      }
+      if (feed) feed.prepend(r.video);
+      const offer = await r.pc.createOffer();
+      await r.pc.setLocalDescription(offer);
+      r.timer = setTimeout(fail, 8000);
+      const unsub = await this._hass.connection.subscribeMessage((m) => {
+        if (this._jhRtc !== r || !m) return;
+        if (m.type === "session") { r.session = m.session_id; r.pending.splice(0).forEach(send); }
+        else if (m.type === "answer") r.pc.setRemoteDescription({ type: "answer", sdp: m.answer }).catch(fail);
+        else if (m.type === "candidate" && m.candidate) {
+          const c = m.candidate;
+          r.pc.addIceCandidate({ candidate: c.candidate, sdpMid: c.sdpMid !== undefined ? c.sdpMid : c.sdp_mid,
+                                 sdpMLineIndex: c.sdpMLineIndex !== undefined ? c.sdpMLineIndex : c.sdp_m_line_index }).catch(() => {});
+        } else if (m.type === "error") fail();
+      }, { type: "camera/webrtc/offer", entity_id: src, offer: offer.sdp });
+      if (this._jhRtc === r) r.unsub = unsub; else { try { unsub(); } catch (e) {} }
+    } catch (e) {
+      fail();
+    }
+  }
+
+  _armCamWatchdog(entity, img, expectMode, ms) {
+    if (this._camWatchdog) { clearTimeout(this._camWatchdog); }
+    this._camLoadHook(img);   // Jarvis Home (round 5): stills are judged once they have loaded, a retry shows what comes
+    this._camWatchdog = setTimeout(() => {
+      this._camWatchdog = null;
+      if (this._activeCam !== entity || this._camMode !== expectMode) return;
+      if (expectMode === "still" && this._camStillWait(entity, img, ms)) return;   // Jarvis Home (round 5): judged once it is in
+      // v7.94.0: pixels alone don't prove a working tier — a Nest MJPEG can
+      // decode a steady BLACK stream (naturalWidth > 0, nothing visible),
+      // which defeated the original watchdog. Escalate on no-pixels OR a
+      // near-black frame; an unsampleable frame gets the benefit of the doubt.
+      if (img && img.naturalWidth > 0) {
+        const luma = this._frameLuma(img);
+        if (luma === null || luma > 10) { this._camRetryShow(img); return; }   // real (or unverifiable) frame (round 5: a retry shows it)
+        if (this._camDarkNote(entity, img, expectMode)) return;   // Jarvis Home: a dark room seen before, the chain is not walked again
+      }
+      if (expectMode === "stream") this._camFallback(entity);
+      else if (expectMode === "still") this._camJarvisFallback(entity);
+    }, ms);
+  }
+
+  // Jarvis Home patch (2026-11-07, round 3): a dark room is no broken camera. A tier that decodes a real picture that is only very
+  // dark (dim on average, yet with detail in it) is remembered per camera. The chain still tries the next tiers, as it must for a
+  // Nest stream that decodes pure black; when they give nothing better, the panel goes back to that dark picture, shows it with a
+  // small badge and does not stay on the JARVIS tier, so the picture brightens as soon as a light goes on. A frame with no detail
+  // at all, a camera that decodes nothing, and a WebRTC-only camera (Home Assistant lists no hls for it) escalate as before.
+  _camFrameLook(img) {
+    try {
+      if (!img || !img.naturalWidth || !img.naturalHeight) return null;
+      const w = Math.min(320, img.naturalWidth), h = Math.max(1, Math.round(w * img.naturalHeight / img.naturalWidth));
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const ctx = c.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, w, h);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      let sum = 0, top = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+        top = Math.max(top, d[i], d[i + 1], d[i + 2]);
+      }
+      return { luma: sum / (d.length / 4), top };
+    } catch (_) { return null; }
+  }
+
+  // "dark": a real but very dark picture, "bright": light enough, "black": nothing in it, null: no frame or it cannot be read
+  _camLook(img) {
+    const f = this._camFrameLook(img);
+    if (!f) return null;
+    return f.luma > 10 ? "bright" : f.top >= 8 ? "dark" : "black";
+  }
+
+  // Home Assistant's own camera capabilities, asked once per camera; while unknown the camera counts as not WebRTC-only
+  _camWebrtcOnly(src) {
+    const caps = this._camCaps || (this._camCaps = {});
+    if (!(src in caps) && this._hass && this._hass.callWS) {
+      caps[src] = null;
+      Promise.resolve().then(() => this._hass.callWS({ type: "camera/capabilities", entity_id: src }))
+        .then((r) => { caps[src] = r || {}; }, () => { caps[src] = {}; });
+    }
+    const t = (caps[src] && caps[src].frontend_stream_types) || [];
+    return t.includes("web_rtc") && !t.includes("hls");
+  }
+
+  // The watchdog found a dim frame: a dark but real one is remembered. True when this camera already went back to its dark
+  // picture once, so the chain is not walked again (a new stream token every few minutes arms the watchdog again).
+  _camDarkNote(entity, img, mode) {
+    const seen = this._camDarkSeen || (this._camDarkSeen = {});
+    // round 4: only a frame that is still live, and it is remembered for this walk down the chain alone
+    if (this._camLook(img) !== "dark" || !this._camFresh(img) || this._camWebrtcOnly(this._camSource(entity))) return false;
+    const s = seen[entity] || (seen[entity] = {});
+    if (s.walk !== this._camWalk || mode === "stream") s.mode = mode;   // the best tier that showed it in this walk
+    s.walk = this._camWalk;
+    return !!s.back && this._camDarkBack(entity, mode);
+  }
+
+  // The later tiers gave nothing better: the dark picture again, live, with the badge
+  _camDarkBack(entity, mode) {
+    const seen = this._camDarkSeen && this._camDarkSeen[entity];
+    // round 4: only when this walk down the chain saw the dark picture itself; one from an earlier walk proves nothing now
+    if (!seen || seen.walk !== this._camWalk || entity !== this._activeCam || this._camWebrtcOnly(this._camSource(entity))) return false;
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const img = feed && feed.querySelector("img");
+    if (!img) return false;
+    if (this._camPace(entity, () => this._camDarkBack(entity, mode))) return true;   // at most one tier switch a second
+    this._camWalk = (this._camWalk || 0) + 1;   // a new walk: after a later failure it comes back only for a new dark frame
+    seen.back = true;
+    mode = mode || seen.mode;
+    delete this._camModeByEntity[entity];   // never stuck on the JARVIS tier
+    if (this._camWsTimer) { clearInterval(this._camWsTimer); this._camWsTimer = null; }
+    if (this._camWatchdog) { clearTimeout(this._camWatchdog); this._camWatchdog = null; }
+    if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
+    feed.querySelector(".cam-none")?.remove();
+    img.style.display = "";
+    const src = this._camSource(entity), tok = this._camToken(src);
+    this._camMode = mode;
+    if (mode === "stream") {
+      const url = tok ? `/api/camera_proxy_stream/${src}?token=${encodeURIComponent(tok)}` : `/api/camera_proxy_stream/${src}`;
+      if (img.getAttribute("src") !== url) img.src = url;
+    } else {
+      const still = () => { img.src = `/api/camera_proxy/${src}?token=${encodeURIComponent(tok || "")}&_=${Date.now()}`; };
+      still();
+      this._camStillTimer = setInterval(() => { if (this._activeCam === entity) still(); }, 2000);
+    }
+    const strip = this.shadowRoot?.querySelector("#cam-strip");
+    if (strip) strip.innerHTML = `<span>SRC <b>${this._esc(this._camName(entity))}</b></span><span>${mode === "stream" ? "MJPEG" : "STILLS"}</span>`;
+    this._armCamWatchdog(entity, img, mode, mode === "stream" ? 6000 : 5000);   // round 4: a later failure still goes down the chain
+    this._camDarkWatch(entity);
+    return true;
+  }
+
+  // The badge follows the picture: shown while it is dark but real, gone once it is light enough or shows nothing at all
+  _camDarkWatch(entity) {
+    clearInterval(this._camDarkTimer);
+    const tick = () => {
+      const feed = this.shadowRoot?.getElementById("cam-feed");
+      let badge = feed && feed.querySelector(".cam-dark");
+      if (!this.isConnected || this._activeCam !== entity || !feed) {
+        clearInterval(this._camDarkTimer); this._camDarkTimer = null;
+        badge?.remove();
+        return;
+      }
+      const pic = feed.querySelector("img");
+      const held = this._camStillHeld(pic);   // round 5: while the next still loads, the last one that loaded is judged
+      const look = held ? held.look : pic && pic.style.display !== "none" ? this._camLook(pic) : null;
+      const dark = look === "dark" && (held ? held.fresh : this._camFresh(pic));   // round 4: only while new frames keep coming
+      // dark again after a light spell (the watchdog ended then): a new one, so a later freeze or failure still goes down the chain
+      if (look === "dark" && !this._camWatchdog && (this._camMode === "stream" || this._camMode === "still"))
+        this._armCamWatchdog(entity, pic, this._camMode, this._camMode === "stream" ? 6000 : 5000);
+      if (dark && !badge) {
+        badge = document.createElement("div");
+        badge.className = "cam-dark";
+        badge.dataset.cam = entity;
+        badge.textContent = "VERY DARK — too little light to see";   // round 4: only what is seen
+        feed.appendChild(badge);
+      } else if (!dark && badge) badge.remove();
+    };
+    this._camDarkTimer = setInterval(tick, 2000);
+    setTimeout(tick, 500);   // a stream that was attached again shows its first frame by then
+    tick();
+  }
+
+  // Jarvis Home patch (2026-11-07, round 4): the dark picture comes back only for the walk down the chain that saw it, and only
+  // while new frames keep coming, so a camera that was dark once and then errors, hangs or decodes pure black ends on NO FRAME as
+  // before. No tier switch happens more than once a second per camera: true here means the switch waits and then runs once, a
+  // second after the last one, unless the feed was attached again in between.
+  _camPace(entity, again) {
+    const last = this._camSwitchAt || (this._camSwitchAt = {});
+    const pend = this._camPaced || (this._camPaced = {});
+    if (pend[entity] && pend[entity].walk === this._camWalk) return true;   // one already waits for this walk: it goes first
+    if (pend[entity]) { clearTimeout(pend[entity].timer); delete pend[entity]; }
+    const wait = (last[entity] || 0) + 1000 - Date.now();
+    if (wait <= 0) { last[entity] = Date.now(); return false; }
+    const walk = this._camWalk;
+    pend[entity] = { walk, timer: setTimeout(() => {
+      delete pend[entity];
+      if (this.isConnected && this._activeCam === entity && this._camWalk === walk) again();
+    }, wait) };
+    return true;
+  }
+
+  // True while new frames keep coming: the picture changed within the last 5 s (its first look counts as new, it was decoded after
+  // the feed was attached). An MJPEG stream that ended or froze keeps its last frame without any event, so the pixels are compared.
+  _camFresh(img) {
+    try {
+      if (!img || !img.naturalWidth || !img.naturalHeight) return false;
+      const w = Math.min(1280, img.naturalWidth), h = Math.max(1, Math.round(w * img.naturalHeight / img.naturalWidth));
+      const c = this._camSigCanvas || (this._camSigCanvas = document.createElement("canvas"));
+      if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return false;
+      ctx.drawImage(img, 0, 0, w, h);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      let sig = 2166136261;
+      for (let i = 0; i < d.length; i += 4) sig = Math.imul(sig ^ (d[i] + 3 * d[i + 1] + 7 * d[i + 2]), 16777619);
+      const now = Date.now();
+      if (img._jhFrameSig !== sig) { img._jhFrameSig = sig; img._jhFrameAt = now; }
+      return now - img._jhFrameAt < 5000;
+    } catch (_) { return false; }
+  }
+
+  // Jarvis Home patch (2026-11-08, round 5): a still is judged only once it has loaded. The stills tier asks for the next still
+  // every 2 s, and one can take a second or more (a phone on mobile data, go2rtc waiting for a keyframe); while it loads the picture
+  // has no pixels to judge. The still watchdog waits for that still while the last one loaded within its window, and the badge goes
+  // by the last still that loaded. A still that fails (an error, or none loaded within the window) still goes down the chain.
+  _camLoadHook(img) {
+    if (!img || img._jhLoadHook) return;
+    img._jhLoadHook = true;
+    img.addEventListener("load", () => {
+      if (!img.naturalWidth) return;
+      if (this._camMode === "still") {
+        img._jhStillAt = Date.now();
+        img._jhStillLook = this._camLook(img);
+        if (img._jhStillLook === "dark") this._camFresh(img);   // new frames are timed by the stills that came in
+      }
+      this._camRetryShow(img);
+    });
+  }
+
+  // The last still that loaded, while the next one still loads and the last one is less than 5 s old; null otherwise
+  _camStillHeld(img) {
+    // a still that failed (complete, no pixels) is held over like one that loads, until the next one comes (round 5 follow-up)
+    if (this._camMode !== "still" || !img || (img.complete && img.naturalWidth) || img.style.display === "none") return null;
+    const now = Date.now();
+    if (!(now - (img._jhStillAt || 0) < 5000)) return null;
+    return { look: img._jhStillLook || null, fresh: now - (img._jhFrameAt || 0) < 5000 };
+  }
+
+  // The still watchdog fired while a still loads and the last one loaded within its window: this still is judged once it is in or
+  // has failed, or once the window since the last one that loaded has passed. True while it waits. The watchdog is armed again with
+  // 0 then: it judges at once, or waits for the next still if that one already loads.
+  _camStillWait(entity, img, ms) {
+    const win = ms || (img && img._jhStillWin) || 0, at = img && img._jhStillAt;
+    // a still that failed waits for the next one too, while the last one loaded within the window (round 5 follow-up)
+    if (!img || (img.complete && img.naturalWidth) || !at || !(Date.now() - at < win)) return false;
+    img._jhStillWin = win;
+    let timer = null;
+    const go = () => {
+      img.removeEventListener("load", go); img.removeEventListener("error", go);
+      if (this._camWatchdog !== timer) return;   // ended or replaced meanwhile
+      clearTimeout(timer); this._camWatchdog = null;
+      if (this._activeCam === entity && this._camMode === "still") this._armCamWatchdog(entity, img, "still", 0);
+    };
+    timer = setTimeout(go, at + win - Date.now() + 50);
+    this._camWatchdog = timer;
+    img.addEventListener("load", go); img.addEventListener("error", go);
+    return true;
+  }
+
+  // One still that fails while the last still, a dark one, loaded less than 5 s ago is no end: the next still comes within 2 s, and
+  // stills that keep failing still go down the chain (the watchdog, or the next error once 5 s have passed).
+  _camStillDarkRecent(img) {
+    return this._camMode === "still" && !!img && img._jhStillLook === "dark" && Date.now() - (img._jhStillAt || 0) < 5000;
+  }
+
+  // Jarvis Home patch (2026-11-08, round 5, the owner's rule): while the tile shows NO FRAME for a camera, the normal chain (stream,
+  // stills, then the JARVIS tier) is tried again about once a minute, one try at a time and never faster than one tier switch a
+  // second. NO FRAME stays up while it is tried; a camera that delivers frames again is shown (a dark picture by the dark path, with
+  // its badge). A camera that stays broken stays on NO FRAME, with about one walk down the chain a minute. A try that comes due after
+  // the tile was left, the panel was closed or another camera was picked does nothing.
+  _camRetryLater(entity, ms) {
+    if (this._camRetryTimer && this._camRetryCam === entity) return;   // one try at a time
+    clearTimeout(this._camRetryTimer);
+    this._camRetryCam = entity;
+    this._camRetryTimer = setTimeout(() => { this._camRetryTimer = null; this._camRetryNow(entity); }, ms);
+  }
+
+  _camRetryNow(entity) {
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const img = feed && feed.querySelector("img"), none = feed && feed.querySelector(".cam-none");
+    if (!this.isConnected || !img || !none || this._activeCam !== entity || this._camMode !== "jarvis"
+        || img.style.display !== "none" || !(none.textContent || "").startsWith("NO FRAME")) return;
+    if (this._camPace(entity, () => this._camRetryNow(entity))) return;   // at most one tier switch a second
+    const strip = this.shadowRoot.getElementById("cam-strip"), label = strip ? strip.innerHTML : "";
+    delete this._camModeByEntity[entity];   // the chain is walked as on a first attach
+    this._lastCamKey = "";
+    this._renderCameraFeed();
+    feed.appendChild(none);                 // NO FRAME stays up until a frame comes
+    img.style.display = "none";
+    if (strip) strip.innerHTML = label;
+    this._camRetryFor = entity;
+  }
+
+  // A light picture on the stream or stills tier while a try still shows NO FRAME: it is shown
+  _camRetryShow(img) {
+    const entity = this._activeCam;
+    if (!entity || entity !== this._camRetryFor || !img || !img.naturalWidth || img.style.display !== "none"
+        || (this._camMode !== "stream" && this._camMode !== "still")) return;
+    const luma = this._frameLuma(img);
+    if (luma !== null && luma <= 10) return;   // a dark picture comes back by the dark path, with its badge; black is no picture
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    if (!feed || !feed.contains(img)) return;
+    this._camRetryFor = null;
+    feed.querySelector(".cam-none")?.remove();
+    img.style.display = "";
+    const strip = this.shadowRoot.getElementById("cam-strip");
+    if (strip) strip.innerHTML = `<span>SRC <b>${this._esc(this._camName(entity))}</b></span><span>${this._camMode === "stream" ? "MJPEG" : "STILLS"}</span>`;
+  }
+
+  _camFallback(entity) {
+    // Nest/WebRTC cameras may not serve MJPEG — fall back to a refreshed still.
+    if (entity !== this._activeCam) return;
+    if (this._camPace(entity, () => this._camFallback(entity))) return;   // Jarvis Home: at most one tier switch a second
+    this._camMode = "still";
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const img = feed && feed.querySelector("img");
+    if (!img) return;
+    const src = this._camSource(entity);
+    const tok = this._camToken(src);
+    const still = () => { img.src = `/api/camera_proxy/${src}?token=${encodeURIComponent(tok || "")}&_=${Date.now()}`; };
+    still();
+    if (!this._camStillTimer) this._camStillTimer = setInterval(() => { if (this._activeCam === entity) still(); }, 2000);
+    // Stills can hang exactly like the stream tier — watchdog here too.
+    this._armCamWatchdog(entity, img, "still", 5000);
+  }
+
+  _camJarvisFallback(entity) {
+    // Last tier: frames through JARVIS's backend registry (Nest event media,
+    // stream-wake) over WS. Slower cadence — stream-wake isn't free.
+    if (entity !== this._activeCam) return;
+    if (this._camPace(entity, () => this._camJarvisFallback(entity))) return;   // Jarvis Home: at most one tier switch a second
+    this._camMode = "jarvis";
+    this._camModeByEntity[entity] = "jarvis";
+    if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
+    if (this._camWatchdog) { clearTimeout(this._camWatchdog); this._camWatchdog = null; }
+    const feed = this.shadowRoot?.getElementById("cam-feed");
+    const img = feed && feed.querySelector("img");
+    if (!img || !this._hass) return;
+    const strip = this.shadowRoot?.querySelector("#cam-strip");
+    if (strip) strip.innerHTML = `<span>SRC <b>${this._esc(this._camName(entity))}</b></span><span>JARVIS SNAPSHOT</span>`;
+    const hint = (text) => {
+      if (this._activeCam !== entity || this._camMode !== "jarvis") return;   // Jarvis Home (round 5): a late answer changes nothing
+      if (this._camDarkBack(entity)) return;   // Jarvis Home: nothing better than the dark picture seen before, so that is shown
+      let d = feed.querySelector(".cam-none");
+      if (!d) { d = document.createElement("div"); d.className = "cam-none"; feed.appendChild(d); }
+      d.textContent = text;
+      img.style.display = "none";
+      feed.querySelectorAll(".cam-dark").forEach((b) => b.remove());   // Jarvis Home (round 5): no picture, so no badge on it
+      if (text.startsWith("NO FRAME")) this._camRetryLater(entity, 60000);   // Jarvis Home (round 5): tried again about once a minute
+    };
+    const shot = async () => {
+      if (this._activeCam !== entity || this._camMode !== "jarvis") return;
+      try {
+        const res = await this._hass.callWS({ type: "jarvis/camera_snapshot", entity_id: entity });
+        if (this._activeCam !== entity || this._camMode !== "jarvis") return;   // Jarvis Home (round 5): a late answer changes nothing
+        if (res?.image) {
+          feed.querySelector(".cam-none")?.remove();
+          img.style.display = "";
+          img.src = `data:image/jpeg;base64,${res.image}`;
+        } else {
+          hint("NO FRAME — camera idle or unreachable. For Nest: verify the Google Nest integration is loaded and events are enabled.");
+        }
+      } catch (err) {
+        // v7.94.0: don't swallow this — the most common cause is the WS
+        // command not existing because HA wasn't restarted after updating.
+        const m = String(err?.message || err?.code || err || "");
+        hint(/unknown|not.*found|invalid.*type/i.test(m)
+          ? "JARVIS SNAPSHOT UNAVAILABLE — restart Home Assistant to load the updated integration, then refresh."
+          : `JARVIS SNAPSHOT ERROR — ${m.slice(0, 120)}`);
+      }
+    };
+    shot();
+    if (!this._camWsTimer) this._camWsTimer = setInterval(shot, 6000);
+  }
+
+  // Jarvis Home patch (2026-11-14): jh-cam-zoom - zoom and drag the Camera Watch picture
+  _jhCamZoomInit() {
+    const root = this.shadowRoot;
+    this._jhZ = { s: 1, x: 0, y: 0, ptrs: new Map(), pinch: null, drag: null };
+    const feedOf = (e) => (e.target && e.target.closest) ? e.target.closest("#cam-feed") : null;
+    const MAX = 6;
+    // The wheel listener sits on the panel element itself, not on the shadow root: Chrome only treats a wheel listener on an element
+    // (or document/window) as able to block scrolling - on a shadow root every wheel event arrives with cancelable=false, so
+    // preventDefault() is ignored and the page scrolls while the picture zooms (owner report, 2026-11-14). Over the picture the page never scrolls,
+    // also at 1x when scrolling down.
+    this.addEventListener("wheel", (e) => {
+      const feed = e.composedPath().find((n) => n.id === "cam-feed"); if (!feed) return;
+      e.preventDefault(); e.stopPropagation();
+      const z = this._jhZ, old = z.s, s = Math.min(MAX, Math.max(1, old * (e.deltaY < 0 ? 1.2 : 1 / 1.2)));
+      const r = feed.getBoundingClientRect();
+      const px = e.clientX - r.left - r.width / 2, py = e.clientY - r.top - r.height / 2;   // zoom towards the pointer
+      z.x = px - (px - z.x) * (s / old); z.y = py - (py - z.y) * (s / old); z.s = s;
+      this._jhCamZoomApply();
+    }, { passive: false });
+    root.addEventListener("pointerdown", (e) => {
+      const feed = feedOf(e); if (!feed) return;
+      const z = this._jhZ;
+      z.ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (z.ptrs.size === 2) {
+        const [a, b] = [...z.ptrs.values()];
+        z.pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), s: z.s }; z.drag = null;
+      } else if (z.s > 1) {
+        z.drag = { x: e.clientX, y: e.clientY, ox: z.x, oy: z.y };
+        feed.classList.add("jh-grabbing");
+        try { feed.setPointerCapture(e.pointerId); } catch (_) {}
+        e.preventDefault();
+      }
+    });
+    root.addEventListener("pointermove", (e) => {
+      const z = this._jhZ; if (!z.ptrs.has(e.pointerId)) return;
+      z.ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (z.pinch && z.ptrs.size === 2) {
+        const [a, b] = [...z.ptrs.values()], d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (z.pinch.d > 0) { z.s = Math.min(MAX, Math.max(1, z.pinch.s * d / z.pinch.d)); this._jhCamZoomApply(); }
+      } else if (z.drag) {
+        z.x = z.drag.ox + e.clientX - z.drag.x; z.y = z.drag.oy + e.clientY - z.drag.y; this._jhCamZoomApply();
+      }
+    });
+    const up = (e) => {
+      const z = this._jhZ; z.ptrs.delete(e.pointerId);
+      if (z.ptrs.size < 2) z.pinch = null;
+      if (!z.ptrs.size) { z.drag = null; root.getElementById("cam-feed")?.classList.remove("jh-grabbing"); }
+    };
+    root.addEventListener("pointerup", up);
+    root.addEventListener("pointercancel", up);
+    root.addEventListener("dblclick", (e) => { if (feedOf(e)) this._jhCamZoomReset(); });
+  }
+
+  _jhCamZoomApply() {
+    const z = this._jhZ, feed = this.shadowRoot?.getElementById("cam-feed");
+    if (!z || !feed) return;
+    if (z.s <= 1.001) { z.s = 1; z.x = 0; z.y = 0; }
+    // jh-r27-panbox (step 170, review round 27 #3): the bounds of the picture as drawn inside the fixed box (object-fit:
+    // contain), not of the box: a 4:3 or portrait picture zoomed in never slides into the black bars
+    const W = feed.clientWidth, H = feed.clientHeight, pic = this._jhCamPicBox(feed, W, H);
+    const mx = Math.max(0, (pic.w * z.s - W) / 2), my = Math.max(0, (pic.h * z.s - H) / 2);   // never slide out of the window
+    z.x = Math.max(-mx, Math.min(mx, z.x)); z.y = Math.max(-my, Math.min(my, z.y));
+    const img = feed.querySelector("img");
+    const tf = z.s > 1 ? `translate(${z.x}px, ${z.y}px) scale(${z.s})` : "";
+    if (img) img.style.transform = tf;
+    // jh-r21-rtczoom (step 163, review round 21 #6): the WebRTC picture too, whichever img element is observed after a re-render
+    const vid = feed.querySelector("video.jh-rtc");
+    if (vid) vid.style.transform = tf;
+    feed.classList.toggle("jh-zoomed", z.s > 1);   // no on-screen controls: wheel, drag, double-click only
+  }
+
+  // jh-r27-panbox (step 170, review round 27 #3): the size of the picture as drawn in the box: the shown source's own aspect
+  // ratio (the WebRTC video when it plays, else the picture) fitted inside W x H; the box itself while the size is unknown
+  _jhCamPicBox(feed, W, H) {
+    const vid = feed.querySelector("video.jh-rtc"), img = feed.querySelector("img");
+    let nw = 0, nh = 0;
+    if (vid && vid.style.display !== "none" && vid.videoWidth > 0 && vid.videoHeight > 0) { nw = vid.videoWidth; nh = vid.videoHeight; }
+    else if (img && img.naturalWidth > 0 && img.naturalHeight > 0) { nw = img.naturalWidth; nh = img.naturalHeight; }
+    for (const el of [img, vid]) {   // a picture of another shape after a camera switch: the bounds are checked again
+      if (el && !el._jhPanBox) {
+        el._jhPanBox = true;
+        el.addEventListener(el === img ? "load" : "resize", () => { if (this._jhZ && this._jhZ.s > 1) this._jhCamZoomApply(); });
+      }
+    }
+    if (!(nw > 0 && nh > 0 && W > 0 && H > 0)) return { w: W, h: H };
+    const ar = nw / nh;
+    return { w: Math.min(W, H * ar), h: Math.min(H, W / ar) };
+  }
+
+  _jhCamZoomReset() {
+    if (this._jhZ) { this._jhZ.s = 1; this._jhZ.x = 0; this._jhZ.y = 0; this._jhZ.drag = null; this._jhZ.pinch = null; }
+    this._jhCamZoomApply();
+  }
+
+  // jh-ptz (step 145): pan/tilt pad for the shown camera, only when the backend says it can move (an ONVIF camera with PTZ)
+  // and this login may control it. The step size is kept per login (frontend user data, jh-user-prefs).
+  async _jhPtzRefresh() {
+    const box = this.shadowRoot?.getElementById("jh-ptz");
+    if (!box || !this._hass) return;
+    const cam = this._activeCam || "";
+    if (box.dataset.cam === cam) return;   // asked already for this camera (a full render makes a new, empty box)
+    box.dataset.cam = cam;
+    box.hidden = true;
+    box.innerHTML = "";
+    if (!cam) return;
+    let info = null;
+    try { info = await this._hass.callWS({ type: "jarvis/camera_ptz_info", entity_id: cam }); } catch (e) { info = null; }
+    if (box.dataset.cam !== cam || !info || !info.ptz || !info.can_control) return;   // another camera meanwhile, or no pad
+    const step = ["small", "medium", "large"].includes(this._jhPrefGet("jarvis_ptz_step")) ? this._jhPrefGet("jarvis_ptz_step") : "medium";
+    const btn = (dir, sym, label) => `<button type="button" class="jh-ptz-btn" data-ptz="${dir}" title="${label}" aria-label="${label}">${sym}</button>`;
+    const presets = Array.isArray(info.presets) ? info.presets : [];
+    box.innerHTML = `<div class="head"><span>Camera Move</span><span class="side jh-ptz-cam">${this._esc(this._camName(cam))}</span>${info.admin ? '<button type="button" class="jh-ptz-gear" title="Camera direction" aria-label="Camera direction">\u2699</button>' : ''}</div>
+      ${info.admin ? `<div class="jh-ptz-flip" hidden><label><input type="checkbox" data-flip="pan"${(info.flip || {}).pan ? " checked" : ""}> Flip left/right</label><label><input type="checkbox" data-flip="tilt"${(info.flip || {}).tilt ? " checked" : ""}> Flip up/down</label><label>Speed <select data-speed>${[1, 0.75, 0.5, 0.25].map(v => `<option value="${v}"${Number(info.speed || 1) === v ? " selected" : ""}>${Math.round(v * 100)}%</option>`).join("")}</select></label></div>` : ''}
+      <div class="jh-ptz-pad">
+        <span></span>${btn("up", "\u25B2", "Tilt up")}<span></span>
+        ${btn("left", "\u25C0", "Pan left")}${btn("stop", "\u25A0", "Stop")}${btn("right", "\u25B6", "Pan right")}
+        <span></span>${btn("down", "\u25BC", "Tilt down")}<span></span>
+      </div>
+      <div class="jh-ptz-steps" role="group" aria-label="Step size">${["small", "medium", "large"].map(v =>
+        `<button type="button" class="jh-ptz-step${v === step ? " on" : ""}" data-step="${v}">${v[0].toUpperCase() + v.slice(1)}</button>`).join("")}</div>
+      ${presets.length ? `<div class="jh-ptz-presets">${presets.map(p =>
+        `<button type="button" class="jh-ptz-preset" data-preset="${this._esc(p.token)}">${this._esc(p.name || p.token)}</button>`).join("")}</div>` : ""}`;
+    box.hidden = false;
+    // jh-ptz-flip (step 149): an administrator sets this camera's own direction, kept on the server for every login and device
+    const gear = box.querySelector(".jh-ptz-gear"), flipRow = box.querySelector(".jh-ptz-flip");
+    if (gear && flipRow) gear.addEventListener("click", () => { flipRow.hidden = !flipRow.hidden; });
+    box.querySelectorAll("[data-flip]").forEach(c => c.addEventListener("change", async () => {
+      try { await this._hass.callWS({ type: "jarvis/camera_ptz_flip", entity_id: cam, [c.dataset.flip]: c.checked }); }
+      catch (err) { c.checked = !c.checked; this._toast("\u2717 Camera direction: " + (err?.message || err), "err"); }
+    }));
+    box.querySelectorAll("[data-speed]").forEach(s => s.addEventListener("change", async () => {   // jh-ptz-speed (step 155)
+      try { await this._hass.callWS({ type: "jarvis/camera_ptz_flip", entity_id: cam, speed: Number(s.value) }); }
+      catch (err) { this._toast("\u2717 Camera speed: " + (err?.message || err), "err"); }
+    }));
+    box.querySelectorAll("[data-ptz]").forEach(b => b.addEventListener("click", () => this._jhPtzSend(cam, b.dataset.ptz)));
+    box.querySelectorAll("[data-preset]").forEach(b => b.addEventListener("click", () => this._jhPtzSend(cam, "preset", b.dataset.preset)));
+    box.querySelectorAll("[data-step]").forEach(b => b.addEventListener("click", () => {
+      this._jhPrefSet("jarvis_ptz_step", b.dataset.step);
+      box.querySelectorAll("[data-step]").forEach(x => x.classList.toggle("on", x === b));
+    }));
+  }
+
+  async _jhPtzSend(cam, what, preset) {
+    if (!this._hass || !cam) return;
+    const pick = this._jhPrefGet("jarvis_ptz_step");
+    const msg = { type: "jarvis/camera_ptz", entity_id: cam, action: what === "stop" ? "stop" : what === "preset" ? "preset" : "move" };
+    if (msg.action === "move") { msg.direction = what; msg.step = ["small", "medium", "large"].includes(pick) ? pick : "medium"; }
+    if (msg.action === "preset") msg.preset = preset;
+    try { await this._hass.callWS(msg); }
+    catch (err) { this._toast("\u2717 Camera move: " + (err?.message || err), "err"); }
+  }
+
+  _selectCam(entity) {
+    if (!entity) return;
+    this._jhCamZoomReset();   // Jarvis Home patch (2026-11-14): another camera starts unzoomed
+    if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
+    this._activeCam = entity;
+    this._manualCam = entity;
+    this._camFocus = null;
+    // Remember the explicit pick so it survives tab navigation / panel
+    // re-creation (#231). Per-browser preference; safe to fail.
+    this._jhPrefSet("jarvis_active_cam", entity);   // jh-user-prefs: follows the login
+    this._renderCamSelector();
+    this._renderCameraFeed();
+  }
+
+  // Domains whose changes actually move something on the dashboard (area
+  // occupancy/lights, sparklines, lockdown, presence). Deliberately excludes
+  // chatty domains the panel never displays (update, automation, etc.) so a
+  // burst of unrelated HA activity can't trigger refreshes.
+  static _REALTIME_DOMAINS = new Set([
+    "light", "lock", "cover", "climate", "sensor", "binary_sensor",
+    "person", "device_tracker", "alarm_control_panel",
+  ]);
+
+  async _subscribeStateEvents() {
+    const conn = this._hass && this._hass.connection;
+    if (!conn || this._stateSubs.length) return;  // subscribe once
+    try {
+      this._stateSubs.push(await conn.subscribeEvents(
+        e => this._onStateChangedEvent(e.data || {}), "state_changed"));
+    } catch (_) {}
+  }
+
+  _onStateChangedEvent(data) {
+    const entityId = data.entity_id || "";
+    const domain = entityId.split(".", 1)[0];
+    if (!JarvisPanel._REALTIME_DOMAINS.has(domain)) return;
+    this._scheduleRealtimeRefresh();
+  }
+
+  _scheduleRealtimeRefresh() {
+    // Throttle with a trailing edge: refresh immediately if we haven't in a
+    // while, otherwise coalesce a burst (e.g. a scene firing many entities
+    // at once) into a single refresh at the end of the window — never more
+    // than one fetch per window, never longer than one window's delay.
+    const MIN_GAP_MS = 2000;
+    const now = Date.now();
+    const elapsed = now - this._lastRealtimeFetch;
+    if (elapsed >= MIN_GAP_MS) {
+      this._lastRealtimeFetch = now;
+      this._fetchLiveData();
+      return;
+    }
+    if (this._realtimeTrailing) return;
+    this._realtimeTrailing = setTimeout(() => {
+      this._realtimeTrailing = null;
+      this._lastRealtimeFetch = Date.now();
+      this._fetchLiveData();
+    }, MIN_GAP_MS - elapsed);
+  }
+
+  async _subscribeCameraEvents() {
+    const conn = this._hass && this._hass.connection;
+    if (!conn || this._camSubs.length) return;  // subscribe once
+    // jh-nonadmin (step 158, the live health sweep): Home Assistant lets only an administrator subscribe to JARVIS's own events
+    // (jarvis_camera_event, jarvis_face_recognized); for any other login (a tablet, the house login) it refused them with
+    // "Unauthorized" each time the panel started. Such a login is not subscribed at all (it sees no camera events anyway).
+    if (!(this._hass.user && this._hass.user.is_admin)) return;
+    try {
+      this._camSubs.push(await conn.subscribeEvents(e => this._onCamEvent(e.data || {}), "jarvis_camera_event"));
+    } catch (_) {}
+    try {
+      this._camSubs.push(await conn.subscribeEvents(e => {
+        const x = e.data || {};
+        if (x.is_confident && x.camera_entity) {
+          this._onCamEvent({ entity_id: x.camera_entity, label: x.name || "FACE", confidence: Math.round(x.confidence || 0) });
+        }
+      }, "jarvis_face_recognized"));
+    } catch (_) {}
+  }
+
+  _onCamEvent(data) {
+    const entity = data.entity_id;
+    if (!entity) return;
+    if (this._camStillTimer) { clearInterval(this._camStillTimer); this._camStillTimer = null; }
+    if (!this._cams.find(c => c.entity_id === entity)) this._cams.push({ entity_id: entity, name: entity });
+    this._manualCam = this._manualCam || this._activeCam;
+    this._activeCam = entity;
+    this._camFocus = { entity, label: data.label || "EVENT", conf: (data.confidence != null ? data.confidence : null) };
+    this._lastCamKey = "";  // force the stream to re-attach to the event camera
+    this._renderCamSelector();
+    this._renderCameraFeed();
+    this._toast(`◉ EVENT · ${this._camName(entity)} — camera focused`, "ok");   // jh-ha-names
+    if (this._camFocusTimer) clearTimeout(this._camFocusTimer);
+    this._camFocusTimer = setTimeout(() => {
+      this._camFocus = null;
+      if (this._manualCam) { this._activeCam = this._manualCam; this._lastCamKey = ""; }
+      this._renderCamSelector();
+      this._renderCameraFeed();
+    }, 25000);
+  }
+
+  _styles() {
+    return `
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500&family=Rajdhani:wght@300;400;500;600;700&display=swap');
+
+  :host {
+    display: block;
+    height: 100%;
+    background-color: #060a13;
+    background-image:
+      linear-gradient(rgba(0, 242, 254, 0.022) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 242, 254, 0.022) 1px, transparent 1px),
+      radial-gradient(circle at 50% 0%, rgba(0, 242, 254, 0.05) 0%, transparent 50%),
+      radial-gradient(circle at 100% 100%, rgba(10, 18, 36, 0.85) 0%, #060a13 100%);
+    background-size: 44px 44px, 44px 44px, 100% 100%, 100% 100%;
+    background-attachment: fixed;
+    color: #e2e8f0;
+    font-family: 'Space Grotesk', 'Rajdhani', 'Segoe UI', sans-serif;
+    --bg:         #060a13;
+    --bg-panel:   rgba(10, 18, 36, 0.45);
+    --bg-elev:    rgba(14, 24, 44, 0.55);
+    --line:       rgba(0, 242, 254, 0.12);
+    --line-hot:   rgba(0, 242, 254, 0.35);
+    --cyan:       #00f2fe;
+    --cyan-dim:   #1fb6c9;
+    --cyan-glow:  rgba(0, 242, 254, 0.45);
+    --cyan-faint: rgba(0, 242, 254, 0.07);
+    --amber:      #ffb454;
+    --red:        #ff4d6d;
+    --green:      #00f5a0;
+    --purple:     #b48cff;
+    --pink:       #ff6b9d;
+    --text:       #e2e8f0;
+    --text-dim:   #64748b;
+    --text-faint: #334155;
+    --font-display: 'Space Grotesk', 'Rajdhani', sans-serif;
+    --font-body:    'Space Grotesk', 'Segoe UI', sans-serif;
+    --font-mono:    'JetBrains Mono', 'Consolas', monospace;
+    --radius:     8px;
+    --radius-lg:  12px;
+  }
+  * { box-sizing: border-box; }
+  *::-webkit-scrollbar { width: 4px; height: 4px; }
+  *::-webkit-scrollbar-thumb { background: rgba(0, 242, 254, 0.14); border-radius: 2px; }
+  *::-webkit-scrollbar-thumb:hover { background: rgba(0, 242, 254, 0.3); }
+  *::-webkit-scrollbar-track { background: transparent; }
+
+  .app {
+    min-height: 100%;
+    background: radial-gradient(ellipse at 50% 0%, rgba(0, 242, 254, 0.03) 0%, transparent 60%),
+                radial-gradient(ellipse at 80% 100%, rgba(0, 100, 180, 0.02) 0%, transparent 50%),
+                var(--bg);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    position: relative;
+  }
+  .app::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent 0, transparent 3px,
+      rgba(0, 242, 254, 0.008) 3px, rgba(0, 242, 254, 0.008) 4px
+    );
+    pointer-events: none;
+    z-index: 0;
+  }
+  .app > * { position: relative; z-index: 1; }
+
+  /* MASTHEAD */
+  .masthead {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 24px;
+    padding: 16px 20px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    background: var(--bg-panel);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+    position: relative;
+  }
+  .status-badge {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 500;
+    background: rgba(0, 245, 160, 0.05);
+    border: 1px solid rgba(0, 245, 160, 0.3);
+    padding: 3px 9px;
+    border-radius: 4px;
+    letter-spacing: 1px;
+    color: var(--green);
+    margin-left: 14px;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  .status-badge.alert {
+    background: rgba(255, 77, 109, 0.06);
+    border-color: rgba(255, 77, 109, 0.4);
+    color: var(--red);
+    animation: ldpulse 1.6s infinite;
+  }
+  .masthead::before, .masthead::after {
+    content: ''; position: absolute; width: 14px; height: 14px; border-color: var(--cyan);
+  }
+  .masthead::before { top: -1px; left: -1px; border-top: 2px solid; border-left: 2px solid; border-radius: var(--radius-lg) 0 0 0; }
+  .masthead::after  { bottom: -1px; right: -1px; border-bottom: 2px solid; border-right: 2px solid; border-radius: 0 0 var(--radius-lg) 0; }
+
+  .menu-btn {
+    display: none;
+    width: 40px; height: 40px;
+    border-radius: 4px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 0;
+  }
+  .menu-btn:hover { background: rgba(255,255,255,0.05); border-color: var(--cyan-dim); }
+  .menu-btn svg { width: 22px; height: 22px; fill: currentColor; }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 19px;
+    letter-spacing: 0.35em;
+    color: var(--text);
+  }
+  .brand > span:not(.status-badge) {
+    color: var(--cyan);
+    text-shadow: 0 0 10px var(--cyan-glow);
+    font-weight: 500;
+  }
+  .brand-logo {
+    width: 38px;
+    height: 38px;
+    border-radius: 9px;
+    flex: 0 0 auto;
+    box-shadow: 0 0 16px var(--cyan-glow);
+  }
+  .brand span { color: var(--text-dim); font-weight: 400; }
+
+  /* Lockdown toggle switch */
+  .lockdown-toggle {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid var(--line-hot, #2a3f4a);
+    padding: 5px 10px 5px 8px; border-radius: 999px; cursor: pointer;
+    transition: border-color .2s ease, box-shadow .2s ease; white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .lockdown-toggle:hover { border-color: var(--cyan); }
+  .lockdown-toggle:focus-visible { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(0,242,254,0.35); }
+  .ld-switch {
+    position: relative; flex: 0 0 auto; box-sizing: border-box;
+    width: 40px; height: 22px; border-radius: 999px;
+    background: rgba(120,150,165,0.18);
+    border: 1px solid var(--line-hot, #2a3f4a);
+    transition: background .2s ease, border-color .2s ease, box-shadow .2s ease;
+  }
+  .ld-knob {
+    position: absolute; top: 2px; left: 2px; box-sizing: border-box;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #7d97a6;
+    transition: transform .2s ease, background .2s ease, box-shadow .2s ease;
+  }
+  .ld-label {
+    font-family: var(--font-display); font-size: 12px; letter-spacing: 0.16em;
+    color: var(--text-dim); transition: color .2s ease;
+  }
+  .ld-state {
+    font-family: var(--font-mono); font-size: 9px; font-weight: 600; letter-spacing: 0.14em;
+    color: var(--text-faint); transition: color .2s ease;
+    /* issue #208: size to the actual state text ("OFF"/"ARMED") instead of
+       reserving a fixed 34px — that reserved width was dead clickable space to
+       the right of "OFF" that made the pill easy to toggle by accident. */
+    min-width: 0;
+  }
+  /* armed */
+  .lockdown-toggle.on { border-color: #ff5a5a; box-shadow: 0 0 18px rgba(255,60,60,0.30); }
+  .lockdown-toggle.on .ld-switch {
+    background: rgba(255,60,60,0.28); border-color: #ff6a6a;
+    box-shadow: 0 0 10px rgba(255,60,60,0.45), inset 0 0 6px rgba(255,60,60,0.35);
+  }
+  .lockdown-toggle.on .ld-knob {
+    transform: translateX(18px); background: #ff8080; box-shadow: 0 0 9px #ff5a5a;
+  }
+  .lockdown-toggle.on .ld-label { color: #ff9a9a; }
+  .lockdown-toggle.on .ld-state { color: #ff6a6a; animation: ldpulse 1.6s ease-in-out infinite; }
+  @keyframes ldpulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .greeting {
+    font-size: 15px;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: center;
+  }
+  .greeting b { color: var(--text); font-weight: 500; margin-left: 0.4em; }
+
+  .clock { text-align: right; font-family: var(--font-mono); }
+  .clock .time {
+    font-size: 26px;
+    font-weight: 500;
+    color: var(--cyan);
+    letter-spacing: 0.12em;
+    line-height: 1;
+    text-shadow: 0 0 12px var(--cyan-glow);
+  }
+  .clock .date {
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.3em;
+    margin-top: 4px;
+  }
+
+  /* Right-hand masthead cluster: search · clock · lockdown */
+  .masthead-right {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 16px;
+  }
+
+  /* jh-masthead-fit (step 159, the live panel at 1440x900: the lockdown switch and its state ran 19 px past the screen). On a
+     desktop the greeting gives way first (it shrinks and ends in an ellipsis), then the right block (search, clock, lockdown)
+     wraps inside its own column; the masthead never makes the page scroll sideways. */
+  @media (min-width: 901px) {
+    .masthead { grid-template-columns: auto minmax(0, 1fr) auto; max-width: 100%; box-sizing: border-box; }
+    .masthead > .brand { min-width: 0; }
+    .masthead > .greeting { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .masthead-right { min-width: 0; max-width: 100%; flex-wrap: wrap; justify-content: flex-end; row-gap: 8px; }
+    .masthead-right > .lockdown-toggle, .masthead-right > .clock { flex: 0 0 auto; }
+    .masthead-right > .gsearch { flex: 0 1 auto; min-width: 0; }
+    .masthead-right .gsearch-input { max-width: 100%; box-sizing: border-box; }
+  }
+
+  /* Global search (issue #209) */
+  .gsearch { position: relative; }
+  .gsearch-input {
+    width: 180px;
+    max-width: 30vw;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 7px 12px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    outline: none;
+    transition: border-color .2s ease, box-shadow .2s ease, width .2s ease;
+  }
+  .gsearch-input::placeholder { color: var(--text-dim); }
+  .gsearch-input:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 0 2px rgba(0,242,254,0.18);
+    width: 230px;
+  }
+  .gsearch-results {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    width: 320px;
+    max-width: 80vw;
+    max-height: 60vh;
+    overflow-y: auto;
+    z-index: 60;
+    background: var(--bg-panel, #0b1620);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    padding: 6px;
+  }
+  .gs-group {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 8px 8px 4px;
+  }
+  .gs-item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 7px;
+    padding: 8px 10px;
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .gs-item:hover { background: rgba(0,242,254,0.08); }
+  .gs-ent-name { color: var(--text); }
+  .gs-ent-id {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.02em;
+  }
+  .gs-empty {
+    color: var(--text-dim);
+    font-size: 12px;
+    padding: 12px 10px;
+    font-family: var(--font-mono);
+  }
+
+  /* GRID */
+  .grid {
+    display: grid;
+    grid-template-columns: 240px 1fr 300px;
+    gap: 16px;
+    align-items: start;
+  }
+
+  /* PANEL base */
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    position: relative;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .panel:hover {
+    border-color: var(--line-hot);
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37), 0 0 24px rgba(0, 242, 254, 0.05);
+  }
+  .panel::before, .panel::after {
+    content: ''; position: absolute; width: 10px; height: 10px; border-color: var(--cyan-dim);
+  }
+  .panel::before { top: -1px; left: -1px; border-top: 1.5px solid; border-left: 1.5px solid; border-radius: var(--radius-lg) 0 0 0; }
+  .panel::after  { bottom: -1px; right: -1px; border-bottom: 1.5px solid; border-right: 1.5px solid; border-radius: 0 0 var(--radius-lg) 0; }
+
+  .panel .head {
+    font-family: var(--font-display);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.25em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel .head > span:first-child { color: var(--text-main, var(--text)); }
+  .panel:hover .head > span:first-child { color: var(--cyan); transition: color 0.4s; }
+  .panel .head .side {
+    font-family: var(--font-mono);
+    color: var(--text-dim);
+    font-size: 9px;
+    letter-spacing: 0.2em;
+  }
+
+  /* STATUS */
+  .status-list { display: flex; flex-direction: column; gap: 10px; }
+  .status-row {
+    display: grid; grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--bg-elev);
+    border-left: 2px solid var(--line);
+    border-radius: var(--radius);
+    font-size: 13px; letter-spacing: 0.08em;
+    transition: border-color 0.3s, background 0.3s;
+  }
+  .status-row.live { border-left-color: var(--green); background: rgba(0, 245, 160, 0.03); }
+  .status-row.warn { border-left-color: var(--amber); background: rgba(255, 157, 46, 0.03); }
+  .status-row.off  { border-left-color: var(--text-faint); }
+  .status-row .k {
+    color: var(--text-dim);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.22em;
+  }
+  .status-row .v {
+    font-family: var(--font-mono);
+    color: var(--text);
+    font-size: 12px;
+    letter-spacing: 0.1em;
+  }
+  .status-row.live .v { color: var(--green); }
+  .status-row.warn .v { color: var(--amber); }
+  .dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    margin-right: 8px;
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 2.6s ease-in-out infinite;
+  }
+  .dot.warn { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  .dot.off  { background: var(--text-faint); box-shadow: none; animation: none; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.5; transform: scale(0.85); }
+  }
+
+  .meta {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--line);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.18em;
+    font-family: var(--font-mono);
+    line-height: 1.8;
+    text-transform: uppercase;
+  }
+  .meta span { color: var(--cyan); }
+
+  /* ANCHOR */
+  .anchor {
+    background: linear-gradient(135deg, rgba(5, 7, 9, 0.9), rgba(0, 30, 50, 0.3));
+    border: 1px solid var(--line-hot);
+    border-radius: var(--radius-lg);
+    padding: 28px 24px 24px;
+    position: relative;
+    min-height: 360px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    backdrop-filter: blur(12px);
+    box-shadow: inset 0 0 60px rgba(0, 242, 254, 0.02);
+  }
+  .anchor::before {
+    content: ''; position: absolute;
+    top: 50%; left: 50%;
+    width: 420px; height: 420px;
+    border: 1px solid var(--cyan-faint);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  .anchor::after {
+    content: ''; position: absolute;
+    top: 50%; left: 50%;
+    width: 280px; height: 280px;
+    border: 1px solid var(--cyan-faint);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    animation: rotate-slow 90s linear infinite;
+    border-top-color: var(--cyan-dim);
+  }
+  @keyframes rotate-slow {
+    from { transform: translate(-50%, -50%) rotate(0deg); }
+    to   { transform: translate(-50%, -50%) rotate(360deg); }
+  }
+
+  .anchor-head {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    position: relative; z-index: 2;
+  }
+  .anchor-label {
+    font-family: var(--font-display);
+    font-size: 10px; letter-spacing: 0.4em;
+    color: var(--cyan); text-transform: uppercase;
+  }
+  .anchor-coord {
+    font-family: var(--font-mono);
+    font-size: 10px; color: var(--text-dim); letter-spacing: 0.15em;
+  }
+
+  .anchor-core {
+    flex: 1;
+    display: flex; flex-direction: column;
+    justify-content: center; align-items: center;
+    position: relative; z-index: 2;
+    padding: 20px 0;
+  }
+
+  .room-name {
+    font-family: var(--font-display);
+    font-size: 42px; font-weight: 500;
+    letter-spacing: 0.1em;
+    color: var(--text);
+    text-transform: uppercase;
+    text-shadow: 0 0 30px var(--cyan-glow);
+    margin-bottom: 6px;
+    text-align: center;
+    transition: opacity 0.25s;
+  }
+  .room-sub {
+    font-size: 11px;
+    color: var(--cyan);
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    margin-bottom: 24px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .room-sub::before, .room-sub::after {
+    content: ''; width: 30px; height: 1px; background: var(--cyan-dim);
+  }
+
+  .reactor {
+    width: 72px; height: 72px;
+    border-radius: 50%;
+    background: radial-gradient(circle at center, var(--cyan) 0%, var(--cyan-dim) 40%, transparent 70%);
+    box-shadow: 0 0 40px var(--cyan-glow), inset 0 0 20px rgba(255,255,255,0.1);
+    animation: reactor-pulse 3s ease-in-out infinite;
+    position: relative;
+    margin-bottom: 24px;
+  }
+  .reactor::before {
+    content: ''; position: absolute; inset: 10px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.25);
+  }
+  .reactor::after {
+    content: ''; position: absolute; inset: 22px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.9);
+    box-shadow: 0 0 20px rgba(255,255,255,0.6);
+  }
+  @keyframes reactor-pulse {
+    0%, 100% { box-shadow: 0 0 40px var(--cyan-glow), inset 0 0 20px rgba(255,255,255,0.1); }
+    50%      { box-shadow: 0 0 60px var(--cyan-glow), inset 0 0 25px rgba(255,255,255,0.2); }
+  }
+
+  .room-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+    width: 100%;
+    max-width: 380px;
+  }
+  .stat {
+    text-align: center;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: rgba(0, 242, 254, 0.02);
+    backdrop-filter: blur(4px);
+    transition: border-color 0.3s;
+  }
+  .stat:hover { border-color: var(--cyan-dim); }
+  .stat .v {
+    font-family: var(--font-display);
+    font-size: 20px; font-weight: 500;
+    color: var(--cyan); line-height: 1;
+    margin-bottom: 6px;
+  }
+  .stat .k {
+    font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.25em; text-transform: uppercase;
+  }
+
+  .anchor-foot {
+    position: relative; z-index: 2;
+    display: flex; justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 10px; color: var(--text-dim);
+    letter-spacing: 0.15em;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+  .anchor-foot span { color: var(--cyan); }
+
+  /* FLOOR PLAN */
+  .floorplan-panel {
+    padding: 16px;
+  }
+  .floor-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 12px;
+  }
+  .floor-tab {
+    padding: 5px 16px;
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--font-display);
+    font-size: 9px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.25s;
+  }
+  .floor-tab:hover {
+    border-color: var(--cyan-dim);
+    color: var(--text);
+  }
+  .floor-tab.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0, 242, 254, 0.08);
+    box-shadow: 0 0 10px rgba(0, 242, 254, 0.15);
+  }
+  .floorplan-wrap {
+    background: rgba(0, 5, 10, 0.5);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 0;
+    min-height: 450px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  /* 3D House Scene */
+  .house3d-scene {
+    width: 100%;
+    height: 450px;
+    perspective: 1100px;
+    touch-action: pan-y;
+    background:
+      radial-gradient(ellipse at 50% 42%, rgba(0, 242, 254, 0.05) 0%, transparent 55%),
+      radial-gradient(ellipse at 50% 40%, rgba(0, 25, 45, 0.35), #04070d 72%);
+    position: relative;
+    overflow: hidden;
+    cursor: grab;
+    border-radius: var(--radius);
+  }
+  .house3d-scene::before {
+    content: '';
+    position: absolute; inset: -30%;
+    background-image:
+      linear-gradient(rgba(0, 242, 254, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 242, 254, 0.035) 1px, transparent 1px);
+    background-size: 34px 34px;
+    transform: rotateX(60deg) scale(1.15);
+    transform-origin: 50% 60%;
+    pointer-events: none;
+    -webkit-mask-image: radial-gradient(ellipse at 50% 55%, #000 30%, transparent 72%);
+    mask-image: radial-gradient(ellipse at 50% 55%, #000 30%, transparent 72%);
+  }
+  .house3d-scene::after {
+    content: '';
+    position: absolute; inset: -25%;
+    background: conic-gradient(from 0deg at 50% 55%,
+      transparent 0deg, rgba(0, 242, 254, 0.05) 16deg,
+      rgba(0, 242, 254, 0.012) 32deg, transparent 52deg);
+    animation: radarSweep 16s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes radarSweep { to { transform: rotate(360deg); } }
+  .house3d-scene:active { cursor: grabbing; }
+  .house3d {
+    position: absolute;
+    left: 50%;
+    top: 52%;
+    transform-style: preserve-3d;
+  }
+  .res-iso {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 12px 14px;
+  }
+  .res-iso svg { width: 100%; height: 100%; display: block; }
+  /* 2D isometric: drop the 3D perspective grid/radar so it doesn't clash with the SVG */
+  .iso-scene::before, .iso-scene::after { display: none; }
+  .iso-scene, .iso-scene:active { cursor: default; }
+  .h3d-face {
+    position: absolute;
+    backface-visibility: visible;
+  }
+  .h3d-label {
+    position: absolute;
+    font-family: var(--font-display);
+    letter-spacing: 1.5px;
+    text-align: center;
+    pointer-events: none;
+    text-transform: uppercase;
+    font-weight: 500;
+  }
+  .h3d-occ-dot {
+    position: absolute;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2.5s ease-in-out infinite;
+  }
+  .h3d-occ-dot-dom {
+    width: 9px;
+    height: 9px;
+    box-shadow: 0 0 10px 3px rgba(0,245,160,0.75);
+  }
+  .h3d-glow { box-shadow: 0 0 16px 2px rgba(0,242,254,0.32); }  .h3d-glow-dom {
+    box-shadow: 0 0 18px 3px rgba(0,242,254,0.45);
+    animation: h3dDom 2.4s ease-in-out infinite;
+  }
+  @keyframes h3dDom {
+    0%, 100% { box-shadow: 0 0 16px 3px rgba(0,242,254,0.40); }
+    50%      { box-shadow: 0 0 32px 7px rgba(0,242,254,0.72); }
+  }
+  .h3d-platform {
+    box-shadow: 0 0 30px 2px rgba(0,242,254,0.16);
+    pointer-events: none;
+  }
+  .h3d-floor-badge {
+    position: absolute;
+    font-family: var(--font-display);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    color: rgba(120,225,255,0.85);
+    text-shadow: 0 0 10px rgba(0,242,254,0.6);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  .h3d-lit {
+    box-shadow: 0 0 18px 2px rgba(255,184,72,0.30);
+  }
+  .h3d-lamp {
+    position: absolute;
+    width: 17px;
+    height: 17px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: rgba(0,242,254,0.35);
+    background: rgba(6,14,22,0.55);
+    border: 1px solid rgba(0,242,254,0.22);
+    cursor: pointer;
+    pointer-events: auto;
+    transition: transform 0.12s ease, box-shadow 0.2s ease, color 0.2s ease;
+  }
+  .h3d-lamp:hover {
+    color: #fff;
+    border-color: rgba(255,200,110,0.7);
+    transform: scale(1.18);
+  }
+  .h3d-lamp.on {
+    color: #ffce6b;
+    background: rgba(58,40,12,0.6);
+    border-color: rgba(255,196,96,0.75);
+    box-shadow: 0 0 13px 2px rgba(255,184,72,0.6);
+  }
+  .house3d-hud-tl, .house3d-hud-tr {
+    position: absolute;
+    color: rgba(0,242,254,0.4);
+    font-family: var(--font-mono);
+    font-size: 8px;
+    letter-spacing: 2px;
+    pointer-events: none;
+  }
+  .house3d-hud-tl { top: 8px; left: 12px; }
+  .house3d-hud-tr { top: 8px; right: 12px; }
+  .fp-svg {
+    width: 100%;
+    max-height: 240px;
+  }
+  .fp-room { cursor: pointer; transition: opacity 0.3s; }
+  .fp-room:hover rect { stroke-width: 2 !important; }
+
+  /* Dominant room info bar */
+  .dom-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+    gap: 16px;
+  }
+  .dom-left { flex: 1; }
+  .dom-name-wrap { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; flex-wrap: wrap; }   /* jh-room-pin */
+  .dom-pinned { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; color: var(--text-dim); background: transparent;
+    border: 1px solid var(--line); border-radius: 3px; padding: 1px 6px; cursor: pointer; opacity: 0.8; }
+  .dom-pinned:hover { opacity: 1; }
+  .dom-pinned[hidden] { display: none; }
+  .dom-name {
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    color: var(--cyan);
+    text-transform: uppercase;
+    text-shadow: 0 0 12px var(--cyan-glow);
+  }
+  .dom-sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.12em;
+    margin-top: 2px;
+  }
+  .dom-gauges {
+    display: flex;
+    gap: 14px;
+  }
+  .rgauge {
+    position: relative;
+    width: 64px;
+    text-align: center;
+    transition: opacity 0.3s ease;
+  }
+  .rgauge.dim { opacity: 0.45; }
+  .rgauge-svg { width: 64px; height: 64px; display: block; }
+  .rgauge-track {
+    fill: none;
+    stroke: rgba(0, 242, 254, 0.12);
+    stroke-width: 5;
+  }
+  .rgauge-fill {
+    fill: none;
+    stroke-width: 5;
+    stroke-linecap: round;
+    transform: rotate(-90deg);
+    transform-origin: 50% 50%;
+    transition: stroke-dashoffset 0.8s cubic-bezier(0.22, 1, 0.36, 1), stroke 0.6s ease;
+    filter: drop-shadow(0 0 4px currentColor);
+  }
+  .rgauge-val {
+    position: absolute;
+    top: 26px;
+    left: 0;
+    width: 64px;
+    font-family: var(--font-display);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1;
+    text-shadow: 0 0 8px var(--cyan-glow);
+  }
+  .rgauge-lbl {
+    margin-top: 2px;
+    font-size: 8px;
+    color: var(--text-dim);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+
+  /* AREAS */
+  .areas {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+  }
+  .area {
+    padding: 12px 10px 10px;
+    background: var(--bg-panel);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+    position: relative;
+    cursor: pointer;
+    transition: transform 0.2s, border-color 0.3s, box-shadow 0.3s;
+    min-height: 88px;
+  }
+  .area:focus-visible { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(0,242,254,0.35); }
+  .area:hover {
+    border-color: rgba(0, 242, 254, 0.4);
+    transform: translateY(-2px);
+  }
+  .area.active {
+    border-color: var(--cyan);
+    background: rgba(0, 242, 254, 0.03);
+    box-shadow: inset 0 0 15px rgba(0, 242, 254, 0.05), 0 0 18px rgba(0, 242, 254, 0.08);
+  }
+  .area.active::before {
+    content: ''; position: absolute;
+    top: 6px; right: 6px;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 2.6s ease-in-out infinite;
+  }
+
+  /* Capability row (icons above, labels below) */
+  .area-caps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: flex-start;
+    min-height: 42px;
+  }
+  .cap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    min-width: 26px;
+  }
+  .cap-icon {
+    width: 18px; height: 18px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-dim);
+    transition: color 0.25s;
+  }
+  .cap-icon svg {
+    width: 18px; height: 18px;
+    fill: currentColor;
+  }
+  .cap-lbl {
+    font-family: var(--font-mono);
+    font-size: 8px;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    line-height: 1;
+  }
+  .cap-empty .cap-lbl { opacity: 0.4; }
+  .area.active .cap-icon { color: var(--cyan); }
+  .area.active .cap-lbl  { color: var(--cyan-dim); }
+
+  .area-name {
+    font-size: 12px; color: var(--text);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    font-weight: 500;
+    padding-top: 4px;
+    border-top: 1px solid var(--line);
+    margin-top: auto;
+  }
+  .area.active .area-name { color: var(--cyan); border-top-color: var(--cyan-faint); }
+  .area-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin-top: auto;
+    border-top: 1px solid var(--line);
+    padding-top: 4px;
+  }
+  .area-foot .area-name {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 0;
+    /* Shrink/ellipsize a long room name instead of shoving the light pill
+       past the card edge into the next card (#188). Short names are
+       unaffected; the full name stays available via the title tooltip. */
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .area.active .area-foot { border-top-color: var(--cyan-faint); }
+  .area-light {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+    letter-spacing: 0.08em;
+    padding: 3px 7px;
+    border-radius: 999px;
+    cursor: pointer;
+    background: transparent;
+    border: 1px solid rgba(0,242,254,0.22);
+    color: var(--text-dim);
+    transition: color 0.15s, border-color 0.15s, box-shadow 0.2s;
+    flex-shrink: 0;
+  }
+  .area-light .al-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: rgba(0,242,254,0.3);
+    transition: background 0.15s, box-shadow 0.2s;
+  }
+  .area-light:hover { color: #fff; border-color: rgba(255,200,110,0.6); }
+  .area-light.on {
+    color: #ffce6b;
+    border-color: rgba(255,196,96,0.7);
+    box-shadow: 0 0 10px rgba(255,184,72,0.4);
+  }
+  .area-light.on .al-dot {
+    background: #ffce6b;
+    box-shadow: 0 0 8px 1px rgba(255,184,72,0.8);
+  }
+  .area-light.static { cursor: default; }
+  .area-light.static:hover { color: var(--text-dim); border-color: rgba(0,242,254,0.22); }
+  .area-light.static.on:hover { color: #ffce6b; border-color: rgba(255,196,96,0.7); }
+  .h3d-lamp.static { cursor: default; }
+  .area.bedroom .area-name::before { content: '◐ '; color: var(--amber); }
+
+  /* AREA READINGS + SPARKLINES (v7.94.0) */
+  .area-readings { display: flex; gap: 10px; flex-wrap: wrap; }
+  .area-reading {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-dim);
+  }
+  .spark { width: 44px; height: 14px; flex-shrink: 0; opacity: 0.85; }
+
+  /* AREA DETAIL DRILL-DOWN (v7.94.0) */
+  .area-detail-overlay {
+    position: fixed; inset: 0; z-index: 40;
+    background: rgba(2, 6, 10, 0.75);
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .area-detail-card {
+    width: 100%; max-width: 420px;
+    background: var(--bg-panel);
+    border: 1px solid var(--line-hot);
+    border-radius: 12px;
+    box-shadow: 0 0 40px rgba(0,242,254,0.15);
+    padding: 16px 18px 18px;
+  }
+  .area-detail-head {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  }
+  .area-detail-title {
+    flex: 1; font-family: var(--font-display); font-size: 15px;
+    letter-spacing: 0.08em; color: var(--cyan); text-transform: uppercase;
+  }
+  .area-detail-status {
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.1em;
+    color: var(--text-dim);
+  }
+  .area-detail-status.active { color: var(--green); }
+  .area-detail-close {
+    background: transparent; border: 1px solid var(--line); color: var(--text-dim);
+    border-radius: 4px; width: 22px; height: 22px; cursor: pointer; line-height: 1;
+  }
+  .area-detail-close:hover { border-color: var(--red); color: var(--red); }
+  .area-detail-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;
+  }
+  .area-detail-stat {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .ads-label {
+    font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.12em;
+    color: var(--text-dim); text-transform: uppercase;
+  }
+  .ads-value { font-size: 20px; color: var(--text); font-weight: 500; }
+  .ads-spark { width: 100%; }
+  .ads-spark .spark { width: 100%; height: 24px; }
+  .area-detail-meta { display: flex; flex-direction: column; gap: 0; }
+  .adm-row {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 7px 0; border-top: 1px dashed var(--line);
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-dim);
+  }
+  .adm-row:first-child { border-top: none; }
+  .adm-row span:last-child { color: var(--text); }
+  .area-light.adl { margin: 0; }
+
+  /* ROOM LIGHTS popover — per-light list + toggles (#234) */
+  .area-lights-overlay {
+    position: fixed; inset: 0; z-index: 42;
+    background: rgba(2, 6, 10, 0.75);
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .area-lights-card {
+    width: 100%; max-width: 380px;
+    max-height: 70vh; display: flex; flex-direction: column;
+    background: var(--bg-panel);
+    border: 1px solid var(--line-hot);
+    border-radius: 12px;
+    box-shadow: 0 0 40px rgba(255,196,96,0.15);
+    padding: 16px 18px 18px;
+  }
+  .alp-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .alp-title {
+    flex: 1; font-family: var(--font-display); font-size: 15px;
+    letter-spacing: 0.08em; color: #ffce6b; text-transform: uppercase;
+  }
+  .alp-close {
+    background: transparent; border: 1px solid var(--line); color: var(--text-dim);
+    border-radius: 4px; width: 22px; height: 22px; cursor: pointer; line-height: 1;
+  }
+  .alp-close:hover { border-color: var(--red); color: var(--red); }
+  .alp-list { overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .alp-loading {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    padding: 14px 2px; text-align: center;
+  }
+  .alp-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 11px; cursor: pointer; text-align: left;
+    background: transparent; border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text-dim); font-family: var(--font-mono); font-size: 12px;
+  }
+  .alp-row:hover { border-color: rgba(255,200,110,0.6); color: #fff; }
+  .alp-row.alp-manual { cursor: default; opacity: 0.7; border-style: dashed; }   /* jh-r22-lights (step 164) */
+  .alp-row.alp-manual:hover { border-color: var(--line); color: var(--text-dim); }
+  .alp-dot {
+    width: 9px; height: 9px; border-radius: 50%; flex: none;
+    background: var(--text-dim); box-shadow: none;
+  }
+  .alp-row.on { color: #ffce6b; border-color: rgba(255,196,96,0.5); }
+  .alp-row.on .alp-dot { background: #ffce6b; box-shadow: 0 0 8px rgba(255,196,96,0.8); }
+  .alp-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .alp-state { font-size: 9px; letter-spacing: 0.1em; }
+  .alp-foot { margin-top: 12px; display: flex; justify-content: flex-end; }
+  .alp-all-off {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line); color: var(--text-dim);
+    text-transform: uppercase;
+  }
+  .alp-all-off:hover:not([disabled]) { border-color: var(--red); color: var(--red); }
+  .alp-all-off[disabled] { opacity: 0.4; cursor: default; }
+
+  /* CAMERA DIAGNOSTICS (v7.94.0) */
+  .cam-diag-btn {
+    font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.14em;
+    padding: 2px 8px; margin-left: 10px; border-radius: 3px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line); color: var(--text-dim);
+  }
+  .cam-diag-btn:hover { border-color: var(--cyan-dim); color: var(--cyan); }
+  .cam-diag-btn:disabled { opacity: 0.5; cursor: wait; }
+  .cam-diag {
+    position: absolute; inset: 8px; z-index: 5; overflow: auto;
+    background: rgba(2, 6, 10, 0.92); border: 1px solid var(--line-hot);
+    border-radius: 6px; padding: 10px 12px;
+    font-family: var(--font-mono); font-size: 9.5px; line-height: 1.7;
+    color: var(--text); white-space: pre-wrap; word-break: break-word;
+  }
+  .cam-diag-line { min-height: 14px; }
+  .cam-diag-ok { color: var(--green); }
+  .cam-diag-bad { color: #ff8a9d; }
+  .cam-diag-verdict { margin-top: 6px; color: var(--cyan); }
+  .cam-diag-hint { margin-top: 6px; color: var(--text-dim); font-size: 8.5px; }
+  .cam-loc-chip.active { border-color: var(--cyan); color: var(--cyan); background: rgba(0, 242, 254, 0.08); }
+  .camset-list { display: flex; flex-direction: column; gap: 10px; }
+  .camset-row { border-top: 1px dashed var(--line); padding-top: 10px; }
+  .camset-row:first-child { border-top: none; padding-top: 0; }
+  .camset-id { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); letter-spacing: 0.04em; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+  .camset-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); letter-spacing: 0.04em; }
+  .camset-bulk { display: flex; gap: 6px; }
+  .cam-enable-toggle { flex-shrink: 0; min-width: 34px; padding: 2px 8px; border-radius: var(--radius); font-family: var(--font-mono); font-size: 9px; font-weight: 600; letter-spacing: 0.08em; cursor: pointer; }
+  .cam-enable-toggle.on { background: var(--cyan-faint); color: var(--cyan); border: 1px solid var(--cyan-dim); }
+  .cam-enable-toggle.off { background: rgba(120,140,160,0.08); color: var(--text-faint); border: 1px solid var(--line); }
+  .cam-enable-toggle:hover { filter: brightness(1.3); }
+  .camset-ent { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .camset-row.cam-off { opacity: 0.5; }
+  .fp-openings { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .op-headr { font-family: var(--font-mono); font-size: 10px; color: var(--cyan); letter-spacing: 0.06em; margin-bottom: 8px; }
+  .op-hint { color: var(--text-dim); margin-left: 8px; letter-spacing: 0.02em; }
+  .op-add { display: flex; gap: 6px; margin-bottom: 10px; }
+  .op-add .ctrl { padding: 5px 10px; font-size: 9px; }
+  .op-row { display: flex; align-items: center; gap: 6px; padding: 5px 0; border-top: 1px solid rgba(0,242,254,0.06); flex-wrap: wrap; }
+  .op-type { flex-shrink: 0; min-width: 66px; text-align: center; padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.06em; }
+  .op-window { background: rgba(0,242,254,0.12); color: var(--cyan); border: 1px solid var(--cyan-dim); }
+  .op-door { background: rgba(255,170,40,0.14); color: #ffb84d; border: 1px solid rgba(255,170,40,0.4); }
+  .op-door.op-int { background: rgba(120,140,160,0.1); color: var(--text-faint); border: 1px solid var(--line); }
+  .op-door.op-cellar { background: rgba(201,138,42,0.14); color: #e0a94a; border: 1px solid rgba(201,138,42,0.4); }
+  .op-dormer { background: rgba(176,106,255,0.14); color: #c79bff; border: 1px solid rgba(176,106,255,0.4); }
+  .op-door.op-cased { background: rgba(120,185,215,0.12); color: #9fd0e8; border: 1px solid rgba(120,185,215,0.4); }
+  .op-cased-tag { font-size: 9px; color: var(--text-faint); font-style: italic; opacity: 0.85; }
+  .fp-3d-preview { height: 260px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: radial-gradient(ellipse at 50% 40%, rgba(0,40,60,0.4), rgba(0,5,10,0.85)); overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .fp-3d-preview svg { max-height: 100%; max-width: 100%; }
+  .fp-3d-empty { color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; }
+  .op-room { max-width: 120px; }
+  .op-field { background: var(--bg); border: 1px solid var(--line); color: var(--cyan); border-radius: 4px; padding: 2px 5px; font-family: var(--font-mono); font-size: 10px; }
+  .fp-cameras { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .cam-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 5px 0; }
+  .cam-tag { flex-shrink: 0; min-width: 52px; text-align: center; padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.06em; background: rgba(255,90,90,0.14); color: #ff8a8a; border: 1px solid rgba(255,90,90,0.4); }
+  .cam-tag.out { background: rgba(255,170,60,0.14); color: #ffbb5c; border-color: rgba(255,170,60,0.4); }
+  .cam-field { background: var(--bg); border: 1px solid var(--line); color: var(--cyan); border-radius: 4px; padding: 2px 5px; font-family: var(--font-mono); font-size: 10px; }
+  .cam-num { width: 46px; }
+  .cam-lbl { font-size: 9px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 4px; }
+  .cam-io { font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.06em; padding: 3px 8px; border-radius: 4px; cursor: pointer; background: rgba(255,90,90,0.1); color: #ff8a8a; border: 1px solid rgba(255,90,90,0.35); }
+  .cam-io.out { background: rgba(255,170,60,0.1); color: #ffbb5c; border-color: rgba(255,170,60,0.35); }
+  .cam-item { margin: 5px 0; }
+  .cam-cov { font-size: 9px; color: var(--text-dim); margin: 2px 0 0 56px; letter-spacing: 0.02em; }
+  .cam-cov-room { color: var(--text-faint); }
+  .cam-cov-room.full { color: var(--cyan); }
+  .cam-cov-room.zone { color: #00f5a0; }
+  .cam-cov-none { color: #b06a6a; opacity: 0.8; font-style: italic; }
+  .cam-cov-llm { font-size: 9px; margin: 2px 0 0 56px; line-height: 1.45; }
+  .cam-cov-conf { color: #34d399; font-family: var(--font-mono); letter-spacing: 0.04em; }
+  .cam-cov-reason { color: var(--text-dim); font-style: italic; }
+  .op-pos { padding: 0; }
+  .op-ent { flex: 1; min-width: 130px; }
+  .op-del { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 14px; padding: 0 4px; }
+  .op-del:hover { color: #ff5a5a; }
+  .op-empty { color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; padding: 6px 0; }
+  .op-marker { transition: all 0.12s ease; }
+  .op-marker.op-glow { opacity: 1; stroke: #ffffff; stroke-width: 2.5; filter: drop-shadow(0 0 6px #ffffff); }
+  .op-row:hover { background: rgba(0,242,254,0.04); }
+  .camset-ov { color: var(--cyan-dim); }
+  .camset-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .camset-name { width: 200px; font-size: 11px; }
+  .camset-chips { display: flex; gap: 6px; }
+
+  /* LOG */
+  .log {
+    display: flex; flex-direction: column; gap: 1px;
+    max-height: 480px;
+    overflow-y: auto;
+    overflow-x: hidden;   /* jh-feed (step 149): long names wrap, never a horizontal scroll bar */
+    scrollbar-width: thin; scrollbar-color: transparent transparent;   /* thin, shown on hover or while scrolling */
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  }
+  .log:hover, .log.jh-scrolling { scrollbar-color: var(--cyan-dim) transparent; }
+  .log::-webkit-scrollbar { width: 4px; height: 0; }
+  .log::-webkit-scrollbar-track { background: transparent; }
+  .log::-webkit-scrollbar-thumb { background: transparent; border-radius: 2px; }
+  .log:hover::-webkit-scrollbar-thumb, .log.jh-scrolling::-webkit-scrollbar-thumb { background: var(--cyan-dim); }
+  .evt {
+    padding: 10px 12px;
+    border-left: 2px solid var(--cyan);
+    border-radius: 0 6px 6px 0;
+    background: rgba(255, 255, 255, 0.02);
+    display: grid; grid-template-columns: 52px 16px minmax(0, 1fr);   /* jh-feed (step 149): the text column can shrink */
+    gap: 8px; font-size: 12px;
+    animation: evt-in 0.5s ease-out;
+    transition: background 0.2s, border-color 0.2s;
+    margin-bottom: 2px;
+  }
+  .evt:hover { background: rgba(0, 242, 254, 0.04); }
+  @keyframes evt-in {
+    from { opacity: 0; transform: translateX(8px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+  .evt .ts {
+    font-family: var(--font-mono);
+    color: var(--text-dim);
+    font-size: 10px; letter-spacing: 0.1em;
+  }
+  .evt .msg { color: var(--text); line-height: 1.4; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }   /* jh-feed (step 149) */
+  .evt-icon { color: var(--cyan-dim); align-self: start; margin-top: 2px; opacity: 0.9; }
+  .evt.critical .evt-icon { color: var(--red); opacity: 1; }
+  .evt.high .evt-icon { color: var(--amber); opacity: 1; }
+  .evt.medium .evt-icon { color: var(--cyan); }
+  .evt .msg b {
+    color: var(--cyan); font-weight: 500; letter-spacing: 0.08em;
+  }
+  .evt.critical { border-left-color: var(--red); background: rgba(255, 59, 59, 0.04); }
+  .evt.critical .msg b { color: var(--red); }
+  .evt.high     { border-left-color: var(--amber); background: rgba(255, 157, 46, 0.04); }
+  .evt.high .msg b { color: var(--amber); }
+  .evt.medium   { border-left-color: var(--cyan-dim); }
+  .evt.low      { border-left-color: var(--text-faint); opacity: 0.75; }
+  .evt.muted    { border-left-color: var(--text-faint); opacity: 0.5; }
+  .evt.muted .msg { font-style: italic; }
+
+  /* CONTROLS */
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 8px;
+  }
+
+  /* LOGS TAB */
+  .logs-tab { padding: 0; }
+  .log-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 0 12px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .log-filter {
+    padding: 4px 12px;
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .log-filter:hover {
+    border-color: var(--cyan-dim);
+    color: var(--text);
+    background: rgba(0, 242, 254, 0.04);
+  }
+  .log-search {
+    padding: 4px 12px;
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    background: rgba(0, 242, 254, 0.03);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    width: 140px;
+    outline: none;
+  }
+  .log-search::placeholder { color: var(--text-faint); letter-spacing: 0.1em; }
+  .log-search:focus { border-color: var(--cyan-dim); background: rgba(0, 242, 254, 0.06); }
+  .activity-search { width: 100%; margin-bottom: 8px; box-sizing: border-box; }
+  .log-count {
+    font-family: var(--font-mono); font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.08em; margin: -6px 0 10px;
+  }
+  .log-filter.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0, 242, 254, 0.1);
+    box-shadow: 0 0 8px rgba(0, 242, 254, 0.15);
+  }
+  .log-entries {
+    max-height: 65vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .log-entries::-webkit-scrollbar { width: 3px; }
+  .log-entries::-webkit-scrollbar-track { background: var(--bg-elev); border-radius: 3px; }
+  .log-entries::-webkit-scrollbar-thumb { background: var(--cyan-dim); border-radius: 3px; }
+  .log-entry {
+    display: grid;
+    grid-template-columns: 60px 70px 1fr;
+    gap: 10px;
+    padding: 6px 10px;
+    background: var(--bg-elev);
+    border-radius: var(--radius);
+    border-left: 2px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    transition: background 0.2s;
+    animation: evt-in 0.3s ease-out;
+  }
+  .log-entry:hover { background: rgba(0, 242, 254, 0.02); }
+  .log-entry-error {
+    border-left-color: var(--red) !important;
+    background: rgba(255, 59, 59, 0.04) !important;
+  }
+  .log-ts {
+    color: var(--text-dim);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+  }
+  .log-cat {
+    font-weight: 600;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+  }
+  .log-msg {
+    color: var(--text);
+    word-break: break-word;
+  }
+  .log-loading {
+    color: var(--cyan-dim);
+    padding: 16px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+  }
+
+  /* TAB BAR */
+  .tab-bar {
+    display: flex;
+    gap: 2px;
+    border-bottom: 1px solid var(--line);
+    padding: 0 4px;
+  }
+  .tab {
+    padding: 10px 24px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: var(--radius) var(--radius) 0 0;
+    color: var(--text-dim);
+    font-family: var(--font-display);
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.25s;
+  }
+  .tab:hover {
+    color: var(--text);
+    background: rgba(0, 242, 254, 0.04);
+  }
+  .tab.active {
+    color: var(--cyan);
+    border-bottom-color: var(--cyan);
+    background: rgba(0, 242, 254, 0.06);
+    text-shadow: 0 0 8px var(--cyan-glow);
+  }
+
+  /* SETTINGS PAGE */
+  .settings-page {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .settings-subnav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 12px;
+  }
+  .settings-subnav-btn {
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: var(--font-display);
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .settings-subnav-btn:hover { color: var(--text); border-color: var(--cyan-dim); }
+  .settings-subnav-btn.active {
+    color: var(--bg);
+    background: var(--cyan);
+    border-color: var(--cyan);
+  }
+  .settings-grid {
+    /* CSS grid (not multi-column): multicol + display:none section toggling
+       miscalculates column balancing on desktop/WebKit and drops cards. Grid
+       removes hidden items from flow cleanly, so sub-nav switching is reliable. */
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  .settings-grid > * {
+    min-width: 0;
+  }
+  .ctrl {
+    padding: 12px 16px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    font-family: var(--font-body);
+    font-size: 12px; font-weight: 500;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.25s;
+    text-align: center;
+  }
+  .ctrl:hover {
+    border-color: var(--cyan); color: var(--cyan);
+    background: rgba(0, 242, 254, 0.06);
+    box-shadow: 0 0 15px var(--cyan-glow);
+    text-shadow: 0 0 8px var(--cyan-glow);
+    transform: translateY(-1px);
+  }
+  .ctrl.primary { border-color: var(--cyan-dim); color: var(--cyan); }
+  .ctrl.warn    { border-color: var(--amber); color: var(--amber); }
+  .ctrl.warn:hover { background: rgba(255, 157, 46, 0.05); box-shadow: 0 0 15px rgba(255, 157, 46, 0.2); }
+
+  /* SETTINGS TOGGLES */
+  .toggle-list { display: flex; flex-direction: column; gap: 8px; }
+  .toggle-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    gap: 2px 12px;
+    transition: border-color 0.2s;
+  }
+  .toggle-row:hover { border-color: var(--line-hot); }
+  .toggle-label {
+    font-size: 12px; font-weight: 500;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text);
+    grid-column: 1; grid-row: 1;
+  }
+  .toggle-desc {
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    grid-column: 1; grid-row: 2;
+  }
+  .toggle-btn {
+    grid-column: 2; grid-row: 1 / 3;
+    padding: 6px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    font-family: var(--font-mono);
+    font-size: 11px; font-weight: 500;
+    letter-spacing: 0.2em;
+    cursor: pointer;
+    transition: all 0.25s;
+    min-width: 52px;
+    text-align: center;
+  }
+  .toggle-btn.on {
+    border-color: var(--green);
+    color: var(--green);
+    background: rgba(0, 245, 160, 0.08);
+    box-shadow: 0 0 10px rgba(0, 245, 160, 0.1);
+  }
+  .toggle-btn.off {
+    border-color: var(--text-faint);
+    color: var(--text-dim);
+  }
+  .toggle-btn:hover {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0, 242, 254, 0.06);
+  }
+
+  /* Residence / Home config card */
+  .home-cfg { display: flex; flex-direction: column; gap: 8px; }
+  .cfg-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    transition: border-color 0.2s;
+  }
+  .cfg-row:hover { border-color: var(--cyan-dim); }
+  .cfg-row > label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+  .cfg-field {
+    grid-column: 2;
+    min-width: 140px;
+    padding: 6px 10px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--cyan);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .cfg-field:hover, .cfg-field:focus { border-color: var(--cyan); outline: none; }
+  .cfg-num { width: 92px; min-width: 0; text-align: right; cursor: text; }
+  /* jh-person-address 2026-11-14 */
+  .jh-pron-sels { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
+  .jh-pron-sels .cfg-field { width: auto; min-width: 0; }
+  /* jh-quick-actions 2026-11-14 */
+  .jh-qa-rows { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .settings-page .cfg-row.jh-qa-row, .cfg-row.jh-qa-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto; gap: 6px; padding: 6px 8px; }
+  .jh-qa-row > .cfg-field { grid-column: auto; min-width: 0; width: 100%; box-sizing: border-box; cursor: text; letter-spacing: 0; }
+  .jh-qa-row > .jh-qa-data { grid-column: 1 / -1; grid-row: 2; }   /* label, action and buttons on one line, data below */
+  .jh-qa-btns { display: flex; gap: 4px; grid-column: 3; grid-row: 1; }
+  .jh-qa-btns .ctrl, .jh-qa-actions .ctrl { padding: 6px 10px; letter-spacing: 0.08em; }
+  .jh-qa-btns .ctrl:disabled, .jh-qa-actions .ctrl:disabled { opacity: 0.35; cursor: default; transform: none; }
+  .jh-qa-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .jh-qa-msg { min-height: 14px; margin-top: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; }
+  .jh-qa-msg.err { color: var(--amber); }
+  .jh-qa-none { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); padding: 6px 2px; }
+  /* jh-optional: Settings > Optional pages */
+  .jh-opt-row { border-top: 1px solid var(--line, rgba(255,255,255,0.08)); padding: 8px 0; }
+  .jh-opt-row:first-of-type { border-top: none; }
+  .jh-opt-state { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+  .jh-opt-where { overflow-wrap: anywhere; min-width: 0; }
+  .jh-opt-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .jh-opt-btns .ctrl { padding: 6px 10px; letter-spacing: 0.08em; }
+  .jh-opt-btns .ctrl:disabled { opacity: 0.35; cursor: default; }
+  .jh-opt-days .cfg-field { width: 90px; max-width: 100%; }
+  .jh-opt-warn { color: var(--amber); }
+  .jh-watch-body { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
+  .jh-watch-row { border-top: 1px solid var(--line, rgba(255,255,255,0.08)); padding-top: 6px; font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+  .jh-watch-top { display: flex; flex-wrap: wrap; gap: 4px 10px; font-family: var(--font-mono); font-size: 11px; }
+  .jh-watch-q { margin-top: 4px; font-weight: 600; white-space: pre-wrap; }
+  .jh-watch-a { opacity: 0.85; white-space: pre-wrap; }
+  #jh-opt-card .cfg-row > label { min-width: 0; overflow-wrap: anywhere; }
+  @media (max-width: 600px) {
+    .settings-page .cfg-row.jh-qa-row, .cfg-row.jh-qa-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .jh-qa-btns { grid-column: 1 / -1; grid-row: 3; justify-content: flex-end; }
+    .jh-qa-actions .ctrl { flex: 1 1 auto; }
+  }
+  .cfg-text { width: 100%; min-width: 0; cursor: text; letter-spacing: 0; }
+  .cfg-row:has(.cfg-text) { grid-template-columns: 1fr; gap: 5px; }
+  .cfg-row:has(.cfg-text) > label { grid-column: 1; }
+  .cfg-row:has(.cfg-text) > .cfg-text { grid-column: 1; }
+  .home-cfg-hint {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--text-faint);
+    padding: 4px 4px 0;
+  }
+  .notify-select {
+    grid-column: 2; grid-row: 1 / 3;
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    color: var(--cyan);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    min-width: 120px;
+    max-width: 180px;
+    transition: border-color 0.2s;
+  }
+  .notify-select:hover { border-color: var(--cyan-dim); }
+  .notify-select option {
+    background: var(--bg-panel);
+    color: var(--text);
+  }
+
+  /* AI MODELS */
+  .model-list { display: flex; flex-direction: column; gap: 8px; }
+  .model-row {
+    display: grid;
+    grid-template-columns: 90px 1fr 1.4fr;
+    grid-auto-rows: auto;
+    gap: 6px;
+    align-items: center;
+  }
+  .model-hint { grid-column: 1 / -1; font-family: var(--font-mono); font-size: 10px;
+    line-height: 1.4; color: var(--text-dim); margin-top: 2px; opacity: 0.85; }
+  .model-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+  .model-row .prov-select,
+  .model-row .model-select {
+    grid-column: auto; grid-row: auto;
+    min-width: 0; max-width: none; width: 100%;
+  }
+  .model-custom {
+    grid-column: 2 / 4;
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    color: var(--cyan);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .model-custom:focus { outline: none; border-color: var(--cyan-dim); }
+  .model-hint {
+    margin-top: 8px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    opacity: 0.7;
+  }
+  .model-thinking-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-transform: uppercase;
+  }
+  .model-thinking-row .toggle-btn { font-size: 9px; padding: 4px 10px; }
+  .model-thinking-tokens {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    text-transform: none;
+    opacity: 0.9;
+  }
+  .model-thinking-tokens label { font-size: 9px; color: var(--text-dim); }
+  .model-thinking-tokens .cfg-num { width: 76px; }
+
+  /* APPLIANCES / ENERGY PROFILE */
+  .pl-entities { padding: 10px 14px 14px; border-top: 1px solid var(--line); }
+  .pl-ehead { font-family: var(--font-mono); font-size: 10px; color: var(--cyan); letter-spacing: 0.06em; margin-bottom: 8px; }
+  .pl-hint { color: var(--text-dim); margin-left: 6px; letter-spacing: 0.02em; }
+  .pl-add { display: flex; gap: 8px; margin-bottom: 10px; }
+  .pl-add .op-field, .pl-add .pl-input { flex: 1; min-width: 0; }
+  .pl-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pl-chip { display: inline-flex; align-items: center; gap: 4px; background: rgba(0,242,254,0.1); border: 1px solid var(--cyan-dim); color: var(--cyan); border-radius: 12px; padding: 3px 6px 3px 10px; font-family: var(--font-mono); font-size: 10px; }
+  .pl-del { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 13px; padding: 0 2px; }
+  .pl-del:hover { color: #ff5a5a; }
+  .pl-empty { color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; }
+  .appliance-intro {
+    font-family: var(--font-mono); font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.04em; opacity: 0.8; margin-bottom: 8px; line-height: 1.5;
+  }
+  .appliance-list { display: flex; flex-direction: column; gap: 8px; }
+  .appliance-empty {
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-dim);
+    opacity: 0.7; padding: 6px 2px;
+  }
+  .appliance-row {
+    border: 1px solid rgba(0, 242, 254, 0.12);
+    border-radius: var(--radius);
+    background: rgba(0, 242, 254, 0.02);
+    padding: 7px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .ar-line1 { display: flex; gap: 6px; align-items: center; }
+  .ar-line1 .appliance-name { flex: 1 1 auto; min-width: 0; }
+  .ar-line2 {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) 56px;
+    gap: 6px;
+    align-items: center;
+  }
+  .appliance-row input, .appliance-row select {
+    background: rgba(0, 242, 254, 0.04);
+    border: 1px solid rgba(0, 242, 254, 0.2);
+    color: var(--text); font-family: var(--font-mono); font-size: 10px;
+    padding: 5px 6px; border-radius: 4px; min-width: 0; width: 100%;
+    box-sizing: border-box;
+  }
+  .appliance-row input:focus, .appliance-row select:focus {
+    outline: none; border-color: var(--cyan);
+  }
+  .appliance-learned {
+    font-family: var(--font-mono); font-size: 8px; color: var(--cyan);
+    opacity: 0.75; letter-spacing: 0.05em;
+  }
+  .appliance-remove {
+    flex: 0 0 auto;
+    width: 26px; height: 26px;
+    padding: 0; font-size: 11px; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent; border: 1px solid rgba(255, 90, 90, 0.3);
+    color: #ff8a8a; border-radius: 4px; cursor: pointer;
+  }
+  .appliance-remove:hover { border-color: #ff5a5a; background: rgba(255, 90, 90, 0.08); }
+  .appliance-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .appliance-actions .btn.primary {
+    border-color: var(--cyan); color: var(--cyan);
+  }
+  .appliance-unknown {
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    font-family: var(--font-mono); font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.04em; cursor: pointer;
+  }
+  .appliance-unknown input { accent-color: var(--cyan); flex: 0 0 auto; }
+
+  .rule-list { display: flex; flex-direction: column; gap: 4px; }
+  .rule-row {
+    display: grid; grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto;
+    padding: 8px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    gap: 2px 10px;
+    transition: border-color 0.2s;
+  }
+  .rule-row:hover { border-color: var(--line-hot); }
+  .rule-name {
+    font-size: 11px; font-weight: 500;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--text); grid-column: 1; grid-row: 1;
+  }
+  .rule-desc {
+    font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.08em; grid-column: 1; grid-row: 2;
+  }
+  .rule-toggle {
+    grid-column: 2; grid-row: 1 / 3;
+    padding: 4px 10px;
+    font-size: 10px;
+    min-width: 42px;
+    border-radius: var(--radius);
+  }
+
+  /* PAIRING ROWS */
+  .pairing-list { display: flex; flex-direction: column; gap: 6px; }
+  .pairing-row {
+    display: grid; grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 8px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    gap: 8px;
+    transition: border-color 0.2s;
+  }
+  .pairing-row:hover { border-color: var(--line-hot); }
+  .pairing-label {
+    font-size: 11px; font-weight: 500;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--text);
+  }
+  .sat-pair-select {
+    min-width: 160px; max-width: 220px;
+  }
+
+  .diag-row {
+    display: grid; grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--bg-elev);
+    border: 1px dashed var(--line);
+    border-radius: var(--radius);
+    margin-bottom: 6px; gap: 12px;
+    transition: border-color 0.2s;
+  }
+  .diag-row:hover { border-color: var(--line-hot); }
+
+  /* SUGGESTIONS */
+  .sug-tab-intro { font-family: var(--font-mono); font-size: 11px; line-height: 1.5;
+    color: var(--text-dim); margin: 4px 0 12px; max-width: 640px; }
+  .sug-empty { text-align: center; padding: 8px 0 4px; }
+  .sug-empty-body { display: flex; flex-direction: column; align-items: center;
+    gap: 6px; padding: 28px 16px; }
+  .sug-empty-icon { font-size: 32px; color: var(--green); opacity: 0.5;
+    line-height: 1; }
+  .sug-empty-title { font-family: var(--font-display); font-size: 13px;
+    letter-spacing: 0.08em; color: var(--text); }
+  .sug-empty-sub { font-family: var(--font-mono); font-size: 11px; line-height: 1.6;
+    color: var(--text-dim); max-width: 460px; }
+  .sug-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .sug-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .sug-header-title { color: var(--green); font-family: var(--font-display); font-size: 9px; letter-spacing: 0.2em; }
+  .sug-header-sub { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); }
+  .sug {
+    background: rgba(0, 245, 160, 0.03);
+    border: 1px solid rgba(0, 245, 160, 0.18);
+    border-radius: 8px; padding: 11px 12px;
+    transition: opacity 0.3s;
+  }
+  .sug-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 7px; }
+  .sug-type {
+    font-family: var(--font-mono); font-size: 8.5px; letter-spacing: 0.08em;
+    padding: 2px 7px; border-radius: 4px;
+    background: rgba(0, 245, 160, 0.10); color: var(--green);
+    border: 1px solid rgba(0, 245, 160, 0.3);
+  }
+  .sug-type-repeated_command { background: rgba(0,242,254,0.10); color: var(--cyan); border-color: rgba(0,242,254,0.3); }
+  .sug-type-presence { background: rgba(180,120,255,0.10); color: #c8a6ff; border-color: rgba(180,120,255,0.3); }
+  .sug-type-temp_pref { background: rgba(255,180,0,0.10); color: var(--amber); border-color: rgba(255,180,0,0.3); }
+  .sug-pct-txt { font-family: var(--font-mono); font-size: 9px; white-space: nowrap; }
+  .sug-pct-txt.sug-hi { color: var(--green); }
+  .sug-pct-txt.sug-mid { color: var(--amber); }
+  .sug-pct-txt.sug-lo { color: var(--text-dim); }
+  .sug-why { font-size: 12px; color: var(--text); font-weight: 500; margin-bottom: 3px; }
+  .sug-desc { font-size: 10.5px; color: var(--text-dim); line-height: 1.45; margin-bottom: 8px; }
+  .sug-ev-label {
+    font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.1em;
+    color: var(--text-dim); text-transform: uppercase; margin-bottom: 4px;
+  }
+  .sug-ev { margin: 0 0 8px; padding-left: 15px; }
+  .sug-ev li { font-size: 10.5px; color: var(--text); line-height: 1.55; }
+  .sug-ents { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+  .sug-ent {
+    font-family: var(--font-mono); font-size: 8.5px; color: var(--cyan-dim);
+    background: rgba(0,242,254,0.06); border: 1px solid var(--line);
+    border-radius: 3px; padding: 1px 6px;
+  }
+  .sug-conf-row { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .sug-conf {
+    flex: 1; height: 4px; background: rgba(0, 245, 160, 0.12);
+    border-radius: 2px; overflow: hidden;
+  }
+  .sug-conf i { display: block; height: 100%; background: var(--green); box-shadow: 0 0 6px rgba(0,245,160,0.6); }
+  .sug-conf.sug-mid i { background: var(--amber); box-shadow: 0 0 6px rgba(255,180,0,0.5); }
+  .sug-conf.sug-lo i { background: var(--text-dim); box-shadow: none; }
+  .sug-seen { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); white-space: nowrap; }
+  .sug-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sug-btn {
+    font-family: var(--font-mono); font-size: 9px; line-height: 1;
+    padding: 6px 10px; border-radius: 5px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line); color: var(--text-dim);
+  }
+  .sug-btn:hover { border-color: var(--line-hot); color: var(--text); }
+  .sug-composer { margin-top: 8px; }
+  .composer-sub { font-size: 11px; opacity: 0.65; margin: 2px 0 6px; line-height: 1.4; }
+  .composer-input {
+    width: 100%; box-sizing: border-box; resize: vertical;
+    background: rgba(4, 8, 14, 0.7); border: 1px solid var(--line);
+    color: var(--text, #e2e8f0); border-radius: 6px; padding: 8px;
+    font: inherit; font-size: 12px;
+  }
+  .composer-input:focus { outline: none; border-color: var(--green); }
+  .composer-actions { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+  .composer-result { margin-top: 8px; }
+  .composer-msg { font-size: 12px; margin-bottom: 6px; }
+  .composer-draft { border-color: rgba(0,245,160,0.35); color: var(--green); }
+  .composer-draft:hover { border-color: var(--green); background: rgba(0,245,160,0.08); }
+  .sug-approve { border-color: rgba(0,245,160,0.35); color: var(--green); }
+  .sug-approve:hover { border-color: var(--green); background: rgba(0,245,160,0.08); }
+  .sug-dismiss { border-color: rgba(255,77,109,0.3); color: #ff8a9d; }
+  .sug-dismiss:hover { border-color: var(--red); }
+  .sug-yaml {
+    margin: 8px 0 0; padding: 8px; max-height: 160px; overflow: auto;
+    background: rgba(4, 8, 14, 0.7); border: 1px solid var(--line);
+    border-radius: 4px; font-family: var(--font-mono); font-size: 9.5px;
+    color: var(--cyan-dim); white-space: pre-wrap; word-break: break-word;
+    user-select: text;
+  }
+
+  /* GOALS */
+  .goal-list { display: flex; flex-direction: column; gap: 8px; }
+  .goal {
+    background: rgba(0, 242, 254, 0.025);
+    border: 1px solid var(--line);
+    border-left: 2px solid var(--cyan-dim);
+    border-radius: 6px; padding: 9px 10px;
+  }
+  .goal-done      { border-left-color: var(--green); opacity: 0.7; }
+  .goal-failed    { border-left-color: var(--red); opacity: 0.7; }
+  .goal-cancelled { border-left-color: var(--text-dim); opacity: 0.5; }
+  .goal-top { display: flex; align-items: center; gap: 8px; }
+  .goal-status-badge {
+    font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.1em;
+    color: var(--cyan-dim); border: 1px solid var(--line-hot); border-radius: 3px;
+    padding: 1px 5px; white-space: nowrap;
+  }
+  .goal-done .goal-status-badge      { color: var(--green); border-color: rgba(0,245,160,0.35); }
+  .goal-failed .goal-status-badge    { color: #ff8a9d; border-color: rgba(255,77,109,0.3); }
+  .goal-cancelled .goal-status-badge { color: var(--text-dim); }
+  .goal-title { flex: 1; font-size: 11.5px; color: var(--text); font-weight: 600; }
+  .goal-cancel {
+    font-family: var(--font-mono); font-size: 9px; line-height: 1;
+    padding: 3px 6px; border-radius: 4px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line); color: var(--text-dim);
+  }
+  .goal-cancel:hover { border-color: var(--red); color: var(--red); }
+  .goal-delete {
+    margin-left: auto; background: transparent; border: 1px solid var(--line);
+    color: var(--text-dim); border-radius: 4px; cursor: pointer;
+    font-size: 11px; padding: 1px 7px; line-height: 1.4;
+  }
+  .goal-delete:hover { border-color: var(--red); color: var(--red); }
+  .goal-new { display: flex; gap: 6px; margin: 8px 0; }
+  .goal-new-input {
+    flex: 1; background: rgba(0,0,0,0.25); border: 1px solid var(--line);
+    border-radius: 5px; color: var(--text); font-size: 12px; padding: 7px 10px;
+    font-family: var(--font-display); outline: none;
+  }
+  .goal-new-input:focus { border-color: var(--cyan); }
+  .goal-new-btn {
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.1em;
+    padding: 6px 12px; border-radius: 5px; cursor: pointer;
+    background: rgba(0,242,254,0.1); border: 1px solid var(--cyan); color: var(--cyan);
+  }
+  .goal-new-btn:hover { background: rgba(0,242,254,0.2); }
+  .goal-new-btn:disabled { opacity: 0.5; cursor: default; }
+  .goal-empty { color: var(--text-dim); font-size: 11px; padding: 8px 4px; }
+  .vc-test-result { font-size: 10.5px; color: var(--text-dim); margin-top: 8px; line-height: 1.5; min-height: 14px; }
+  .vc-sat { color: var(--text-faint); font-family: var(--font-mono); font-size: 9px; }
+  .intr-snap { margin-top: 6px; }
+  .intr-img { width: 100%; max-height: 260px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); display: block; }
+  .intr-snap-meta { font-size: 9px; color: var(--text-dim); font-family: var(--font-mono); margin-top: 4px; }
+  .intr-fa { font-size: 10px; color: var(--amber); margin-top: 8px; }
+  .intr-ack { font-size: 10px; color: var(--green); margin-top: 8px; }
+  /* Faces tab (#140) */
+  .faces-page { padding: 0 16px 24px; }
+  .faces-panel { margin-top: 12px; }
+  .faces-add-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 4px; }
+  .faces-add-row #faces-add-name { flex: 1; min-width: 160px; }
+  .faces-section { margin-top: 16px; }
+  .faces-section-head { display: flex; align-items: baseline; gap: 10px; border-bottom: 1px solid var(--border, rgba(255,255,255,.1)); padding-bottom: 6px; margin-bottom: 12px; }
+  .faces-section-head > span:first-child { font-size: 13px; letter-spacing: .04em; color: var(--text, #cfe); }
+  .faces-section-sub { font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-dim); font-family: var(--font-mono); }
+  .faces-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 12px; }
+  .faces-card { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px; }
+  .faces-thumb { position: relative; width: 100%; aspect-ratio: 1 / 1; border-radius: 10px; overflow: hidden; background: var(--panel-2, rgba(255,255,255,.04)); border: 1px solid var(--border, rgba(255,255,255,.1)); display: flex; align-items: center; justify-content: center; cursor: zoom-in; }
+  .faces-thumb:hover { border-color: var(--cyan, #00f2fe); }
+  .faces-thumb-img { width: 100%; height: 100%; object-fit: cover; }
+  .faces-thumb-ph { font-size: 32px; font-weight: 600; color: var(--text-dim); font-family: var(--font-mono); }
+  .faces-card-name { font-size: 13px; color: var(--text, #cfe); margin-top: 4px; word-break: break-word; }
+  .faces-card-meta { font-size: 10px; color: var(--text-dim); font-family: var(--font-mono); }
+  .faces-card-act { margin-top: 4px; }
+  .faces-mark { font-size: 10px; padding: 3px 8px; }
+  .faces-badge { position: absolute; top: 6px; left: 6px; font-size: 8px; letter-spacing: .06em; padding: 1px 5px; border-radius: 7px; font-family: var(--font-mono); }
+  .faces-badge.resident { background: rgba(80,200,120,.85); color: #04210f; }
+  .faces-badge.guest { background: rgba(90,170,235,.88); color: #04172b; }
+  .faces-badge.unknown { background: rgba(230,180,60,.85); color: #241a02; }
+  .faces-badge.guess { background: rgba(170,120,230,.9); color: #160a26; }
+  /* Provenance chip: which backend named this face (top-right of the thumb). */
+  .faces-srcchip { position: absolute; top: 6px; right: 6px; font-size: 7px; letter-spacing: .06em; padding: 1px 4px; border-radius: 6px; font-family: var(--font-mono); background: rgba(0,0,0,.55); color: var(--text-dim, #9fb3c8); border: 1px solid var(--border, rgba(255,255,255,.14)); }
+  .faces-src { font-size: 10px; color: var(--text-dim); margin-top: 16px; font-family: var(--font-mono); }
+  /* Identity-source selector row on the Faces tab (mirrors Settings → Cameras). */
+  .faces-src-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 2px; }
+  .faces-src-row label { font-size: 12px; color: var(--text, #cfe); }
+  .faces-src-row select { min-width: 180px; }
+  /* Phase 3: best-effort LLM recognition controls */
+  .faces-llm-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 2px; }
+  .faces-llm-row label { font-size: 12px; color: var(--text, #cfe); display: flex; align-items: center; gap: 6px; }
+  .faces-exp { font-size: 8px; letter-spacing: .08em; padding: 1px 5px; border-radius: 6px; background: rgba(170,120,230,.22); color: var(--purple, #b488e6); font-family: var(--font-mono); }
+  .faces-llm-note { margin-bottom: 4px; }
+  .voices-status { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); margin-bottom: 8px; }
+  .voices-ok { color: var(--green, #6ad28f); }
+  .voices-off { color: var(--text-dim); }
+  .voices-guess { color: var(--purple, #b488e6); }
+  .voices-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--border, rgba(255,255,255,.07)); }
+  .voices-name { flex: 1; font-size: 13px; color: var(--text, #cfe); }
+  .voices-meta { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+  .voices-forget { padding: 2px 8px; }
+  .voices-enroll { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+  .voices-enroll .voices-name-input { flex: 1; min-width: 140px; }
+  .faces-card-ref { margin-top: 4px; }
+  .faces-ref { display: inline-block; font-size: 10px; padding: 3px 8px; border-radius: 6px; border: 1px dashed var(--border, rgba(255,255,255,.2)); color: var(--text-dim); cursor: pointer; }
+  .faces-ref.set { border-style: solid; color: var(--text, #cfe); }
+  .faces-ref:hover { border-color: var(--cyan, #00f2fe); }
+  .faces-ref-auto { margin-left: 6px; font-size: 8px; letter-spacing: .06em; padding: 1px 5px; border-radius: 6px; font-family: var(--font-mono); background: rgba(170,120,230,.18); color: var(--purple, #b488e6); vertical-align: middle; }
+  /* On-the-fly labeling (#140) */
+  .faces-cap { background: transparent; margin-left: 6px; font-family: inherit; }
+  .faces-card-snap { margin-top: 4px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .faces-snap-cam { max-width: 140px; }
+  .faces-snapnow { margin-left: 0; }
+  .faces-assign-sel {
+    font-size: 10px; font-family: var(--font-mono);
+    padding: 3px 6px; border-radius: 6px;
+    background: var(--panel-2, rgba(255,255,255,.05));
+    border: 1px dashed var(--border, rgba(255,255,255,.2));
+    color: var(--text, #cfe); cursor: pointer; max-width: 100%;
+  }
+  .faces-assign-sel:hover { border-color: var(--cyan, #00f2fe); color: var(--text, #cfe); }
+  .faces-assign-sel:focus { outline: none; border-color: var(--cyan, #00f2fe); }
+  /* Native dropdown options render in a system popup; force a readable, solid
+     colour pair so they aren't near-invisible on the dim theme. */
+  .faces-panel select option, .faces-panel datalist option { color: #e8f4ff; background: #0d1b2a; }
+  /* Free-text "Name this face" labeling (#388 follow-up) */
+  .faces-card-label { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; justify-content: center; }
+  .faces-label-input {
+    font-size: 11px; font-family: var(--font-mono);
+    padding: 4px 7px; border-radius: 6px; width: 120px; max-width: 100%;
+    background: var(--panel-2, rgba(255,255,255,.05));
+    border: 1px solid var(--border, rgba(255,255,255,.2));
+    color: var(--text, #cfe);
+  }
+  .faces-label-input::placeholder { color: var(--text-dim); }
+  .faces-label-input:focus { outline: none; border-color: var(--cyan, #00f2fe); }
+  /* Snapshot lightbox (#388 follow-up) */
+  .faces-lightbox { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,.84); display: none; align-items: center; justify-content: center; cursor: zoom-out; padding: 24px; }
+  .faces-lightbox-inner { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: min(92vw, 720px); max-height: 92vh; }
+  .faces-lightbox img { max-width: 100%; max-height: 82vh; object-fit: contain; border-radius: 12px; border: 1px solid var(--border, rgba(255,255,255,.15)); box-shadow: 0 10px 44px rgba(0,0,0,.6); }
+  .faces-lightbox-cap { font-family: var(--font-mono); font-size: 13px; color: var(--text, #cfe); }
+  /* Muted announcements (#181) */
+  .mutes-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+  .mutes-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-family: var(--font-mono); background: var(--panel-2, rgba(255,255,255,.05)); border: 1px solid var(--border, rgba(255,255,255,.12)); border-radius: 12px; padding: 3px 4px 3px 10px; }
+  .mutes-chip.cat { border-style: dashed; }
+  .mutes-tag { font-size: 8px; letter-spacing: .05em; color: var(--text-dim); text-transform: uppercase; }
+  .mutes-x { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 11px; line-height: 1; padding: 0 3px; }
+  .mutes-x:hover { color: var(--red, #e55); }
+  .intr-timeout-row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; }
+  .intr-timeout-row label { font-size: 11px; color: var(--text-dim); }
+  .intr-timeout { background: rgba(0,0,0,0.25); border: 1px solid var(--line); border-radius: 5px; color: var(--text); font-size: 11px; padding: 5px 9px; }
+  .onboarding-card { background: linear-gradient(135deg, rgba(0,242,254,0.08), rgba(10,18,36,0.6)); border: 1px solid var(--cyan); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+  .ob-head { display: flex; justify-content: space-between; align-items: flex-start; }
+  .ob-title { font-size: 16px; font-weight: 600; color: var(--text); }
+  .ob-dismiss { background: transparent; border: none; color: var(--text-dim); font-size: 15px; cursor: pointer; padding: 0 2px; line-height: 1; }
+  .ob-dismiss:hover { color: var(--text); }
+  .ob-sub { font-size: 12px; color: var(--text-dim); margin: 6px 0 12px; line-height: 1.5; }
+  .ob-progress { position: relative; height: 5px; background: rgba(255,255,255,0.06); border-radius: 3px; margin-bottom: 14px; overflow: hidden; }
+  .ob-progress i { position: absolute; left: 0; top: 0; height: 100%; background: var(--cyan); border-radius: 3px; }
+  .ob-progress span { position: absolute; right: 0; top: -16px; font-size: 9px; font-family: var(--font-mono); color: var(--text-dim); }
+  .ob-steps { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+  .ob-step { display: flex; gap: 10px; align-items: flex-start; }
+  .ob-check { font-family: var(--font-mono); color: var(--text-dim); font-size: 13px; line-height: 1.4; }
+  .ob-done .ob-check { color: var(--green); }
+  .ob-step-label { font-size: 12.5px; color: var(--text); font-weight: 500; }
+  .ob-done .ob-step-label { color: var(--text-dim); }
+  .ob-step-hint { font-size: 10.5px; color: var(--text-dim); margin-top: 1px; line-height: 1.4; }
+  .ob-step-go { margin-left: auto; align-self: center; flex-shrink: 0; background: var(--cyan-faint); color: var(--cyan); border: 1px solid var(--cyan-dim); border-radius: var(--radius); padding: 1px 9px; cursor: pointer; font-family: var(--font-mono); font-size: 14px; line-height: 1.3; }
+  .ob-step-go:hover { background: var(--cyan-glow); color: #fff; }
+  .settings-grid .panel.ob-flash { outline: 1px solid var(--cyan); outline-offset: 2px; animation: obFlash 1.6s ease-out; }
+  @keyframes obFlash { 0% { background: var(--cyan-faint); } 100% { background: transparent; } }
+  .ob-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .ob-go { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; padding: 7px 14px; border-radius: 6px; cursor: pointer; background: rgba(0,242,254,0.12); border: 1px solid var(--cyan); color: var(--cyan); }
+  .ob-go:hover { background: rgba(0,242,254,0.22); }
+  .ob-tip { font-size: 10.5px; color: var(--text-dim); }
+  .ob-tip em { color: var(--text); font-style: normal; }
+  .goal-outcome { font-size: 10.5px; color: var(--text-dim); line-height: 1.4; margin-top: 4px; }
+  .goal-meta { display: flex; align-items: center; gap: 7px; margin-top: 7px; }
+  .goal-steps-bar {
+    flex: 1; height: 3px; background: rgba(0, 242, 254, 0.12);
+    border-radius: 2px; overflow: hidden;
+  }
+  .goal-steps-bar i { display: block; height: 100%; background: var(--cyan-dim); box-shadow: 0 0 6px var(--cyan-glow); }
+  .goal-steps-pct { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); white-space: nowrap; }
+  .goal-when { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); margin-top: 6px; letter-spacing: 0.04em; }
+
+  /* RECENT BRIEFINGS (#232) — full text, newest first */
+  .brief-item { padding: 8px 0; border-top: 1px dashed var(--line); }
+  .brief-item:first-of-type { border-top: none; }
+  .brief-when { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); letter-spacing: 0.04em; margin-bottom: 4px; }
+  .brief-text { font-size: 12px; color: var(--text); line-height: 1.5; white-space: pre-wrap; }
+  .brief-latest .brief-text { color: var(--text, #cfe); }
+  .brief-latest .brief-when { color: var(--cyan, #00f2fe); }
+
+  /* PERSON ROUTINES (reuses .sug-conf / .mem-group styling) */
+  .proutine-item {
+    padding: 6px 0; border-top: 1px dashed var(--line);
+  }
+  .mem-group .proutine-item:first-of-type { border-top: none; }
+  .proutine-desc { font-size: 11px; color: var(--text); line-height: 1.45; }
+  .proutine-meta { display: flex; align-items: center; gap: 7px; margin-top: 5px; }
+
+
+  /* LOCAL LLM URL */
+  .llm-url-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  .llm-url-label {
+    font-family: var(--font-mono); font-size: 9px; color: var(--text-dim);
+    letter-spacing: 0.1em; white-space: nowrap;
+  }
+  .llm-url-input {
+    flex: 1; min-width: 0;
+    background: rgba(0, 242, 254, 0.04);
+    border: 1px solid rgba(0, 242, 254, 0.2); color: var(--text);
+    font-family: var(--font-mono); font-size: 10px; padding: 6px 8px; border-radius: 4px;
+  }
+  .llm-url-input:focus { outline: none; border-color: var(--cyan); }
+
+  /* DOORBELL TRAINING */
+  .dbt-intro {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    line-height: 1.5; margin-bottom: 12px; opacity: 0.85;
+  }
+  .dbt-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .dbt-scan {
+    border-color: var(--cyan); color: var(--cyan); white-space: nowrap;
+  }
+  .dbt-limit {
+    width: 64px; background: rgba(0,242,254,0.04);
+    border: 1px solid rgba(0,242,254,0.2); color: var(--text);
+    font-family: var(--font-mono); font-size: 11px; padding: 6px 8px; border-radius: 4px;
+  }
+  .dbt-stat {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    letter-spacing: 0.04em;
+  }
+  .dbt-list { display: flex; flex-direction: column; gap: 5px; max-height: 320px; overflow-y: auto; }
+  .dbt-empty {
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+    opacity: 0.7; padding: 14px 6px; text-align: center;
+  }
+  .dbt-row {
+    display: grid; grid-template-columns: 84px 78px auto 1fr; gap: 8px;
+    align-items: baseline; padding: 7px 9px;
+    background: var(--bg-elev); border: 1px solid var(--line);
+    border-left: 2px solid rgba(0,242,254,0.3);
+    border-radius: 4px; font-family: var(--font-mono); font-size: 11px;
+  }
+  .dbt-row.dbt-notable { border-left-color: var(--amber, #ffb300); }
+  .dbt-ts { color: var(--text-dim); white-space: nowrap; }
+  .dbt-src {
+    text-transform: uppercase; font-size: 9px; letter-spacing: 0.08em;
+    padding: 2px 5px; border-radius: 3px; text-align: center; white-space: nowrap;
+    color: var(--cyan); border: 1px solid rgba(0,242,254,0.3);
+  }
+  .dbt-src-backlog { color: #b48cff; border-color: rgba(180,140,255,0.4); }
+  .dbt-src-eventmedia { color: #ffb300; border-color: rgba(255,179,0,0.4); }
+  .dbt-cat {
+    color: var(--text-dim); text-transform: uppercase; font-size: 9px;
+    letter-spacing: 0.06em; align-self: center; white-space: nowrap;
+  }
+  .dbt-desc { color: var(--text); line-height: 1.4; }
+
+  /* FLOOR PLAN EDITOR */
+  .fp-editor { display: flex; flex-direction: column; gap: 4px; }
+  .fp-editor-canvas { min-height: 400px; }
+  #fp-editor-svg { min-height: 380px; }
+  .diag-row .label {
+    font-size: 11px; color: var(--text-dim);
+    letter-spacing: 0.15em; text-transform: uppercase;
+  }
+  .diag-row .btn {
+    padding: 6px 12px;
+    border: 1px solid var(--cyan-dim);
+    border-radius: var(--radius);
+    color: var(--cyan);
+    background: transparent;
+    font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.2em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.25s;
+  }
+  .diag-row .btn:hover {
+    background: rgba(0, 242, 254, 0.1);
+    box-shadow: 0 0 12px var(--cyan-glow);
+    transform: translateY(-1px);
+  }
+
+  /* FOOTER */
+  .footer {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 24px;
+    padding: 10px 20px;
+    border-top: 1px solid var(--line);
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+    font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.2em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    background: linear-gradient(to right, rgba(5, 7, 9, 0.5), transparent, rgba(5, 7, 9, 0.5));
+  }
+  .footer .mid { text-align: center; color: var(--cyan-dim); }
+  .footer .hl { color: var(--cyan); }
+
+  /* TOASTS */
+  .toast-wrap {
+    position: fixed;
+    bottom: 20px; right: 20px;
+    z-index: 9999;
+    display: flex; flex-direction: column; gap: 8px;
+    align-items: flex-end;
+  }
+  .toast {
+    padding: 10px 16px;
+    background: var(--bg-elev);
+    border: 1px solid var(--cyan-dim);
+    border-radius: var(--radius);
+    color: var(--cyan);
+    font-family: var(--font-mono);
+    font-size: 12px; letter-spacing: 0.1em;
+    box-shadow: 0 0 20px var(--cyan-glow);
+    transition: opacity 0.3s, transform 0.3s;
+    backdrop-filter: blur(8px);
+  }
+  .toast.err { border-color: var(--red); color: var(--red); box-shadow: 0 0 20px rgba(255,59,59,0.4); }
+  .toast.out { opacity: 0; transform: translateX(20px); }
+
+  /* MOBILE */
+  @media (max-width: 900px) {
+    .menu-btn { display: flex; }
+    .app { padding: 12px; gap: 12px; }
+    .grid { grid-template-columns: 1fr; }
+    .masthead {
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      padding: 10px 12px;
+    }
+    .brand { font-size: 14px; letter-spacing: 0.25em; }
+    .greeting { font-size: 11px; letter-spacing: 0.15em; }
+    .clock .time { font-size: 18px; }
+    .clock .date { display: none; }
+    .room-name { font-size: 28px; }
+    .anchor { padding: 20px 16px; min-height: 280px; }
+    .anchor::before { width: 320px; height: 320px; }
+    .anchor::after  { width: 200px; height: 200px; animation: none; }
+    .reactor { width: 56px; height: 56px; margin-bottom: 18px; }
+    .settings-grid { grid-template-columns: 1fr; }
+    .areas { grid-template-columns: repeat(2, 1fr); }
+    .log { max-height: 320px; }
+    .footer { grid-template-columns: 1fr; text-align: center; gap: 4px; padding: 10px; }
+    .footer .mid, .footer > div:last-child { display: none; }
+  }
+  /* CENTER: camera (primary) + residence overview, side by side */
+  .c-center { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; align-items: start; min-width: 0; }
+  .c-center > .panel { min-width: 0; }
+  @media (max-width: 1280px) { .c-center { grid-template-columns: 1fr; } }
+
+  .c-camera { display: flex; flex-direction: column; }
+  .cam-sel { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .camchip {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.05em; color: var(--text-dim);
+    border: 1px solid var(--line); padding: 4px 9px; cursor: pointer; transition: all 0.2s; white-space: nowrap;
+  }
+  .camchip:hover { border-color: var(--line-hot); color: var(--cyan); }
+  .camchip.on { color: var(--cyan); border-color: var(--line-hot); background: rgba(0,242,254,0.08); }
+  .camchip.evt { color: var(--red); border-color: rgba(255,77,109,0.5); background: rgba(255,77,109,0.08); }
+  .cam-feed {
+    position: relative; width: 100%; min-height: 220px; overflow: hidden;
+    border: 1px solid var(--line); background: #05090f; border-radius: 4px;
+  }
+  .cam-feed img { display: block; width: 100%; height: auto; }
+  .cam-feed > video.jh-rtc { position: relative; width: 100%; height: 100%; object-fit: contain; background: #000;   /* jh-rtc */
+    transform-origin: 50% 50%; pointer-events: none; }
+  /* jh-cam-fixed 2026-11-14 */
+  .cam-feed { aspect-ratio: 16 / 9; max-height: 72vh; }
+  .cam-feed > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  /* jh-cam-zoom 2026-11-14 */
+  .cam-feed { touch-action: pan-y; }
+  .cam-feed.jh-zoomed { touch-action: none; cursor: grab; }
+  .cam-feed.jh-grabbing { cursor: grabbing; }
+  .cam-feed > img { transform-origin: 50% 50%; user-select: none; -webkit-user-drag: none; will-change: transform; }
+  .cam-none {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--text-faint); font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.1em;
+  }
+  .cam-vig { position: absolute; inset: 0; z-index: 3; pointer-events: none;
+    background: radial-gradient(ellipse 78% 80% at 50% 46%, transparent 55%, rgba(0,0,0,0.7) 100%); }
+  .cam-scan { position: absolute; inset: 0; z-index: 4; pointer-events: none; opacity: 0.35;
+    background: linear-gradient(rgba(0,0,0,0) 50%, rgba(0,0,0,0.22) 50%),
+                linear-gradient(90deg, rgba(255,0,0,0.05), rgba(0,255,0,0.02), rgba(0,0,255,0.05));
+    background-size: 100% 3px, 7px 100%; }
+  .cam-tag { position: absolute; top: 8px; left: 10px; z-index: 6; font-family: var(--font-mono);
+    font-size: 9px; letter-spacing: 0.08em; color: rgba(0,242,254,0.7); }
+  .cam-focus { position: absolute; top: 8px; right: 10px; z-index: 6; font-family: var(--font-mono);
+    font-size: 9px; letter-spacing: 0.08em; color: var(--red); display: flex; align-items: center; gap: 5px;
+    background: rgba(8,12,20,0.72); padding: 3px 8px; border: 1px solid rgba(255,77,109,0.4); }
+  .cam-focus i { width: 6px; height: 6px; border-radius: 50%; background: var(--red); animation: camblink 1.1s steps(1) infinite; }
+  @keyframes camblink { 50% { opacity: 0; } }
+  .cam-strip { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.05em; color: var(--cyan); padding: 9px 2px 0; margin-top: 10px; border-top: 1px solid var(--line); }
+  .cam-strip b { color: var(--text); }
+  /* jh-ptz (step 145) */
+  .c-right { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .c-ptz[hidden] { display: none; }
+  .jh-ptz-cam { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jh-ptz-pad { display: grid; grid-template-columns: repeat(3, 48px); grid-template-rows: repeat(3, 48px); gap: 6px; justify-content: center; }
+  .jh-ptz-btn, .jh-ptz-step, .jh-ptz-preset { font-family: var(--font-mono); color: var(--cyan); background: rgba(0,242,254,0.06);
+    border: 1px solid var(--line); border-radius: 6px; cursor: pointer; touch-action: manipulation; }
+  .jh-ptz-btn { width: 48px; height: 48px; font-size: 18px; }
+  .jh-ptz-btn:hover, .jh-ptz-step:hover, .jh-ptz-preset:hover { background: rgba(0,242,254,0.14); }
+  .jh-ptz-btn:active { transform: scale(0.96); }
+  .jh-ptz-btn[data-ptz="stop"] { color: var(--red, #ff4d6d); }
+  .jh-ptz-steps, .jh-ptz-presets { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 10px; }
+  .jh-ptz-step, .jh-ptz-preset { min-height: 36px; padding: 0 12px; font-size: 11px; letter-spacing: 0.06em; }
+  .jh-ptz-step.on { background: rgba(0,242,254,0.22); color: var(--text); }
+  .jh-ptz-gear { background: none; border: 0; color: var(--text-dim); cursor: pointer; font-size: 14px; padding: 0 0 0 8px; }   /* jh-ptz-flip */
+  .jh-ptz-gear:hover { color: var(--cyan); }
+  .jh-ptz-flip { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin: -6px 0 10px; font-family: var(--font-mono);
+    font-size: 11px; color: var(--text-dim); }
+  .jh-ptz-flip[hidden] { display: none; }
+  .jh-ptz-flip label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .jh-ptz-flip select { background: transparent; color: var(--text); border: 1px solid var(--line); font: inherit; }   /* jh-ptz-speed */
+  .cam-dark { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 6; max-width: 92%; box-sizing: border-box;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; color: #ffd166; text-align: center; pointer-events: none;
+    background: rgba(8,12,20,0.72); padding: 4px 10px; border: 1px solid rgba(255,209,102,0.45); }
+  /* RESIDENCE OVERVIEW — architectural data-merge overlay */
+  #house3d { filter: drop-shadow(0 0 12px rgba(0, 242, 254, 0.10)); }
+  .res-banner { position: absolute; top: 10px; left: 13px; z-index: 8; pointer-events: none; }
+  .res-banner-t { font-family: var(--font-display); font-size: 11px; font-weight: 700; letter-spacing: 0.16em; color: var(--cyan); text-shadow: 0 0 12px rgba(0,242,254,0.35); }
+  .res-banner-s { font-family: var(--font-mono); font-size: 7.5px; letter-spacing: 0.22em; color: var(--text-dim); margin-top: 3px; }
+  .res-stat { position: absolute; top: 9px; right: 13px; z-index: 8; pointer-events: none; display: flex; gap: 16px; }
+  .res-stat-i { text-align: right; }
+  .res-stat-i label { display: block; font-family: var(--font-mono); font-size: 7px; letter-spacing: 0.2em; color: var(--text-dim); }
+  .res-stat-i b { font-family: var(--font-display); font-size: 13px; font-weight: 500; color: var(--cyan); letter-spacing: 0.04em; }
+
+  .res-callouts { position: absolute; inset: 0; z-index: 7; pointer-events: none; }
+  .res-co { position: absolute; display: flex; align-items: center; opacity: 0; animation: coIn 0.5s ease forwards; }
+  @keyframes coIn { to { opacity: 1; } }
+  .res-co.left  { left: 13px;  flex-direction: row; }
+  .res-co.right { right: 13px; flex-direction: row-reverse; }
+  .res-co-label { padding: 4px 9px; background: rgba(6, 11, 20, 0.80); border: 1px solid var(--line);
+    border-left: 2px solid var(--cyan-dim); min-width: 116px; backdrop-filter: blur(2px); }
+  .res-co.right .res-co-label { border-left: 1px solid var(--line); border-right: 2px solid var(--cyan-dim); text-align: right; }
+  .res-co-t { font-family: var(--font-display); font-size: 9.5px; font-weight: 500; letter-spacing: 0.12em; color: var(--text); }
+  .res-co-l { font-family: var(--font-mono); font-size: 7.5px; letter-spacing: 0.05em; color: var(--text-dim); margin-top: 2px; }
+  .res-co-line { width: 60px; height: 1px; background: linear-gradient(90deg, var(--cyan-dim), transparent); }
+  .res-co.right .res-co-line { background: linear-gradient(270deg, var(--cyan-dim), transparent); }
+  .res-co-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 7px var(--cyan); margin-left: -3px; flex: none; }
+  .res-co.right .res-co-dot { margin-left: 0; margin-right: -3px; }
+  .res-co.occ .res-co-label { border-left-color: var(--cyan); }
+  .res-co.occ.right .res-co-label { border-right-color: var(--cyan); border-left-color: var(--line); }
+  .res-co.occ .res-co-t { color: var(--cyan); }
+  .res-co.occ .res-co-line { background: linear-gradient(90deg, var(--cyan), transparent); }
+  .res-co.occ.right .res-co-line { background: linear-gradient(270deg, var(--cyan), transparent); }
+  .res-co.dom .res-co-label { border-left-color: var(--red); box-shadow: 0 0 16px rgba(255,77,109,0.20); }
+  .res-co.dom .res-co-t { color: var(--red); }
+  .res-co.dom .res-co-dot { background: var(--red); box-shadow: 0 0 9px var(--red); }
+  .res-co.dom .res-co-line { background: linear-gradient(90deg, var(--red), transparent); }
+  @media (max-width: 1480px) {
+    .res-co-label { min-width: 96px; padding: 3px 7px; }
+    .res-co-line { width: 34px; }
+    .res-co-l { font-size: 7px; }
+  }
+  /* RESIDENCE TAB — full-width house with style template */
+  .res-tab { display: block; }
+  .mmwave-panel { margin-top: 12px; }
+  .mmwave-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-top: 8px; }
+  .mmwave-empty { color: var(--text-dim); font-size: 11px; font-family: var(--font-mono); padding: 12px; grid-column: 1 / -1; }
+  .mmwave-room { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: rgba(0,0,0,0.2); }
+  .mmwave-room.live { border-color: rgba(0,245,160,0.35); background: rgba(0,245,160,0.05); }
+  .mmwave-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-faint); flex: none; }
+  .mmwave-dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); animation: mmwavePulse 2s ease-in-out infinite; }
+  @keyframes mmwavePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .mmwave-name { font-size: 12px; color: var(--text); font-family: var(--font-display); letter-spacing: 0.03em; }
+  .mmwave-meta { font-size: 9px; color: var(--text-dim); font-family: var(--font-mono); letter-spacing: 0.05em; margin-top: 2px; }
+  .mmwave-out { color: var(--amber); font-size: 8px; font-family: var(--font-mono); }
+  .doclib-controls { display: flex; gap: 8px; margin: 8px 0; align-items: center; flex-wrap: wrap; }
+  .doclib-q { flex: 1; min-width: 200px; font-size: 11px; }
+  .doclib-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+  .doclib-row { display: flex; justify-content: space-between; padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; background: rgba(0,0,0,0.2); align-items: center; }
+  .doclib-row-r { display: flex; align-items: center; gap: 8px; }
+  .doclib-del { background: transparent; border: 1px solid var(--line); color: var(--text-dim); border-radius: 3px; font-size: 9px; cursor: pointer; padding: 2px 6px; line-height: 1; }
+  .doclib-del:hover { color: var(--red, #ff6b81); border-color: var(--red, #ff6b81); }
+  .doclib-watch { display: flex; gap: 8px; margin: 6px 0; align-items: center; }
+  .doclib-watch-field { flex: 1; min-width: 200px; font-size: 11px; }
+  .doclib-name { font-size: 11px; color: var(--text); font-family: var(--font-mono); }
+  .doclib-chunks { font-size: 9px; color: var(--text-dim); font-family: var(--font-mono); }
+  .doclib-hit { padding: 8px 10px; border: 1px solid var(--line); border-left: 2px solid var(--cyan); border-radius: 5px; background: rgba(0,242,254,0.03); margin-bottom: 6px; }
+  .doclib-hit-src { font-size: 9px; color: var(--cyan); font-family: var(--font-mono); letter-spacing: 0.05em; margin-bottom: 3px; }
+  .doclib-hit-txt { font-size: 11px; color: var(--text); line-height: 1.5; }
+  .diag-list { display: flex; flex-direction: column; gap: 5px; margin-top: 6px; }
+  .diag-row { padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; background: rgba(0,0,0,0.2); }
+  .diag-row-head { display: flex; justify-content: space-between; align-items: center; }
+  .diag-name { font-size: 11px; color: var(--text); font-family: var(--font-display); font-weight: 600; }
+  .diag-detail { font-size: 9.5px; color: var(--text-dim); margin-top: 2px; line-height: 1.4; }
+  .diag-dot { font-size: 9px; margin-right: 4px; }
+  .diag-st { font-size: 9px; font-family: var(--font-mono); letter-spacing: 0.06em; }
+  .ilog-learned { font-size: 10.5px; color: var(--green); margin-bottom: 10px; font-family: var(--font-mono); }
+  .ilog-item { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: rgba(0,0,0,0.18); }
+  .ilog-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .ilog-kind { font-family: var(--font-mono); font-size: 9px; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.05em; }
+  .ilog-confirmed { background: rgba(255,107,129,0.14); color: #ff6b81; border: 1px solid #ff6b81; }
+  .ilog-unresolved { background: rgba(255,180,0,0.14); color: var(--amber); border: 1px solid var(--amber); }
+  .ilog-investigating { background: rgba(0,242,254,0.10); color: var(--cyan); border: 1px solid var(--cyan); }
+  .ilog-when { font-size: 10px; color: var(--text-dim); font-family: var(--font-mono); }
+  .ilog-what { font-size: 11.5px; color: var(--text); margin: 6px 0; }
+  .ilog-snap { max-width: 100%; border-radius: 6px; border: 1px solid var(--line); margin: 4px 0 8px; display: block; }
+  .ilog-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .ilog-btn { font-family: var(--font-mono); font-size: 9px; padding: 5px 10px; border-radius: 5px; cursor: pointer; background: transparent; border: 1px solid var(--line); color: var(--text-dim); }
+  .ilog-btn:hover { color: var(--text); }
+  .ilog-real.ilog-on { background: rgba(255,107,129,0.18); color: #ff6b81; border-color: #ff6b81; }
+  .ilog-false.ilog-on { background: rgba(0,245,160,0.15); color: var(--green); border-color: var(--green); }
+  .diag-ok { color: var(--green); }
+  .diag-warn { color: var(--amber); }
+  .diag-idle { color: var(--text-dim); }
+  .diag-down { color: #ff6b81; }
+  .haz-row { display: flex; align-items: center; justify-content: space-between; margin: 10px 0 6px; }
+  .haz-label { font-size: 10px; font-family: var(--font-mono); color: var(--text-dim); letter-spacing: 0.06em; }
+  .haz-feeds { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .haz-feeds .toggle-btn { font-size: 9px; padding: 5px 8px; }
+  .haz-loc { font-size: 10.5px; color: var(--text-dim); font-family: var(--font-mono); margin-bottom: 10px; }
+  .haz-override, .haz-tune { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .haz-in { width: 90px; background: rgba(0,0,0,0.25); border: 1px solid var(--line); border-radius: 5px; color: var(--text); font-size: 11px; padding: 5px 8px; }
+  .haz-body { margin-top: 10px; }
+  .haz-clear { font-size: 12px; color: var(--green); padding: 8px 0; }
+  .haz-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text); padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .haz-badge { font-family: var(--font-mono); font-size: 9px; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.04em; white-space: nowrap; }
+  .haz-quake { background: rgba(255,180,0,0.15); color: var(--amber); border: 1px solid var(--amber); }
+  .haz-wx { background: rgba(255,107,129,0.14); color: #ff6b81; border: 1px solid #ff6b81; }
+  .haz-dis { background: rgba(0,242,254,0.12); color: var(--cyan); border: 1px solid var(--cyan); }
+  .diag-off { color: var(--text-faint); }
+  .mode-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .mode-chip { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; padding: 6px 12px; border-radius: 5px; cursor: pointer; background: rgba(0,0,0,0.25); border: 1px solid var(--line); color: var(--text-dim); transition: all 0.15s; }
+  .mode-chip:hover { border-color: var(--cyan); color: var(--text); }
+  .mode-chip-on { background: rgba(0,242,254,0.12); border-color: var(--cyan); color: var(--cyan); font-weight: 600; }
+  .mode-active-tag { color: var(--cyan); font-weight: 600; }
+  .energy-cfg { margin: 6px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  .energy-cfg-label { display: block; font-size: 9px; color: var(--text-dim); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; }
+  .energy-meter-live { font-size: 10.5px; color: var(--text); font-family: var(--font-mono); margin-top: 4px; }
+  .energy-agency { display: flex; align-items: center; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .energy-agency-label { font-size: 10px; color: var(--text-dim); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; margin-right: 2px; }
+  .energy-advice { font-size: 11px; color: var(--text); line-height: 1.5; padding: 7px 9px; border: 1px solid var(--line); border-left: 2px solid var(--cyan); border-radius: 5px; background: rgba(0,242,254,0.03); margin-bottom: 6px; }
+  .energy-run-head { font-size: 9px; color: var(--text-dim); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; margin: 8px 0 4px; }
+  .energy-run-row { display: flex; justify-content: space-between; padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; background: rgba(0,0,0,0.2); margin-bottom: 3px; }
+  .energy-run-name { font-size: 10.5px; color: var(--text); font-family: var(--font-mono); }
+  .energy-run-w { font-size: 9.5px; color: var(--amber); font-family: var(--font-mono); }
+  .energy-locked { color: var(--text-faint); }
+  .bio-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+  .bio-row { display: flex; justify-content: space-between; padding: 6px 9px; border: 1px solid var(--line); border-radius: 5px; background: rgba(0,0,0,0.2); }
+  .bio-kind { font-size: 10.5px; color: var(--text); font-family: var(--font-mono); text-transform: capitalize; }
+  .bio-val { font-size: 10.5px; color: var(--cyan); font-family: var(--font-mono); }
+  .vecbk { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+  .vecbk-row { display: flex; justify-content: space-between; align-items: center; }
+  .vecbk-label { font-size: 11px; color: var(--text); font-family: var(--font-display); letter-spacing: 0.03em; }
+  .vecbk-state { font-size: 10px; font-family: var(--font-mono); letter-spacing: 0.05em; }
+  .vecbk-on { color: var(--green); }
+  .vecbk-off { color: var(--amber); }
+  .vecbk-hint { font-size: 9.5px; color: var(--text-dim); margin: 5px 0 7px; line-height: 1.5; }
+
+  .res-main { display: flex; flex-direction: column; }
+  .res-controls { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; }
+  .res-angles { display: flex; gap: 4px; flex-wrap: wrap; }
+  .res-style { display: flex; align-items: center; gap: 8px; }
+  .res-style > label { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.18em; color: var(--text-dim); }
+  .res-style-sel {
+    background: var(--bg); color: var(--cyan); border: 1px solid var(--line);
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.05em; padding: 6px 11px;
+    border-radius: var(--radius); outline: none; cursor: pointer;
+  }
+  .res-style-sel:hover { border-color: var(--line-hot); }
+  .door-map { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .door-map-head { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.18em; color: var(--text-dim); margin-bottom: 10px; }
+  .door-map-hint { color: var(--line-hot); letter-spacing: 0.08em; }
+  .door-map-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; }
+  .door-map-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .door-map .door-map-row > label { white-space: normal; overflow-wrap: anywhere; }   /* jh-doors */
+  .door-area { color: var(--text-dim); opacity: 0.7; letter-spacing: 0.04em; }
+  .door-state { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-left: 4px; }
+  .door-state.open { color: var(--warn, #ff9d2e); border-color: currentColor; }
+  .door-map-none { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+  .door-map-row > label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; color: var(--text-dim); white-space: nowrap; }
+  .door-map-sel {
+    background: var(--bg); color: var(--cyan); border: 1px solid var(--line);
+    font-family: var(--font-mono); font-size: 10px; padding: 5px 9px;
+    border-radius: var(--radius); outline: none; cursor: pointer; flex: 1 1 auto; min-width: 0;
+  }
+  .door-map-sel:hover { border-color: var(--line-hot); }
+  .res-wrap-big { min-height: 560px; }
+  .res-wrap-big .house3d-scene { height: 560px; }
+  .h3d-roof { position: absolute; }
+  .h3d-roof-gable { position: absolute; backface-visibility: hidden; }
+
+  /* ───────────────── PHONE (≤600px) ───────────────── */
+  @media (max-width: 600px) {
+    .app { padding: 8px; gap: 10px; overflow-x: hidden; }
+
+    /* top tab bar: scroll horizontally instead of overflowing; comfortable tap height */
+    .tab-bar { overflow-x: auto; flex-wrap: nowrap; padding: 0 2px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+    .tab-bar::-webkit-scrollbar { display: none; }
+    .tab { padding: 11px 13px; font-size: 10px; letter-spacing: 0.1em; white-space: nowrap; flex: 0 0 auto; }
+
+    /* masthead compact */
+    .masthead { padding: 9px 10px; gap: 8px; }
+    .ld-state { display: none; }
+    .brand { font-size: 13px; letter-spacing: 0.2em; }
+    .greeting { font-size: 10px; }
+    .clock .time { font-size: 16px; }
+    /* hide the search box on phones — too little room beside the clock/lockdown */
+    .masthead-right { gap: 8px; }
+    .gsearch { display: none; }
+    .gsearch-results { width: 80vw; }
+
+    /* dominant-room hero smaller */
+    .room-name { font-size: 24px; }
+    .anchor { padding: 16px 12px; min-height: 240px; }
+
+    /* residence 3D scene shorter so the model + its controls fit one phone screen */
+    .floorplan-wrap, .res-wrap-big { min-height: 340px; }
+  .mode-auto-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 8px 0 10px; }
+  .mode-auto-label { font-size: 10px; line-height: 1.4; color: var(--text-dim); letter-spacing: 0.02em; }
+  .mode-bindings { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+  .mode-bind-head { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.1em; color: var(--cyan-dim); margin-bottom: 8px; }
+  .mode-bind-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
+  .mode-bind-row > label { font-size: 10px; color: var(--text-dim); min-width: 92px; }
+  .mode-bind-sub { opacity: 0.55; }
+  .mode-bind-empty { font-size: 10px; color: var(--text-dim); opacity: 0.6; }
+  .area-chips { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; }
+  .area-chip { font-family: var(--font-mono); font-size: 9px; padding: 3px 8px; background: rgba(0,242,254,0.05); border: 1px solid var(--cyan-dim); color: var(--text-dim); border-radius: 4px; cursor: pointer; }
+  .area-chip.on { color: var(--cyan); border-color: var(--cyan); background: rgba(0,242,254,0.16); }
+  .view-presets { display: flex; align-items: center; gap: 4px; margin: 0 0 8px; flex-wrap: wrap; }
+  .view-btn { font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.08em; padding: 3px 9px; background: rgba(0,242,254,0.06); border: 1px solid var(--cyan-dim); color: var(--text-dim); border-radius: 4px; cursor: pointer; }
+  .view-btn:hover, .view-btn.active { color: var(--cyan); border-color: var(--cyan); background: rgba(0,242,254,0.14); }
+  .view-hint { font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.06em; color: var(--text-dim); opacity: 0.6; margin-left: 4px; }
+  #fp-3d-preview { cursor: grab; }
+  #fp-3d-preview.dragging { cursor: grabbing; }
+    .house3d-scene, .res-wrap-big .house3d-scene { height: 340px; }
+
+    /* residence overlays: compact, avoid banner/stat collision on a narrow scene */
+    .res-banner { top: 6px; left: 8px; }
+    .res-banner-t { font-size: 9px; letter-spacing: 0.1em; }
+    .res-banner-s { display: none; }
+    .res-stat { top: 6px; right: 8px; gap: 9px; }
+    .res-stat-i label { font-size: 7px; letter-spacing: 0.08em; }
+    .res-stat-i b { font-size: 11px; }
+    .res-stat-i:nth-child(3) { display: none; }   /* drop STYLE stat to save width */
+
+    /* residence controls stack full-width; floor pills wrap with bigger tap targets */
+    .res-controls { flex-direction: column; align-items: stretch; gap: 8px; }
+    .res-style { width: 100%; }
+    .res-style-sel { flex: 1 1 auto; }
+    .floor-tabs { flex-wrap: wrap; gap: 6px; }
+    .floor-tab { padding: 8px 14px; font-size: 9px; }
+
+    /* let dense settings rows shrink within the viewport instead of overflowing */
+    .model-row > *, .dbt-row > *, .ar-line2 > * { min-width: 0; }
+    .log { max-height: 300px; }
+  }
+
+  /* jh-phone-fit 2026-11-11 */
+  @media (max-width: 600px) {
+    .masthead { grid-template-columns: auto minmax(0, 1fr); }
+    .masthead .greeting { display: none; }
+    .masthead-right { grid-column: 1 / -1; justify-content: space-between; }
+    .brand { min-width: 0; justify-content: flex-end; gap: 10px; letter-spacing: 0.18em; white-space: nowrap; }
+    .brand > span { display: none; }   /* version and status badge: the lockdown switch still shows the state */
+    .chat-compose { flex-wrap: wrap; }
+    .chat-compose .chat-input { flex: 1 1 100%; }   /* full-width box, buttons on a second row */
+    .chat-compose .chat-input::placeholder { font-size: 11px; }
+    .chat-voice { flex: 1 1 auto; }
+    .chat-compose .chat-send { flex: 0 0 auto; margin-left: auto; }
+    .faces-card { min-width: 0; }
+    .faces-card-snap { justify-content: center; max-width: 100%; }
+    .faces-card-snap .faces-snap-cam { max-width: 100%; min-width: 0; }
+    .log-entry { grid-template-columns: auto 1fr; gap: 2px 10px; }
+    .log-entry .log-msg { grid-column: 1 / -1; }   /* time and category on one line, the message below */
+    .sug-ev, .sug-ev li { overflow-wrap: anywhere; }
+  }
+  /* jh-faces-snap-fit 2026-11-14 */
+  .faces-card { min-width: 0; }
+  .faces-card .faces-card-snap { flex-direction: column; flex-wrap: nowrap; align-items: center; justify-content: flex-start; align-self: stretch; width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
+  .faces-card .faces-card-snap .faces-snap-cam { display: block; width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; text-overflow: ellipsis; }
+  .faces-card .faces-card-snap .faces-snapnow { margin-left: 0; max-width: 100%; box-sizing: border-box; }
+  /* ───────────────── very small phones (≤380px) ───────────────── */
+  @media (max-width: 380px) {
+    .tab { padding: 10px 10px; letter-spacing: 0.05em; }
+    .brand { font-size: 12px; }
+    .floor-tab { padding: 7px 11px; }
+    .res-stat-i:nth-child(1) { display: none; }   /* keep BED/BATH + OCCUPIED only */
+  }
+  /* ── Memory tab ───────────────────────────────────────────────── */
+  .mem-tab { padding: 4px 0 16px; }
+  .mem-sub {
+    color: var(--text-dim); font-size: 12px; line-height: 1.5;
+    margin: 2px 2px 14px; font-family: var(--font-body);
+  }
+  .mem-teach {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    margin-bottom: 16px;
+  }
+  .mem-input {
+    flex: 1 1 160px; min-width: 0;
+    padding: 9px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--font-body); font-size: 13px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .mem-input::placeholder { color: var(--text-faint); }
+  .mem-input:focus {
+    outline: none; border-color: var(--cyan);
+    box-shadow: 0 0 10px rgba(0, 242, 254, 0.12);
+  }
+  .mem-select { flex: 0 0 130px; cursor: pointer; }
+  .mem-btn {
+    flex: 0 0 auto;
+    padding: 9px 18px;
+    border: 1px solid var(--cyan);
+    border-radius: var(--radius);
+    background: rgba(0, 242, 254, 0.1);
+    color: var(--cyan);
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.14em;
+    cursor: pointer; transition: all 0.2s;
+  }
+  .mem-btn:hover {
+    background: rgba(0, 242, 254, 0.2);
+    box-shadow: 0 0 12px rgba(0, 242, 254, 0.25);
+  }
+  .mem-list { display: flex; flex-direction: column; gap: 14px; }
+  .mem-empty {
+    color: var(--text-dim); font-size: 13px; text-align: center;
+    padding: 28px 12px; font-family: var(--font-body);
+  }
+  .mem-group { display: flex; flex-direction: column; gap: 2px; }
+  .mem-group-head {
+    color: var(--cyan-dim); font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.18em;
+    padding: 2px 2px 6px; border-bottom: 1px solid var(--line);
+    margin-bottom: 6px;
+  }
+  .mem-fact {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 10px; border: 1px solid var(--line);
+    border-left: 2px solid var(--cyan-dim);
+    border-radius: var(--radius);
+    background: var(--cyan-faint);
+    transition: border-color 0.18s, background 0.18s;
+  }
+  .mem-fact:hover { border-color: var(--line-hot); background: rgba(0, 242, 254, 0.06); }
+  .mem-kv { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .mem-key {
+    color: var(--text-dim); font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .mem-val {
+    color: var(--text); font-family: var(--font-body); font-size: 14px;
+    word-break: break-word;
+  }
+  .mem-hedge { color: var(--amber); margin-left: 6px; font-weight: 600; cursor: help; }
+  .mem-exp { margin-left: 6px; opacity: 0.6; cursor: help; }
+  .mem-forget {
+    flex: 0 0 auto; width: 26px; height: 26px;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: transparent; color: var(--text-faint);
+    font-size: 13px; line-height: 1; cursor: pointer;
+    transition: all 0.18s;
+  }
+  .mem-forget:hover {
+    border-color: var(--red); color: var(--red);
+    background: rgba(255, 77, 109, 0.1);
+  }
+
+  /* ── Chat tab (issue #322) ──────────────────────────────────────────── */
+  .chat-tab { padding: 4px 0 16px; }
+  .chat-panel { display: flex; flex-direction: column; }
+  .chat-log {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .chat-empty {
+    color: var(--text-dim); font-size: 13px; font-style: italic;
+    text-align: center; padding: 32px 16px; line-height: 1.6;
+  }
+  .chat-msg {
+    display: flex; flex-direction: column; gap: 3px;
+    max-width: 82%; padding: 8px 12px; border-radius: var(--radius);
+    font-size: 13px; line-height: 1.5; word-wrap: break-word;
+    white-space: pre-wrap;
+  }
+  .chat-msg { position: relative; padding-right: 26px !important; }
+  .chat-del { position: absolute; top: 0; right: 0; width: 26px; height: 28px; background: none; border: 0; color: #ff4d4d;
+    cursor: pointer; font-size: 13px; line-height: 1; padding: 0; }   /* the whole corner is the target, the cross stays where it was */
+  .chat-del:hover { color: #ff1f1f; }
+  .chat-clean { margin-left: 12px; background: none; border: 1px solid var(--line-hot); color: var(--cyan);
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; padding: 2px 8px;
+    border-radius: var(--radius); cursor: pointer; }
+  .chat-clean:hover { background: var(--cyan-faint); }
+  .chat-ask { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: 12px; color: #ff4d4d;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; }
+  .chat-ask .chat-clean { margin-left: 0; }
+  .chat-ask .chat-yes { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-ask[hidden], .chat-clean[hidden] { display: none; }
+  .chat-think { display: inline-flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; }
+  .chat-spark { width: 16px; height: 16px; color: var(--cyan); animation: chatSpark 1.6s ease-in-out infinite; transform-origin: center; }
+  .chat-think-t { background: linear-gradient(90deg, var(--text-dim) 25%, var(--cyan) 50%, var(--text-dim) 75%);
+    background-size: 220% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: chatShimmer 1.8s linear infinite; }
+  .chat-think-s { color: var(--text-dim); font-size: 11px; opacity: 0.8; }
+  @keyframes chatSpark { 0%, 100% { transform: scale(0.8) rotate(0deg); opacity: 0.55; } 50% { transform: scale(1.1) rotate(90deg); opacity: 1; } }
+  @keyframes chatShimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+  @media (prefers-reduced-motion: reduce) {   /* jh-r21-motion (step 163, review round 21 #7): still, readable text */
+    .chat-spark, .chat-think-t { animation: none; }
+    .chat-think-t { color: var(--text-dim); background: none; -webkit-background-clip: border-box; background-clip: border-box; }
+  }
+  .chat-clean.on, .chat-mic.on { background: var(--cyan-faint); }
+  .chat-mic { background: none; border: 1px solid var(--line-hot); color: var(--cyan); font-family: var(--font-mono);
+    font-size: 11px; letter-spacing: 0.08em; padding: 0 14px; border-radius: var(--radius); cursor: pointer; }
+  .chat-mic.on { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-mic { touch-action: none; user-select: none; -webkit-user-select: none; }
+  .chat-voice { display: flex; flex-direction: column; gap: 4px; }
+  .chat-voice button { flex: 1 1 0; min-height: 26px; }
+  .chat-tts { background: none; border: 1px solid var(--line-hot); color: var(--text-dim); font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 0.08em; padding: 0 10px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+  .chat-tts.on { color: var(--cyan); background: var(--cyan-faint); }
+  .chat-wake { background: none; border: 1px solid var(--line-hot); color: var(--text-dim); border-radius: var(--radius); cursor: pointer; }
+  .chat-wake.on { color: var(--cyan); background: var(--cyan-faint); border-color: var(--cyan); }
+  .chat-wake.hot { color: #ff4d4d; border-color: #ff4d4d; }
+  .chat-wake.on.rest { border-style: dashed; opacity: 0.55; }
+  /* chat-compose-even */
+  .chat-compose { align-items: stretch !important; }
+  /* chat-compose-oneline */
+  .chat-compose .chat-input { height: 40px; min-height: 40px; box-sizing: border-box; }
+  .chat-compose .chat-send { height: 40px; align-self: stretch; }
+  .chat-voice { flex: none; flex-direction: row !important; width: auto; height: 40px; gap: 8px !important; align-self: stretch; }
+  .chat-voice button { flex: none; width: 40px; height: 40px; min-height: 0; padding: 0; display: flex;
+    align-items: center; justify-content: center; }
+  .chat-who {
+    font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.08em;
+    opacity: 0.7;
+  }
+  .chat-user {
+    align-self: flex-end;
+    background: var(--cyan-faint);
+    border: 1px solid var(--line-hot);
+    color: var(--text);
+  }
+  .chat-user .chat-who { color: var(--cyan-dim); text-align: right; }
+  .chat-jarvis {
+    align-self: flex-start;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    color: var(--text);
+  }
+  .chat-jarvis .chat-who { color: var(--cyan); }
+  .chat-error {
+    align-self: flex-start;
+    background: rgba(255, 77, 109, 0.08);
+    border: 1px solid var(--red);
+    color: var(--red);
+  }
+  .chat-error .chat-who { color: var(--red); }
+  .chat-typing .chat-text { letter-spacing: 2px; opacity: 0.6; }
+  .chat-compose {
+    display: flex; gap: 8px; align-items: flex-end;
+    padding-top: 10px; border-top: 1px solid var(--line);
+  }
+  .chat-input {
+    flex: 1 1 auto;
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid var(--line-hot);
+    color: var(--text);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    font-family: var(--font-body); font-size: 13px; line-height: 1.4;
+    resize: none; max-height: 140px; min-height: 40px;
+    outline: none;
+  }
+  .chat-input::placeholder { color: var(--text-faint); }
+  .chat-input:focus { border-color: var(--cyan); }
+  .chat-input:disabled { opacity: 0.5; }
+  .chat-send {
+    flex: 0 0 auto;
+    background: var(--cyan-faint);
+    border: 1px solid var(--line-hot);
+    color: var(--cyan);
+    border-radius: var(--radius);
+    padding: 0 18px; height: 40px;
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em;
+    cursor: pointer; transition: all 0.18s;
+  }
+  .chat-send:hover:not(:disabled) {
+    background: var(--cyan); color: var(--bg); border-color: var(--cyan);
+  }
+  .chat-send:disabled { opacity: 0.5; cursor: default; }
+  .chat-hint {
+    margin-top: 8px; font-size: 10px; color: var(--text-dim);
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  }
+  .chat-clear {
+    background: transparent; border: none; color: var(--text-dim);
+    text-decoration: underline; cursor: pointer; font-size: 10px;
+    font-family: inherit; padding: 0;
+  }
+  .chat-clear:hover { color: var(--red); }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+   * SETTINGS HUD VISUAL UPGRADE — uniform card chassis, pill toggles, aligned
+   * inputs, sticky icon sub-nav with card counts + live filter. All rules are
+   * scoped to .settings-page so no other tab is affected. (.settings-grid's
+   * track sizing lives above so the max-width:900px single-column override
+   * still wins on small screens.)
+   * ═════════════════════════════════════════════════════════════════════ */
+  .settings-page { display: flex; flex-direction: column; gap: 18px; padding-bottom: 32px; }
+
+  /* Sticky sub-navigation dock */
+  .settings-subnav {
+    position: sticky; top: 0; z-index: 30;
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 10px 12px;
+    background: linear-gradient(180deg, rgba(6,15,24,0.96) 0%, rgba(4,10,16,0.93) 100%);
+    border: 1px solid rgba(0,242,254,0.24); border-radius: 6px;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.65), inset 0 1px 0 rgba(0,242,254,0.14);
+  }
+  .settings-subnav-btn {
+    position: relative; display: inline-flex; align-items: center; gap: 7px;
+    padding: 7px 12px; background: rgba(10,22,34,0.7);
+    border: 1px solid rgba(0,242,254,0.14); border-radius: 4px;
+    color: var(--text-dim, #6e91a3);
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 11px; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase;
+    cursor: pointer; transition: all 0.16s ease;
+  }
+  .settings-subnav-btn svg.subnav-ico {
+    width: 13px; height: 13px; stroke: currentColor; fill: none;
+    stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; opacity: 0.8;
+  }
+  .settings-subnav-btn:hover {
+    color: #dffaff; border-color: rgba(0,242,254,0.45);
+    background: rgba(0,242,254,0.08); transform: translateY(-1px);
+  }
+  .settings-subnav-btn.active {
+    color: #00f2fe;
+    background: linear-gradient(180deg, rgba(0,242,254,0.18) 0%, rgba(0,242,254,0.05) 100%);
+    border-color: rgba(0,242,254,0.8);
+    box-shadow: 0 0 16px rgba(0,242,254,0.22), inset 0 -2px 0 #00f2fe;
+  }
+  .settings-subnav-btn .subnav-count {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 18px; height: 16px; padding: 0 5px; border-radius: 9px;
+    font-size: 9px; background: rgba(0,242,254,0.12);
+    color: rgba(165,235,255,0.85); border: 1px solid rgba(0,242,254,0.22);
+  }
+  .settings-subnav-btn.active .subnav-count {
+    background: rgba(0,242,254,0.26); color: #fff; border-color: rgba(0,242,254,0.65);
+  }
+  .settings-filter-input {
+    margin-left: auto; min-width: 210px; padding: 6px 11px;
+    background: rgba(3,8,14,0.9); border: 1px solid rgba(0,242,254,0.26);
+    border-radius: 4px; color: #dffaff;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 11px;
+    outline: none; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .settings-filter-input:focus { border-color: #00f2fe; box-shadow: 0 0 12px rgba(0,242,254,0.28); }
+
+  /* Card chassis */
+  .settings-page .panel {
+    position: relative;
+    background: linear-gradient(165deg, rgba(12,25,38,0.88) 0%, rgba(6,13,21,0.95) 100%);
+    border: 1px solid rgba(0,242,254,0.18); border-radius: 6px; padding: 16px 18px;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.5), inset 0 1px 0 rgba(0,242,254,0.08);
+    transition: border-color 0.18s ease, box-shadow 0.18s ease; overflow: hidden;
+  }
+  .settings-page .panel::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, rgba(0,242,254,0.8), rgba(0,245,160,0.35) 55%, transparent 100%);
+    opacity: 0.8; pointer-events: none;
+  }
+  .settings-page .panel:hover {
+    border-color: rgba(0,242,254,0.38);
+    box-shadow: 0 8px 28px rgba(0,0,0,0.62), 0 0 18px rgba(0,242,254,0.08);
+  }
+  .settings-page .panel > .head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 10px; margin-bottom: 12px; border-bottom: 1px solid rgba(0,242,254,0.15);
+    font-family: var(--font-display, 'Space Grotesk', sans-serif);
+    font-size: 13px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+    color: #e6fbff;
+  }
+  .settings-page .panel > .head .side {
+    padding: 2px 8px; border-radius: 3px;
+    background: rgba(0,242,254,0.1); border: 1px solid rgba(0,242,254,0.28);
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 9.5px; font-weight: 500; letter-spacing: 0.12em; color: #00f2fe;
+  }
+  .settings-page .mem-sub,
+  .settings-page .appliance-intro,
+  .settings-page .dbt-intro,
+  .settings-page .home-cfg-hint {
+    font-size: 11.5px; line-height: 1.5; color: rgba(168,206,224,0.82);
+    background: rgba(0,20,34,0.45); border-left: 2px solid rgba(0,242,254,0.42);
+    padding: 7px 10px; border-radius: 0 4px 4px 0; margin-bottom: 12px;
+  }
+
+  /* Tactile pill switch (.toggle-btn) — one shape for every settings toggle */
+  .settings-page .toggle-btn {
+    position: relative; display: inline-flex; align-items: center; justify-content: flex-end;
+    min-width: 64px; height: 26px; padding: 0 9px 0 28px; border-radius: 13px;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 10px; font-weight: 600; letter-spacing: 0.08em; cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.22,1,0.36,1); flex-shrink: 0;
+  }
+  .settings-page .toggle-btn::before {
+    content: ""; position: absolute; top: 3px; left: 4px; width: 18px; height: 18px;
+    border-radius: 50%; background: #5b7989; box-shadow: 0 1px 4px rgba(0,0,0,0.65);
+    transition: transform 0.2s cubic-bezier(0.22,1,0.36,1), background 0.2s ease, box-shadow 0.2s ease;
+  }
+  .settings-page .toggle-btn.off {
+    background: rgba(8,18,28,0.92); border: 1px solid rgba(90,130,150,0.35);
+    color: #6d8d9e; justify-content: flex-end;
+  }
+  .settings-page .toggle-btn.on {
+    background: linear-gradient(90deg, rgba(0,245,160,0.25) 0%, rgba(0,242,254,0.28) 100%);
+    border: 1px solid rgba(0,245,160,0.78); color: #d6fff0;
+    justify-content: flex-start; padding: 0 28px 0 9px; box-shadow: 0 0 12px rgba(0,245,160,0.22);
+  }
+  .settings-page .toggle-btn.on::before { transform: translateX(36px); background: #00f5a0; box-shadow: 0 0 8px #00f5a0; }
+  /* Safety-gated switches ([data-confirm]) glow amber when armed */
+  .settings-page .toggle-btn[data-confirm].on {
+    background: linear-gradient(90deg, rgba(255,157,46,0.3) 0%, rgba(255,110,30,0.22) 100%);
+    border-color: #ff9d2e; color: #ffe3be; box-shadow: 0 0 12px rgba(255,157,46,0.32);
+  }
+  .settings-page .toggle-btn[data-confirm].on::before { background: #ff9d2e; box-shadow: 0 0 8px #ff9d2e; }
+
+  /* Rows: label (+ description) on the left, control on the right */
+  .settings-page .toggle-list,
+  .settings-page .home-cfg,
+  .settings-page .rule-list,
+  .settings-page .pairing-list { display: flex; flex-direction: column; gap: 6px; }
+  .settings-page .toggle-row,
+  .settings-page .cfg-row,
+  .settings-page .rule-row,
+  .settings-page .pairing-row,
+  .settings-page .diag-row {
+    display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 14px;
+    padding: 9px 11px; background: rgba(6,15,24,0.56);
+    border: 1px solid rgba(0,242,254,0.08); border-radius: 5px;
+    transition: background 0.14s ease, border-color 0.14s ease;
+  }
+  .settings-page .toggle-row:hover,
+  .settings-page .cfg-row:hover,
+  .settings-page .rule-row:hover,
+  .settings-page .pairing-row:hover,
+  .settings-page .diag-row:hover {
+    background: rgba(0,242,254,0.05); border-color: rgba(0,242,254,0.24);
+  }
+  .settings-page .toggle-row .toggle-label,
+  .settings-page .cfg-row > label,
+  .settings-page .rule-row .rule-name,
+  .settings-page .pairing-row .pairing-label {
+    font-size: 12.5px; font-weight: 500; color: #e4f7ff; grid-column: 1;
+  }
+  .settings-page .toggle-row .toggle-desc,
+  .settings-page .cfg-row > label .cfg-hint,
+  .settings-page .cfg-row > label .cfg-sub,
+  .settings-page .cfg-row > label .mode-bind-sub,
+  .settings-page .rule-row .rule-desc {
+    display: block; font-size: 11px; font-weight: 400; line-height: 1.4;
+    color: rgba(140,180,200,0.78); grid-column: 1; margin-top: 2px;
+  }
+  .settings-page .toggle-row > .toggle-btn,
+  .settings-page .toggle-row > .cfg-field,
+  .settings-page .toggle-row > .notify-select,
+  .settings-page .rule-row > .toggle-btn { grid-column: 2; grid-row: 1 / span 2; }
+  /* Sub-row tree indentation for ↳ dependent settings */
+  .settings-page .cfg-row.cfg-subrow {
+    margin-left: 16px; border-left: 2px solid rgba(0,242,254,0.42);
+    background: rgba(3,10,18,0.68); padding-left: 10px; border-radius: 0 4px 4px 0;
+  }
+
+  /* Inputs, selects & textareas */
+  .settings-page .cfg-field,
+  .settings-page .notify-select,
+  .settings-page .op-field {
+    padding: 6px 10px; background: rgba(3,9,15,0.92);
+    border: 1px solid rgba(0,242,254,0.26); border-radius: 4px; color: #daf8ff;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 11.5px;
+    outline: none; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .settings-page .cfg-field:focus,
+  .settings-page .notify-select:focus,
+  .settings-page .op-field:focus { border-color: #00f2fe; box-shadow: 0 0 10px rgba(0,242,254,0.26); }
+  .settings-page .cfg-num { width: 78px; text-align: right; }
+
+  /* AI Models rack */
+  .settings-page .model-list { display: flex; flex-direction: column; gap: 8px; }
+  .settings-page .model-row {
+    display: grid; grid-template-columns: 110px 135px 1fr; gap: 8px; align-items: center;
+    padding: 10px 12px;
+    background: linear-gradient(90deg, rgba(0,242,254,0.06) 0%, rgba(6,15,24,0.65) 100%);
+    border: 1px solid rgba(0,242,254,0.16); border-left: 3px solid #00f2fe; border-radius: 5px;
+  }
+  .settings-page .model-label {
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #00f2fe;
+  }
+  .settings-page .model-row .model-hint,
+  .settings-page .model-row .model-thinking-row { grid-column: 1 / -1; }
+  .settings-page .model-thinking-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding-top: 6px; margin-top: 4px; border-top: 1px dashed rgba(0,242,254,0.15);
+    font-size: 11px; color: #9ec6d8;
+  }
+
+  /* Area & entity chips */
+  .settings-page .area-chips,
+  .settings-page .pl-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .settings-page .area-chip,
+  .settings-page .pl-chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 14px;
+    background: rgba(8,20,32,0.85); border: 1px solid rgba(0,242,254,0.22); color: #9ec6d8;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 10.5px;
+    cursor: pointer; transition: all 0.15s ease;
+  }
+  .settings-page .area-chip.on {
+    background: rgba(0,242,254,0.18); border-color: #00f2fe; color: #e8fdff;
+    box-shadow: 0 0 10px rgba(0,242,254,0.2);
+  }
+
+  /* Observer / Memory telemetry grid */
+  .settings-page .status-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(185px, 1fr)); gap: 7px; }
+  .settings-page .status-row {
+    display: flex; justify-content: space-between; align-items: center; padding: 8px 10px;
+    background: rgba(5,13,21,0.72); border: 1px solid rgba(0,242,254,0.12); border-radius: 4px;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 11px;
+  }
+  .settings-page .status-row .k { color: rgba(145,185,205,0.82); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .settings-page .status-row .v { color: #00f2fe; font-weight: 600; }
+
+  /* Labeled toggle chips (hazard feeds, briefing includes) put their own text
+     label INSIDE the button ("EARTHQUAKES ON", "WEATHER"), so the sliding-knob
+     pill from the HUD upgrade would sit on top of the words. Keep these as
+     compact, centered colored chips — no knob — so the label stays legible.
+     (Fix for the 9.91.0 Settings HUD toggle overlap.) */
+  .settings-page .haz-feeds .toggle-btn,
+  .settings-page .haz-feeds .toggle-btn.on,
+  .settings-page .haz-feeds .toggle-btn.off {
+    min-width: 0; height: auto; padding: 5px 10px;
+    justify-content: center; font-size: 9px; letter-spacing: 0.04em;
+  }
+  .settings-page .haz-feeds .toggle-btn::before { content: none; }
+
+  /* jh-tablet-fit 2026-11-15: no sideways scroll on tablets and phones, readable labels */
+  @media (min-width: 1331px) { .grid { grid-template-columns: 240px minmax(0, 1fr) 300px; } }
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: minmax(0, 1fr); }
+    .grid > *, .area { min-width: 0; }
+    .areas { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  .masthead > *, .masthead-right > * { min-width: 0; }
+  .panel .head .side, .settings-page .panel > .head .side { font-size: 11px; }
+  .status-badge, .ld-state, .camchip, .cam-diag-btn { font-size: 11px; }
+  #cognitive-stats > span:first-child, #cognitive-stats .loading-cog { font-size: 11px !important; }
+  @media (min-width: 601px) and (max-width: 1520px) {
+    .masthead { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "menu brand greet" "right right right"; row-gap: 10px; }
+    .masthead > .menu-btn { grid-area: menu; }
+    .masthead > .brand { grid-area: brand; flex-wrap: wrap; row-gap: 6px; }
+    .masthead > .greeting { grid-area: greet; }
+    .masthead > .masthead-right { grid-area: right; flex-wrap: wrap; justify-content: flex-end; row-gap: 8px; }
+    .tab-bar { flex-wrap: wrap; }
+    .tab { padding: 10px 16px; letter-spacing: 0.2em; }
+  }
+  @media (min-width: 901px) and (max-width: 1330px) {
+    .grid { grid-template-columns: 240px minmax(0, 1fr); }
+    .grid > .c-log { grid-column: 1 / -1; }
+    .grid > .c-right { grid-column: 1 / -1; }   /* jh-ptz (step 145) */
+  }
+  @media (max-width: 600px) {
+    .tab-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow-x: visible; gap: 2px; padding: 0; }
+    .tab { padding: 9px 4px; font-size: 11px; letter-spacing: 0.06em; white-space: normal; text-align: center; line-height: 1.25; }
+  }
+  @media (orientation: portrait) and (min-width: 601px) and (max-width: 1100px) {
+    .cam-feed { max-height: 42vh; }
+  }
+
+  /* jh-phone-cards (step 157, the owner's phone screenshot): on a phone (the Home Assistant app in portrait, at most 480 px wide)
+     every card fits the screen: full width with its own border and padding, no fixed width wider than the screen, text that
+     wraps or ends in an ellipsis inside the card, the camera chips scroll in their own row, the Camera Watch footer wraps, the
+     picture scales to the card, the camera move pad stays centred, and the page never scrolls sideways. */
+  .camchip { max-width: 16em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }   /* jh-ha-names: long HA names */
+  .camset-haname { color: #cfe9f5; font-size: 12px; overflow-wrap: anywhere; }
+  @media (max-width: 480px) {
+    :host { max-width: 100vw; overflow-x: hidden; }
+    .app { max-width: 100%; box-sizing: border-box; }
+    .grid { grid-template-columns: minmax(0, 1fr) !important; }
+    .grid > *, .panel, .c-right, .c-right > *, .area { min-width: 0 !important; max-width: 100%; box-sizing: border-box; }
+    .panel { width: 100%; }
+    .panel .head { min-width: 0; flex-wrap: wrap; row-gap: 4px; }
+    .panel .head > * { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+    .meta, #cognitive-stats, #cognitive-stats * { white-space: normal !important; overflow-wrap: anywhere; }
+    .status-row { min-width: 0; gap: 8px; }
+    .status-row > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .cam-sel { display: flex; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; max-width: 100%; scrollbar-width: none; }
+    .cam-sel .camchip { flex: 0 0 auto; }
+    .cam-feed { max-width: 100%; min-width: 0; }
+    .cam-feed > img, .cam-feed > video { max-width: 100%; }
+    .cam-strip { flex-wrap: wrap; row-gap: 2px; min-width: 0; max-width: 100%; }
+    .cam-strip > span { min-width: 0; overflow-wrap: anywhere; }
+    .jh-ptz-pad { margin-left: auto; margin-right: auto; max-width: 100%; }
+    .jh-ptz-steps, .jh-ptz-presets { flex-wrap: wrap; justify-content: center; max-width: 100%; }
+    .tab-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow-x: visible; gap: 2px; padding: 0; max-width: 100%; }
+    .tab { padding: 9px 4px; font-size: 11px; letter-spacing: 0.06em; white-space: normal; text-align: center; line-height: 1.25; min-width: 0; }
+  }
+
+  /* jh-cam-box (step 169, the owner: "camera watch switch size automatically"): Camera Watch is ONE fixed 16:9 box at the
+     card's full width whatever plays in it. Every source (the MJPEG / stills / snapshot picture, the WebRTC video, the NO FRAME
+     note) lies on top of the box and is fitted inside it whole, letterboxed on dark, so no frame, source switch or camera with
+     another shape changes the card's size. Never taller than 72% of the screen (42% on a portrait tablet): then the box keeps
+     its shape, narrower and centred. The footer stays one row (an ellipsis), so a camera switch never changes the card height. */
+  .cam-feed { box-sizing: border-box; width: 100%; height: auto; min-height: 0; max-height: none; aspect-ratio: 16 / 9;
+    max-width: calc(72vh * 16 / 9); margin-left: auto; margin-right: auto; flex: 0 0 auto; contain: layout paint;
+    background: #000; }
+  .cam-feed > img, .cam-feed > video, .cam-feed > video.jh-rtc { position: absolute; inset: 0; width: 100%; height: 100%;
+    max-width: none; max-height: none; object-fit: contain; object-position: 50% 50%; background: #000; }
+  .cam-feed > .cam-none { background: #05090f; }
+  .cam-strip { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; box-sizing: border-box; height: 24px; line-height: 14px;
+    gap: 8px; min-width: 0; max-width: 100%; }
+  .cam-strip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+  @media (orientation: portrait) and (min-width: 601px) and (max-width: 1100px) {
+    .cam-feed { max-width: calc(42vh * 16 / 9); }
+  }
+
+</style>
+    `;
+  }
+}
+
+// Register the custom element — must match webcomponent_name in panel registration
+if (!customElements.get("jarvis-panel")) {
+  customElements.define("jarvis-panel", JarvisPanel);
+}
+
+console.info(
+  "%c JARVIS Panel %c v7.94.0 ",
+  "color: #00f2fe; background: #050709; padding: 2px 6px;",
+  "color: #567685; background: #0a0d12; padding: 2px 6px;"
+);

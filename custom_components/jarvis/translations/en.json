@@ -1,0 +1,293 @@
+{
+  "config": {
+    "step": {
+      "provider_menu": {
+        "title": "JARVIS — Add a Provider",
+        "description": "{note}",
+        "menu_options": {
+          "groq": "Groq",
+          "openai": "OpenAI",
+          "anthropic": "Anthropic",
+          "gemini": "Gemini",
+          "custom": "Custom (OpenAI-compatible)",
+          "ollama": "Ollama (local)",
+          "finish": "Finish setup"
+        }
+      },
+      "groq": {
+        "title": "JARVIS — Groq",
+        "data": {
+          "api_key": "Groq API key"
+        }
+      },
+      "openai": {
+        "title": "JARVIS — OpenAI",
+        "data": {
+          "api_key": "OpenAI API key"
+        }
+      },
+      "anthropic": {
+        "title": "JARVIS — Anthropic",
+        "data": {
+          "api_key": "Anthropic API key"
+        }
+      },
+      "gemini": {
+        "title": "JARVIS — Gemini",
+        "data": {
+          "api_key": "Gemini API key"
+        }
+      },
+      "custom": {
+        "title": "JARVIS — Custom Provider",
+        "data": {
+          "api_key": "API key (optional, if the endpoint requires one)",
+          "custom_base_url": "API base URL (OpenAI-compatible)"
+        }
+      },
+      "ollama": {
+        "title": "JARVIS — Ollama",
+        "data": {
+          "ollama_base_url": "Base URL (leave blank for the default local Ollama endpoint)"
+        }
+      },
+      "finish": {
+        "title": "JARVIS — Finish Setup",
+        "description": "{note}",
+        "data": {
+          "llm_provider": "Main Agent provider",
+          "honorific": "Address me as"
+        }
+      },
+      "finish_model": {
+        "title": "JARVIS — Conversation Model",
+        "data": {
+          "model": "Conversation model"
+        }
+      }
+    },
+    "error": {
+      "need_llm": "Enter either a cloud API key or a local LLM URL.",
+      "cannot_connect": "Couldn't reach the LLM. Check the URL/endpoint is correct and the server (e.g. Ollama) is running.",
+      "invalid_auth": "The API key was rejected. Check the key and try again.",
+      "unknown": "Couldn't validate the LLM connection. Check the settings and try again.",
+      "no_models": "No models are available for this provider. For a local server like Ollama, pull a model first (e.g. run 'ollama pull llama3.2'), then retry. Otherwise, check the provider endpoint.",
+      "no_providers": "No LLM providers are configured. Add a provider key or endpoint in the LLM section first."
+    },
+    "abort": {
+      "already_configured": "JARVIS is already configured.",
+      "import_failed": "Found a JARVIS config but no usable LLM (no API key and no local endpoint)."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "JARVIS — Configure",
+        "menu_options": {
+          "llm": "LLM — manage provider keys",
+          "core": "Core — persona, directive, conversation model",
+          "routing": "Routing — bedroom areas, broadcast group, notify service",
+          "observer": "Observer — proactive awareness (uses configured LLM providers)",
+          "identity": "Identity — per-person recognition",
+          "email": "Email — read-only inbox (password via secrets.yaml)",
+          "agents": "Agents — specialised sub-agents (FRIDAY/HOMER), autonomy toggles"
+        }
+      },
+      "llm": {
+        "title": "JARVIS — LLM",
+        "description": "{note}",
+        "menu_options": {
+          "groq": "Groq",
+          "openai": "OpenAI",
+          "anthropic": "Anthropic",
+          "gemini": "Gemini",
+          "custom": "Custom (OpenAI-compatible)",
+          "ollama": "Ollama (local)",
+          "back": "Back to Configure menu"
+        }
+      },
+      "groq": {
+        "title": "JARVIS — Groq",
+        "data": {
+          "api_key": "Groq API key"
+        }
+      },
+      "openai": {
+        "title": "JARVIS — OpenAI",
+        "data": {
+          "api_key": "OpenAI API key"
+        }
+      },
+      "anthropic": {
+        "title": "JARVIS — Anthropic",
+        "data": {
+          "api_key": "Anthropic API key"
+        }
+      },
+      "gemini": {
+        "title": "JARVIS — Gemini",
+        "data": {
+          "api_key": "Gemini API key"
+        }
+      },
+      "custom": {
+        "title": "JARVIS — Custom Provider",
+        "data": {
+          "api_key": "API key (optional, if the endpoint requires one)",
+          "custom_base_url": "API base URL (OpenAI-compatible)"
+        }
+      },
+      "ollama": {
+        "title": "JARVIS — Ollama",
+        "data": {
+          "ollama_base_url": "Base URL (leave blank for the default local Ollama endpoint)"
+        }
+      },
+      "core": {
+        "title": "JARVIS — Core",
+        "description": "Persona, directive, and conversation model.",
+        "data": {
+          "honorific": "Address me as",
+          "directive_preset": "Directive preset",
+          "directive": "Custom directive (optional, overrides preset)",
+          "llm_provider": "Conversation model provider",
+          "use_hass_api": "Enable home control (lights, climate, locks, etc.)",
+          "web_research_llm_fallback": "Let web research escalate to the LLM's own web search when the default backend finds nothing",
+          "jh_strict_actions": "Check that actions really ran (recommended)",
+          "jh_mail_block": "Block actions after reading an email (recommended)",
+          "jh_facts_only_briefings": "Scheduled briefings use real facts only, no AI text (recommended)",
+          "camera_watch_default": "Camera Watch opens on this camera"
+        }
+      },
+      "core_model": {
+        "title": "JARVIS — Conversation Model",
+        "data": {
+          "model": "Conversation model"
+        }
+      },
+      "routing": {
+        "title": "JARVIS — Routing",
+        "description": "pick which HA areas are bedrooms (for sleep detection), which media_player group to use for broadcasts, and your phone notify service.",
+        "data": {
+          "bedroom_areas": "Bedroom areas (for sleep detection during quiet hours)",
+          "broadcast_group": "Broadcast speaker group (typically your home Cast group)",
+          "notify_service": "Phone notify service (e.g. notify.mobile_app_yourphone)"
+        },
+        "data_description": {
+          "bedroom_areas": "Any presence sensor in these areas fires sleep mode during quiet hours.",
+          "broadcast_group": "Used for critical and high-urgency announcements.",
+          "notify_service": "Used when you're away from home or asleep."
+        }
+      },
+      "observer": {
+        "title": "JARVIS — Observer Mode",
+        "description": "Configure each Observer model tier and its quiet hours. Review is optional and only runs when configured.",
+        "menu_options": {
+          "classifier": "Classifier (Tier 1 — cheap)",
+          "reasoning": "Reasoning (Tier 2 — main)",
+          "review": "Review (Tier 3 — periodic, optional)",
+          "observer_settings": "Observer settings",
+          "back": "Back to Configure menu"
+        }
+      },
+      "classifier": {
+        "title": "JARVIS — Classifier Provider",
+        "data": {
+          "classifier_provider": "Classifier model provider"
+        }
+      },
+      "classifier_model": {
+        "title": "JARVIS — Classifier Model",
+        "data": {
+          "classifier_model": "Classifier model"
+        }
+      },
+      "reasoning": {
+        "title": "JARVIS — Reasoning Provider",
+        "data": {
+          "reasoning_provider": "Reasoning model provider"
+        }
+      },
+      "reasoning_model": {
+        "title": "JARVIS — Reasoning Model",
+        "data": {
+          "reasoning_model": "Reasoning model"
+        }
+      },
+      "review": {
+        "title": "JARVIS — Review Provider",
+        "data": {
+          "review_provider": "Review model provider"
+        }
+      },
+      "review_model": {
+        "title": "JARVIS — Review Model",
+        "data": {
+          "review_model": "Review model"
+        }
+      },
+      "observer_settings": {
+        "title": "JARVIS — Observer Settings",
+        "data": {
+          "observer_enabled": "Enable observer mode",
+          "observer_quiet_start": "Quiet hours start (HH:MM)",
+          "observer_quiet_end": "Quiet hours end (HH:MM)"
+        }
+      },
+      "identity": {
+        "title": "JARVIS — Identity",
+        "description": "per-person recognition, so JARVIS tailors itself to who's speaking. Works with no special hardware using presence and (if set up) camera face recognition. Voice fingerprinting is the most accurate but needs a local GPU, so it's off by default.",
+        "data": {
+          "identity_enabled": "Recognize who's speaking",
+          "identity_voice_fingerprint": "Voice fingerprinting (requires a local GPU)",
+          "identity_min_confidence": "Minimum confidence before committing to a person",
+          "voice_recognition_source": "Voice recognition source (entity from a speaker-recognition service, e.g. binary_sensor.*_voice)",
+          "voice_recognition_auto_enroll": "Auto-flag voices to enroll as people speak"
+        },
+        "data_description": {
+          "identity_enabled": "Uses who's home + recent camera face recognition. No GPU required.",
+          "identity_voice_fingerprint": "Leave off unless you have a GPU server running a voice-ID model.",
+          "identity_min_confidence": "Higher = more cautious; stays neutral when unsure."
+        }
+      },
+      "email": {
+        "title": "JARVIS — Email",
+        "description": "Read-only inbox access. The IMAP password is read from Home Assistant's secrets.yaml — add it there under the key below (default jarvis_imap_password); it is never stored in the panel config.",
+        "data": {
+          "imap_enabled": "Enable email reading",
+          "imap_host": "IMAP host (e.g. imap.gmail.com)",
+          "imap_port": "IMAP port (SSL: 993)",
+          "imap_user": "IMAP username / email address",
+          "imap_folder": "Mailbox folder (default INBOX)",
+          "imap_ssl": "Use SSL (recommended)",
+          "imap_secret_key": "secrets.yaml key holding the password"
+        }
+      },
+      "agents": {
+        "title": "JARVIS — Agents",
+        "description": "Specialised sub-agents and autonomy.\n\n⚠️ FRIDAY (background automator) can CONTROL DEVICES, run scenes, and run scripts on its own — unlike every other sub-agent, which is read-only. Leave it OFF unless you understand that it can actuate your home autonomously. To enable it you must also tick the acknowledgement box.",
+        "data": {
+          "friday_automator": "Enable FRIDAY automator (can control devices) — advanced",
+          "friday_confirm": "I understand FRIDAY can actuate my home; enable it",
+          "proximity_volume": "Dampen TTS volume when I'm close to the speaker (needs mmWave distance sensors)",
+          "host_telemetry": "Monitor host hardware (CPU temp, memory pressure, NVMe I/O)"
+        }
+      }
+    },
+    "error": {
+      "need_llm": "Enter either a cloud API key or a local LLM URL.",
+      "cannot_connect": "Couldn't reach the LLM. Check the URL/endpoint is correct and the server (e.g. Ollama) is running.",
+      "invalid_auth": "The API key was rejected. Check the key and try again.",
+      "unknown": "Couldn't validate the LLM connection. Check the settings and try again.",
+      "no_models": "No models are available for this provider. For a local server like Ollama, pull a model first (e.g. run 'ollama pull llama3.2'), then retry. Otherwise, check the provider endpoint.",
+      "no_providers": "No LLM providers are configured. Add a provider key or endpoint in the LLM section first.",
+      "friday_confirm_required": "You enabled FRIDAY but didn't tick the acknowledgement box. FRIDAY can actuate your home, so it stays off until you confirm."
+    }
+  },
+  "issues": {
+    "llm_unavailable": {
+      "title": "JARVIS reasoning backend unavailable",
+      "description": "JARVIS couldn't reach its reasoning model, so it's running in limited mode — device control, status, and scenes still work. Reason: {detail}\n\nOpen the JARVIS panel → Settings and check your provider, model, and API key. If your provider retired the model, re-select it from the list. This notice clears automatically once reasoning is working again."
+    }
+  }
+}

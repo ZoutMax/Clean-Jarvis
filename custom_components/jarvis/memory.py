@@ -1,0 +1,330 @@
+"""
+JARVIS Long-Term Memory (v5.7.00).
+
+Provides semantic search across past conversations so JARVIS can recall
+context from previous interactions. Uses ChromaDB when available, falls
+back to SQLite FTS5 keyword search.
+
+Usage:
+  - store_memory(text, metadata) — save a conversation turn
+  - search_memory(query, k) — retrieve k most relevant past memories
+  - get_conversation_context(query) — formatted context string for prompt injection
+
+Storage: /config/jarvis_memory/ (ChromaDB) or jarvis.db FTS table (fallback)
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+from .paths import config_path_str
+
+_LOGGER = logging.getLogger(__name__)
+
+MEMORY_DIR = config_path_str("jarvis_memory")
+_DB_PATH = config_path_str("jarvis.db")
+_chromadb_available = False
+_collection = None
+_fts_available = False
+_pgvector_available = False
+
+
+# ── opt-in pgvector backend ──────────────────────────────────────────────────
+
+def _init_pgvector():
+    """Try the opt-in pgvector backend. Only engages when the owner selected it
+    (memory_backend: pgvector + a DSN); otherwise a no-op. Fail-soft."""
+    global _pgvector_available
+    try:
+        from . import memory_pgvector
+        if memory_pgvector.configured() and memory_pgvector.init():
+            _pgvector_available = True
+            _LOGGER.info("JARVIS memory: pgvector backend active")
+            return True
+    except Exception as exc:
+        _LOGGER.debug("JARVIS memory: pgvector init error: %s", exc)
+    return False
+
+
+# ── ChromaDB initialization ─────────────────────────────────────────────────
+
+def _init_chromadb():
+    """Try to initialize ChromaDB. Returns True on success."""
+    global _chromadb_available, _collection
+    try:
+        import chromadb
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        client = chromadb.PersistentClient(path=MEMORY_DIR)
+        _collection = client.get_or_create_collection(
+            name="jarvis_memory",
+            metadata={"hnsw:space": "cosine"},
+        )
+        _chromadb_available = True
+        _LOGGER.info("JARVIS memory: ChromaDB initialized at %s", MEMORY_DIR)
+        return True
+    except ImportError:
+        _LOGGER.debug("JARVIS memory: ChromaDB not available, using FTS5 fallback")
+        return False
+    except Exception as exc:
+        _LOGGER.warning("JARVIS memory: ChromaDB init failed: %s", exc)
+        return False
+
+
+# ── SQLite FTS5 fallback ─────────────────────────────────────────────────────
+
+def _init_fts():
+    """Initialize FTS5 virtual table in the existing JARVIS database."""
+    global _fts_available
+    try:
+        import sqlite3
+        conn = sqlite3.connect(_DB_PATH)
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+            USING fts5(content, metadata, timestamp)
+        """)
+        conn.commit()
+        conn.close()
+        _fts_available = True
+        _LOGGER.info("JARVIS memory: FTS5 fallback initialized")
+        return True
+    except Exception as exc:
+        _LOGGER.warning("JARVIS memory: FTS5 init failed: %s", exc)
+        return False
+
+
+def _ensure_initialized():
+    """Lazy init. Opt-in pgvector first (when selected); otherwise the zero-infra
+    default — ChromaDB, then FTS5. When pgvector is active, FTS5 is still set up
+    as a cheap local fallback so a transient Postgres outage degrades to keyword
+    search instead of losing writes."""
+    # (the _init_* helpers own the assignments; this function only reads the flags)
+    if _pgvector_available or _chromadb_available or _fts_available:
+        return
+    if _init_pgvector():
+        _init_fts()
+        return
+    if not _init_chromadb():
+        _init_fts()
+
+
+# ── Public API ───────────────────────────────────────────────────────────────
+
+def store_memory(
+    text: str,
+    *,
+    role: str = "user",
+    device_id: str = "",
+    conversation_id: str = "",
+    user_id: str = "",
+) -> bool:
+    """
+    Store a conversation turn in long-term memory.
+    Called from conversation.py after each user/assistant message.
+    """
+    if not text or len(text.strip()) < 5:
+        return False
+
+    _ensure_initialized()
+    ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    doc_id = f"{ts}_{role}_{hash(text) % 100000}"
+
+    metadata = {
+        "role": role,
+        "device_id": device_id or "",
+        "conversation_id": conversation_id or "",
+        "user_id": user_id or "",  # Jarvis Home patch: per-user memory
+        "timestamp": ts,
+    }
+
+    if _pgvector_available:
+        try:
+            from . import memory_pgvector
+            if memory_pgvector.store(doc_id, text, metadata):
+                return True
+            # store returned False (e.g. embed briefly unavailable) — fall
+            # through to the local fallback so the write isn't lost.
+        except Exception as exc:
+            _LOGGER.debug("pgvector store failed: %s", exc)
+
+    if _chromadb_available and _collection is not None:
+        try:
+            _collection.add(
+                documents=[text],
+                metadatas=[metadata],
+                ids=[doc_id],
+            )
+            return True
+        except Exception as exc:
+            _LOGGER.debug("ChromaDB store failed: %s", exc)
+
+    if _fts_available:
+        try:
+            import sqlite3, json
+            conn = sqlite3.connect(_DB_PATH)
+            conn.execute(
+                "INSERT INTO memory_fts (content, metadata, timestamp) VALUES (?, ?, ?)",
+                (text, json.dumps(metadata), ts),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as exc:
+            _LOGGER.debug("FTS5 store failed: %s", exc)
+
+    return False
+
+
+def search_memory(
+    query: str,
+    k: int = 5,
+    hours: Optional[int] = None,
+    user_id: Optional[str] = None,
+) -> list[dict]:
+    """
+    Search long-term memory for relevant past conversations.
+
+    Returns list of {"text": ..., "role": ..., "timestamp": ..., "score": ...}
+    """
+    if not query:
+        return []
+
+    _ensure_initialized()
+
+    if _pgvector_available:
+        try:
+            from . import memory_pgvector
+            return memory_pgvector.search(query, k=k, hours=hours, user_id=user_id)
+        except Exception as exc:
+            _LOGGER.debug("pgvector search failed: %s", exc)
+
+    if _chromadb_available and _collection is not None:
+        try:
+            where = None
+            if hours:
+                cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
+                where = {"timestamp": {"$gte": cutoff}}
+            if user_id is not None:  # Jarvis Home patch: the backend itself keeps people apart
+                where = {"$and": [where, {"user_id": user_id}]} if where else {"user_id": user_id}
+
+            results = _collection.query(
+                query_texts=[query],
+                n_results=min(k, 20),
+                where=where,
+            )
+
+            memories = []
+            if results and results.get("documents"):
+                docs = results["documents"][0]
+                metas = results["metadatas"][0] if results.get("metadatas") else [{}] * len(docs)
+                dists = results["distances"][0] if results.get("distances") else [0] * len(docs)
+                for doc, meta, dist in zip(docs, metas, dists):
+                    memories.append({
+                        "text": doc,
+                        "role": meta.get("role", ""),
+                        "timestamp": meta.get("timestamp", ""),
+                        "score": round(1.0 - dist, 3),  # cosine distance → similarity
+                    })
+            return memories
+        except Exception as exc:
+            _LOGGER.debug("ChromaDB search failed: %s", exc)
+
+    if _fts_available:
+        try:
+            import sqlite3, json
+            conn = sqlite3.connect(_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            # FTS5 MATCH query
+            # Jarvis Home patch: quoted words, so punctuation in a sentence is no FTS5 syntax error.
+            import re
+            words = re.findall(r"\w+", query)[:8]  # limit query terms
+            if not words:
+                conn.close()
+                return []
+            query_clean = " OR ".join('"' + w + '"' for w in words)
+            sql = "SELECT content, metadata, rank FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?"
+            rows = conn.execute(sql, (query_clean, k if user_id is None else 500)).fetchall()
+            conn.close()
+
+            memories = []
+            for row in rows:
+                meta = {}
+                try:
+                    meta = json.loads(row["metadata"])
+                except Exception:
+                    pass
+                # review round 3: a row from before per-user memory has no owner; only the admin search (None) sees it
+                if user_id is not None and meta.get("user_id", "?legacy") != user_id:
+                    continue
+                if len(memories) >= k:
+                    break
+                memories.append({
+                    "text": row["content"],
+                    "role": meta.get("role", ""),
+                    "timestamp": meta.get("timestamp", ""),
+                    "score": round(abs(row["rank"]) * 0.1, 3) if row["rank"] else 0,
+                })
+            return memories
+        except Exception as exc:
+            _LOGGER.debug("FTS5 search failed: %s", exc)
+
+    return []
+
+
+def get_conversation_context(query: str, k: int = 3, user_id: Optional[str] = None) -> str:
+    """
+    Format retrieved memories as a context string for the system prompt.
+    Called from conversation.py before each LLM call.
+    """
+    memories = search_memory(query, k=k, user_id=user_id)
+    if not memories:
+        return ""
+
+    parts = ["## Relevant past conversations"]
+    for m in memories:
+        ts = m.get("timestamp", "")[:16]  # trim seconds
+        role = m.get("role", "")
+        text = m.get("text", "")[:300]  # cap length
+        parts.append(f"[{ts}] {role}: {text}")
+
+    return "\n".join(parts)
+
+
+def get_memory_stats() -> dict:
+    """Return memory system stats for the panel."""
+    _ensure_initialized()
+    stats = {
+        "backend": "none",
+        "total_memories": 0,
+    }
+
+    if _pgvector_available:
+        try:
+            from . import memory_pgvector
+            stats["backend"] = "pgvector"
+            stats["total_memories"] = memory_pgvector.count()
+            return stats
+        except Exception:
+            pass
+
+    if _chromadb_available and _collection is not None:
+        try:
+            stats["backend"] = "chromadb"
+            stats["total_memories"] = _collection.count()
+        except Exception:
+            pass
+    elif _fts_available:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(_DB_PATH)
+            row = conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()
+            conn.close()
+            stats["backend"] = "fts5"
+            stats["total_memories"] = row[0] if row else 0
+        except Exception:
+            pass
+
+    return stats
